@@ -10,7 +10,7 @@ info:
 servers:
   - url: https://www.sefpos.com.tr/api/integrations/partner
     description: Production (recommended)
-  - url: https://xdfnozfuuzctubijbnds.supabase.co/functions/v1/partner-orders-api
+  - url: http://45.195.231.185/vds-api/integrations/partner
     description: Direct Supabase Edge (fallback)
 
 paths:

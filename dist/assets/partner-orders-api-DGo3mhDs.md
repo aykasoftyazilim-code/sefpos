@@ -44,7 +44,7 @@ Tüm yollar bu tabanın sonuna eklenir. Örnek:
 **Doğrudan Edge (yedek / test, destek ve güvenlik duvarı kurallarına tabi):**
 
 ```
-https://xdfnozfuuzctubijbnds.supabase.co/functions/v1/partner-orders-api
+http://45.195.231.185/vds-api/integrations/partner
 ```
 
 Üretim entegrasyonunda **www tabanı** kullanılması önerilir.

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'sefpos-v1';
+const CACHE_NAME = 'sefpos-vds-1';
 const STATIC_ASSETS = [
   './',
   './index.html',
@@ -27,7 +27,6 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
 
   if (event.request.method !== 'GET') return;
-  if (url.hostname.includes('supabase.co')) return;
   if (url.protocol === 'chrome-extension:') return;
 
   if (url.origin === self.location.origin) {
