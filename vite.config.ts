@@ -207,15 +207,18 @@ const DEFAULT_PRIMARY_SUPABASE_ANON_KEY = '';
 
 // https://vitejs.dev/config/
 export default defineConfig(({ mode, command }) => {
+  const isVdsSelfHost = process.env.VITE_VDS_SELFHOST === 'true';
   const env = loadEnv(mode, __root, 'VITE_');
-  const viteUrlFromEnv =
-    (env.VITE_SUPABASE_URL || '').trim().replace(/\/$/, '') ||
-    readViteSupabaseUrlFromEnvFiles(mode) ||
-    (process.env.VITE_SUPABASE_URL || '').trim().replace(/\/$/, '');
-  const viteAnonFromEnv =
-    (env.VITE_SUPABASE_ANON_KEY || '').trim() ||
-    readViteSupabaseAnonFromEnvFiles(mode) ||
-    (process.env.VITE_SUPABASE_ANON_KEY || '').trim();
+  const viteUrlFromEnv = isVdsSelfHost
+    ? ''
+    : (env.VITE_SUPABASE_URL || '').trim().replace(/\/$/, '') ||
+      readViteSupabaseUrlFromEnvFiles(mode) ||
+      (process.env.VITE_SUPABASE_URL || '').trim().replace(/\/$/, '');
+  const viteAnonFromEnv = isVdsSelfHost
+    ? ''
+    : (env.VITE_SUPABASE_ANON_KEY || '').trim() ||
+      readViteSupabaseAnonFromEnvFiles(mode) ||
+      (process.env.VITE_SUPABASE_ANON_KEY || '').trim();
 
   const { url: jsonUrl, anon: jsonAnon, devPortJsonOverridesEnv } = readSefposDevPortJson();
   const isDevServe = command === 'serve';
@@ -241,17 +244,24 @@ export default defineConfig(({ mode, command }) => {
         (effectiveNoEnvUrl === DEFAULT_PRIMARY_SUPABASE_URL ? DEFAULT_PRIMARY_SUPABASE_ANON_KEY : '')
       : '';
 
-  const viteSupabaseUrl = forceDevSupabaseFromPortJson
-    ? jsonUrl
-    : resolveDevSupabaseUrl(mode) || (isDevServe ? DEFAULT_PRIMARY_SUPABASE_URL : '');
+  const viteSupabaseUrl = isVdsSelfHost
+    ? ''
+    : forceDevSupabaseFromPortJson
+      ? jsonUrl
+      : resolveDevSupabaseUrl(mode) || (isDevServe ? DEFAULT_PRIMARY_SUPABASE_URL : '');
 
   const define: Record<string, string> = {
-    __SEFPOS_DEV_SUPABASE_URL__: JSON.stringify(devFallbackSupabaseUrl),
-    __SEFPOS_DEV_SUPABASE_ANON_KEY__: JSON.stringify(devFallbackSupabaseAnon),
+    __SEFPOS_DEV_SUPABASE_URL__: JSON.stringify(isVdsSelfHost ? '' : devFallbackSupabaseUrl),
+    __SEFPOS_DEV_SUPABASE_ANON_KEY__: JSON.stringify(isVdsSelfHost ? '' : devFallbackSupabaseAnon),
     /** import.meta.env define’ı güvenilir değil; src/lib/supabase.ts doğrudan bunu okur. */
-    __SEFPOS_DEV_PORT_OVERRIDE_URL__: JSON.stringify(forceDevSupabaseFromPortJson ? jsonUrl : ''),
-    __SEFPOS_DEV_PORT_OVERRIDE_ANON__: JSON.stringify(forceDevSupabaseFromPortJson ? anonForJsonUrl : ''),
+    __SEFPOS_DEV_PORT_OVERRIDE_URL__: JSON.stringify(isVdsSelfHost ? '' : forceDevSupabaseFromPortJson ? jsonUrl : ''),
+    __SEFPOS_DEV_PORT_OVERRIDE_ANON__: JSON.stringify(isVdsSelfHost ? '' : forceDevSupabaseFromPortJson ? anonForJsonUrl : ''),
   };
+  if (isVdsSelfHost) {
+    define['import.meta.env.VITE_VDS_SELFHOST'] = JSON.stringify('true');
+    define['import.meta.env.VITE_SUPABASE_URL'] = JSON.stringify('');
+    define['import.meta.env.VITE_SUPABASE_ANON_KEY'] = JSON.stringify('');
+  }
 
   if (forceDevSupabaseFromPortJson) {
     console.info('[ŞefPOS] Yerel dev: devPortJsonOverridesEnv — .env / localStorage yerine →', jsonUrl);
@@ -265,10 +275,21 @@ export default defineConfig(({ mode, command }) => {
     } catch {
       console.warn('[ŞefPOS] Geçersiz Supabase URL; Edge proxy kapalı:', viteSupabaseUrl);
     }
-  } else {
+  } else if (!isVdsSelfHost) {
     console.warn(
       '[ŞefPOS] VITE_SUPABASE_URL bulunamadı; yerel /__supabase-functions proxy devre dışı. .env veya sefpos-dev-port.json → supabaseDevUrl ekleyin.',
     );
+  }
+
+  if (isVdsSelfHost) {
+    plugins.push({
+      name: 'sefpos-vds-strip-supabase-html',
+      transformIndexHtml(html: string) {
+        return html
+          .replace(/\s*<link rel="dns-prefetch" href="https:\/\/xdfnozfuuzctubijbnds\.supabase\.co" \/>/g, '')
+          .replace(/\s*<link rel="preconnect" href="https:\/\/xdfnozfuuzctubijbnds\.supabase\.co"[^>]*>/g, '');
+      },
+    });
   }
 
   // Cloudflare Pages: kök URL (/). Electron file:// yüklemesi CF_PAGES olmadan ./ kalır.

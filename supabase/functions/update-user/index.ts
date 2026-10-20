@@ -56,6 +56,8 @@ Deno.serve(async (req: Request) => {
       allowed_ips?: string | null;
       delete_user?: boolean;
       revoke_sessions?: boolean;
+      notify_sms?: boolean;
+      phone?: string;
     };
     try {
       body = await req.json();
@@ -66,7 +68,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const { target_user_id, new_password, allowed_ips, delete_user, revoke_sessions } = body;
+    const { target_user_id, new_password, allowed_ips, delete_user, revoke_sessions, notify_sms, phone } = body;
 
     if (!target_user_id) {
       return new Response(
@@ -253,6 +255,58 @@ Deno.serve(async (req: Request) => {
 
       if (pwError) {
         throw pwError;
+      }
+
+      if (notify_sms === true) {
+        const { data: tgtPhone } = await supabaseAdmin
+          .from('profiles')
+          .select('phone')
+          .eq('id', target_user_id)
+          .maybeSingle();
+        const rawPhone = String(phone || (tgtPhone as { phone?: string } | null)?.phone || '');
+        const digits = rawPhone.replace(/\D/g, '');
+        const smsPhone =
+          digits.length === 10 && digits.startsWith('5')
+            ? digits
+            : digits.length === 11 && digits.startsWith('0')
+              ? digits.slice(1)
+              : digits.length === 12 && digits.startsWith('90')
+                ? digits.slice(2)
+                : '';
+        if (!smsPhone) {
+          return new Response(
+            JSON.stringify({
+              success: true,
+              password_updated: true,
+              sms_sent: false,
+              sms_error: 'Kayıtlı telefon yok',
+            }),
+            { headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+          );
+        }
+        try {
+          const { postOztekSms } = await import('../_shared/oztekSms.ts');
+          await postOztekSms(
+            smsPhone,
+            `SefPOS sifreniz yenilendi: ${new_password}. Guvenliginiz icin giris sonrasi degistirin.`,
+            'SMS password reset admin',
+          );
+          return new Response(
+            JSON.stringify({ success: true, password_updated: true, sms_sent: true }),
+            { headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+          );
+        } catch (smsErr: unknown) {
+          const smsMsg = smsErr instanceof Error ? smsErr.message : String(smsErr);
+          return new Response(
+            JSON.stringify({
+              success: true,
+              password_updated: true,
+              sms_sent: false,
+              sms_error: smsMsg,
+            }),
+            { headers: { ...corsHeaders, 'Content-Type': 'application/json' } },
+          );
+        }
       }
     }
 

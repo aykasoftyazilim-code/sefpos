@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, Fragment, useMemo } from 'react';
 import { subscribeOnlineOrdersRealtime } from '../lib/onlineOrdersRealtimeHub';
-import { supabase } from '../lib/supabase';
+import { supabase, getEdgeFunctionInvokeUrl } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import { ShoppingBag, Clock, Phone, MapPin, Check, X, ChevronDown, ChevronUp, Bike, Package, RefreshCw, Volume2, VolumeX, AlertTriangle, Hash, Tag, BellRing, Printer, Store } from 'lucide-react';
 import {
@@ -660,7 +660,6 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
     const order = orders.find((o) => o.id === orderId);
     const prevStatus = order?.status;
 
-    const baseURL = (import.meta.env.VITE_SUPABASE_URL || 'https://xdfnozfuuzctubijbnds.supabase.co').replace(/\/$/, '');
     const now = new Date().toISOString();
     const updateData: Record<string, any> = { status };
     if (status === 'accepted') updateData.accepted_at = now;
@@ -671,19 +670,19 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
     setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, ...updateData } : o)));
     setBusyOrderId(orderId);
 
-    try {
+      try {
       if (dhAction) {
         const { data: { session } } = await supabase.auth.getSession();
         if (!session) throw new Error('Oturum bulunamadı, lütfen yeniden giriş yapın.');
 
-        const resp = await fetch(`${baseURL}/functions/v1/yemeksepeti-callback`, {
-          method: 'POST',
-          headers: {
+        const resp = await fetch(getEdgeFunctionInvokeUrl('yemeksepeti-callback'), {
+              method: 'POST',
+              headers: {
             Authorization: `Bearer ${session.access_token}`,
-            'Content-Type': 'application/json',
+                'Content-Type': 'application/json',
             apikey: (import.meta.env.VITE_SUPABASE_ANON_KEY as string) || '',
-          },
-          body: JSON.stringify({ orderId, action: dhAction, rejectReason }),
+              },
+              body: JSON.stringify({ orderId, action: dhAction, rejectReason }),
         });
 
         const raw = await resp.text();
@@ -855,7 +854,7 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
       });
       if (!res.ok) {
         alert(`Getir senkronizasyonu başarısız: ${(res as any)?.data?.message || res.error || 'bilinmeyen'}`);
-      } else {
+    } else {
         await loadOrders();
       }
     } catch (err: any) {
@@ -1147,16 +1146,15 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
         (p: OnlinePlatformListRow) => p.platform_code !== 'getir',
       );
       if (nonGetir.length > 0) {
-        const baseUrl = (import.meta.env.VITE_SUPABASE_URL || 'https://xdfnozfuuzctubijbnds.supabase.co').replace(/\/$/, '');
         const { data: { session } } = await supabase.auth.getSession();
         if (session) {
           try {
-            const response = await fetch(`${baseUrl}/functions/v1/sync-online-orders`, {
-              method: 'POST',
-              headers: {
+            const response = await fetch(getEdgeFunctionInvokeUrl('sync-online-orders'), {
+          method: 'POST',
+          headers: {
                 Authorization: `Bearer ${session.access_token}`,
-                'Content-Type': 'application/json',
-              },
+            'Content-Type': 'application/json',
+          },
             });
             const result = await response.json().catch(() => ({}));
             if (response.ok && typeof result?.newOrders === 'number') {
@@ -1332,11 +1330,11 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
             <div className="min-w-0">
               <h1 className="text-lg md:text-xl font-black text-slate-800 truncate">
                 ONLİNE SİPARİŞLER
-              </h1>
+            </h1>
               <p className="text-xs text-slate-500 truncate">
                 {orders.length} sipariş · {activeAlertCount} yeni · Yemeksepeti, Getir, Trendyol, Migros
-              </p>
-            </div>
+            </p>
+          </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
             {getirPlatformMeta && (
@@ -1421,8 +1419,8 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
               <span>{syncing ? 'Senkronize ediliyor…' : 'Siparişleri Çek'}</span>
             </button>
           </div>
+          </div>
         </div>
-      </div>
 
       <div className="bg-white border-b border-orange-100 px-4 md:px-6 py-2.5 shrink-0">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 sm:gap-4">
@@ -1562,7 +1560,7 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
               >
                 <span className="flex items-center gap-1.5">
                   <Icon className="w-3.5 h-3.5 shrink-0" />
-                  {tab.label}
+                {tab.label}
                 </span>
                 <span
                   className={`pl-5 text-[9px] font-semibold leading-tight ${
@@ -1623,8 +1621,8 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {filteredOrders.map((order) => {
-                    const isExpanded = expandedOrder === order.id;
+            {filteredOrders.map((order) => {
+              const isExpanded = expandedOrder === order.id;
                     const platformCode = order.online_order_platforms.platform_code;
                     const platformColor = getPlatformColor(platformCode);
                     const orderDate = new Date(order.created_at);
@@ -1633,7 +1631,7 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                         ? getGetirUiPhase(order)
                         : null;
 
-                    return (
+              return (
                       <Fragment key={order.id}>
                         {/* ─── ANA SATIR ─── */}
                         <tr
@@ -1669,11 +1667,11 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                           <td className="px-3 py-2.5 whitespace-nowrap">
                             <div className="font-mono font-semibold text-slate-700 text-xs">
                               #{order.platform_order_number || order.platform_order_id.slice(0, 6)}
-                            </div>
+                      </div>
                             {platformCode === 'getir' && order.getir_verification_code && (
                               <div className="text-[10px] font-bold text-purple-700 font-mono">
                                 {order.getir_verification_code.toUpperCase()}
-                              </div>
+                    </div>
                             )}
                           </td>
 
@@ -1702,10 +1700,10 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                             <div>{orderDate.toLocaleDateString('tr-TR')}</div>
                             <div className="text-[10px] text-slate-400">
                               {orderDate.toLocaleTimeString('tr-TR', {
-                                hour: '2-digit',
-                                minute: '2-digit',
-                              })}
-                            </div>
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })}
+                    </div>
                           </td>
 
                           {/* DURUM */}
@@ -1760,7 +1758,7 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                             <span className="line-clamp-2">{order.customer_address}</span>
                           </div>
                         )}
-                      </div>
+                  </div>
 
                       {/* Sipariş notu */}
                       {order.customer_notes && (
@@ -1775,7 +1773,7 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                         <div className="space-y-1">
                           {order.items.map((item, idx) => (
                             <div key={idx} className="flex justify-between items-start gap-2 text-sm">
-                              <div className="flex-1 min-w-0">
+                      <div className="flex-1 min-w-0">
                                 <p className="font-bold text-slate-800">
                                   <span className="text-slate-500 mr-1">{item.quantity}x</span>
                                   {safeName(item.platform_product_name)}
@@ -1787,8 +1785,8 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                               <span className="font-bold text-slate-700 shrink-0">{item.total_amount.toFixed(0)} ₺</span>
                             </div>
                           ))}
-                        </div>
                       </div>
+                    </div>
 
                       {/* Getir özel rozetler */}
                       {platformCode === 'getir' && (
@@ -1838,8 +1836,8 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                               Ortak Kampanya
                             </span>
                           )}
-                        </div>
-                      )}
+                      </div>
+                    )}
 
                       {/* GETIR akış: iptal sadece «onay» aşamasında (verify fazı) */}
                       {order.online_order_platforms.platform_code === 'getir' &&
@@ -1873,7 +1871,7 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                               className="w-full border border-red-300 rounded-lg px-3 py-2 text-sm font-medium text-slate-800 bg-white focus:outline-none focus:ring-2 focus:ring-red-400"
                             />
                             <div className="flex gap-2">
-                              <button
+                    <button
                                 onClick={() => {
                                   setRejectingOrderId(null);
                                   setGetirCancelReasonId('');
@@ -1916,7 +1914,7 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                         >
                           <Printer className={`w-3 h-3 ${busyOrderId === order.id ? 'animate-pulse' : ''}`} />
                           Fişi Tekrar Bas
-                        </button>
+                    </button>
 
                         {order.online_order_platforms.platform_code === 'getir' &&
                           order.status !== 'delivered' &&
@@ -1932,8 +1930,8 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                               <RefreshCw className={`w-3 h-3 ${busyOrderId === order.id ? 'animate-spin' : ''}`} />
                               {busyOrderId === order.id ? 'Sorguluyor…' : 'Getir ile durumu eşle'}
                             </button>
-                          )}
-                      </div>
+                              )}
+                            </div>
 
                       {order.online_order_platforms.platform_code === 'getir' && getirPhase && (
                         <>
@@ -1972,7 +1970,7 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                           {getirPhase === 'scheduled_accepted_wait' && (
                             <div className="w-full bg-amber-100 text-amber-800 font-bold py-3 rounded-xl text-center text-sm">
                               İleri tarihli — Getir teslimat saatinden 1 saat önce hazırlanma akışını başlatacak.
-                            </div>
+                          </div>
                           )}
 
                           {getirPhase === 'prepare' && (
@@ -2023,8 +2021,8 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                               <div className="text-[11px] font-normal text-purple-700">
                                 Bu sipariş Getir kuryesinde — restoranın «Kurye yola çıktı» / «Teslim edildi» basmasına gerek yok. Durum Getir tarafından otomatik ilerler.
                               </div>
-                            </div>
-                          )}
+                      </div>
+                    )}
 
                           {getirPhase === 'deliver' && (
                             <button
@@ -2040,7 +2038,7 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                           {getirPhase === 'arrived_info' && (
                             <div className="w-full bg-teal-100 text-teal-800 font-bold py-3 rounded-xl text-center text-sm">
                               Müşteriye ulaştı (teslim onayı bekleniyor)
-                            </div>
+                      </div>
                           )}
 
                           {order.status === 'delivered' && (
@@ -2070,43 +2068,43 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                       {/* Diğer platformlar (Yemeksepeti vb.) — eski akış değişmedi */}
                       {order.online_order_platforms.platform_code !== 'getir' && order.status === 'new' &&
                         rejectingOrderId === order.id && (
-                          <div className="bg-red-50 border-2 border-red-200 rounded-xl p-3 space-y-3">
-                            <div className="flex items-center gap-2 text-red-700 font-bold text-sm">
-                              <AlertTriangle className="w-4 h-4" />
-                              Reddetme Sebebi
-                            </div>
-                            <select
-                              value={selectedRejectReason}
+                        <div className="bg-red-50 border-2 border-red-200 rounded-xl p-3 space-y-3">
+                          <div className="flex items-center gap-2 text-red-700 font-bold text-sm">
+                            <AlertTriangle className="w-4 h-4" />
+                            Reddetme Sebebi
+                          </div>
+                          <select
+                            value={selectedRejectReason}
                               onChange={(e) => setSelectedRejectReason(e.target.value)}
-                              className="w-full border border-red-300 rounded-lg px-3 py-2 text-sm font-medium text-slate-800 bg-white focus:outline-none focus:ring-2 focus:ring-red-400"
-                            >
+                            className="w-full border border-red-300 rounded-lg px-3 py-2 text-sm font-medium text-slate-800 bg-white focus:outline-none focus:ring-2 focus:ring-red-400"
+                          >
                               {REJECT_REASONS.map((r) => (
                                 <option key={r.value} value={r.value}>
                                   {r.label}
                                 </option>
-                              ))}
-                            </select>
-                            <div className="flex gap-2">
-                              <button
-                                onClick={() => setRejectingOrderId(null)}
-                                className="flex-1 border-2 border-slate-300 text-slate-700 font-bold py-2.5 rounded-xl transition-all hover:bg-slate-50 text-sm"
-                              >
-                                Vazgec
-                              </button>
-                              <button
-                                onClick={() => {
-                                  setRejectingOrderId(null);
-                                  updateOrderStatus(order.id, 'cancelled', 'reject', selectedRejectReason);
-                                }}
-                                disabled={loading}
-                                className="flex-1 bg-red-600 hover:bg-red-700 text-white font-black py-2.5 rounded-xl transition-all active:scale-95 disabled:opacity-50 text-sm flex items-center justify-center gap-1.5"
-                              >
-                                <X className="w-4 h-4" />
-                                REDDET
-                              </button>
-                            </div>
+                            ))}
+                          </select>
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => setRejectingOrderId(null)}
+                              className="flex-1 border-2 border-slate-300 text-slate-700 font-bold py-2.5 rounded-xl transition-all hover:bg-slate-50 text-sm"
+                            >
+                              Vazgec
+                            </button>
+                            <button
+                              onClick={() => {
+                                setRejectingOrderId(null);
+                                updateOrderStatus(order.id, 'cancelled', 'reject', selectedRejectReason);
+                              }}
+                              disabled={loading}
+                              className="flex-1 bg-red-600 hover:bg-red-700 text-white font-black py-2.5 rounded-xl transition-all active:scale-95 disabled:opacity-50 text-sm flex items-center justify-center gap-1.5"
+                            >
+                              <X className="w-4 h-4" />
+                              REDDET
+                            </button>
                           </div>
-                        )}
+                        </div>
+                      )}
 
                       {order.online_order_platforms.platform_code !== 'getir' && order.status === 'new' && rejectingOrderId !== order.id && (
                         <div className="flex gap-2">
@@ -2164,13 +2162,13 @@ export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
                           {busyOrderId === order.id ? 'Platforma bildiriliyor…' : 'KURYE ALDI / TESLİM EDİLDİ'}
                         </button>
                       )}
-                              </div>
+                    </div>
                             </td>
                           </tr>
                         )}
                       </Fragment>
-                    );
-                  })}
+              );
+            })}
                 </tbody>
               </table>
             </div>

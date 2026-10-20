@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
 import { supabase } from '../lib/supabase';
-import { createClient } from '@supabase/supabase-js';
 import { useAuth } from '../contexts/AuthContext';
 import { Database } from '../lib/supabase';
 import { X, Plus, Trash2, Settings as SettingsIcon, Building2, ToggleLeft, ToggleRight, Printer, AlertCircle, MapPin, Phone, Save, CreditCard as Edit2, User, Store, CheckCircle, Wifi, WifiOff, Globe, RefreshCw, Lock, ShieldCheck, Eye, EyeOff, Package, CheckSquare, Square, Database as DatabaseIcon, Receipt, Pencil, Scale, Loader, QrCode, PhoneIncoming, FlaskConical, Clock, Download, Sparkles, ChevronDown, ChevronUp, HelpCircle, Info, Percent, Puzzle, Gift, Menu } from 'lucide-react';
@@ -599,12 +598,10 @@ export function Settings({ onClose, initialTab }: SettingsProps) {
       .eq('id', branchId);
     if (error) {
       const msg = String(error.message || '');
-      if (/column .*default_discount/i.test(msg)) {
+      if (/column .*default_discount|Invalid column name.*default_discount/i.test(msg)) {
         alert(
           'Sabit iskonto kolonu veritabanında yok. ' +
-          'Supabase migration\'ı (20260515220000_branches_default_discount.sql) ' +
-          'henüz uygulanmamış. GitHub Actions deploy bitince tekrar deneyin ' +
-          'veya Studio → SQL\'de migration\'ı manuel çalıştırın.'
+          'Sunucu şeması güncellenmeli (default_discount_percent / default_discount_active).'
         );
       } else {
         alert('Hata: ' + msg);
@@ -660,53 +657,75 @@ export function Settings({ onClose, initialTab }: SettingsProps) {
   const handleCreateGroup = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    console.log('Creating group - tenant:', tenant);
-    console.log('Group data:', { groupName, groupPrefix, groupColor });
-
     if (!tenant) {
-      alert('Tenant bulunamadı. Lütfen tekrar giriş yapın.');
+      alert('İşletme bilgisi bulunamadı. Lütfen çıkış yapıp tekrar giriş yapın.');
       return;
     }
 
-    if (!groupName.trim()) {
+    const name = groupName.trim();
+    if (!name) {
       alert('Grup adı girin.');
       return;
     }
 
-    const branchForGroup = groupBranchId || activeBranch?.id;
+    const branchForGroup = (groupBranchId || activeBranch?.id || '').trim();
     if (!branchForGroup) {
       alert('Önce üst menüden bir şube seçin veya formda şube seçin.');
       return;
     }
+    if (branches.length > 0 && !branches.some((b) => b.id === branchForGroup)) {
+      alert('Seçilen şube geçersiz. Listeden geçerli bir şube seçin.');
+      return;
+    }
 
-    const rawPrefix = (groupPrefix || groupName || 'M').trim();
-    const prefix = rawPrefix.slice(0, 12).toUpperCase() || 'M';
+    const rawPrefix = (groupPrefix || name || 'M').trim();
+    // TR locale ile büyük harf; max 3 (UI) / DB text
+    const prefix = rawPrefix.slice(0, 3).toLocaleUpperCase('tr-TR') || 'M';
 
     const { data, error } = await supabase
       .from('table_groups')
       .insert({
         tenant_id: tenant.id,
         branch_id: branchForGroup,
-        name: groupName.trim(),
+        name,
         prefix,
-        color: groupColor,
+        color: groupColor || '#FF6B35',
       })
-      .select();
-
-    console.log('Insert result:', { data, error });
+      .select('id, name, prefix, branch_id');
 
     if (error) {
       console.error('Group creation error:', error);
-      alert('Hata: ' + error.message);
+      const msg = String(error.message || '');
+      const code = String((error as { code?: string }).code || '');
+      if (/foreign key|table_groups_branch_id_fkey/i.test(msg) || code === '23503') {
+        alert('Şube kaydı bulunamadı. Üst menüden şubeyi yeniden seçip tekrar deneyin.');
+        return;
+      }
+      if (/row-level security|RLS|42501/i.test(msg) || code === '42501') {
+        alert(
+          'Bu işlem için yetkiniz yok veya oturum süresi dolmuş. Çıkış yapıp tekrar giriş yapın; sorun sürerse yönetici yetkisi gerekir.',
+        );
+        return;
+      }
+      if (/JWT|not authenticated|refresh/i.test(msg)) {
+        alert('Oturum geçersiz. Çıkış yapıp tekrar giriş yapın.');
+        return;
+      }
+      alert('Masa grubu oluşturulamadı: ' + msg);
+      return;
+    }
+
+    if (!data?.length) {
+      alert('Grup kaydı doğrulanamadı. Sayfayı yenileyip listeyi kontrol edin.');
       return;
     }
 
     alert('Grup oluşturuldu. Masaların görünmesi için aynı ekranda «Toplu Masa Oluştur» ile masa ekleyin ve şube seçili olsun.');
     setGroupName('');
     setGroupPrefix('');
-    setGroupBranchId('');
+    setGroupBranchId(activeBranch?.id || '');
     setShowGroupForm(false);
-    loadGroups();
+    void loadGroups();
   };
 
   const handleBulkCreateTables = async () => {
@@ -1502,15 +1521,16 @@ export function Settings({ onClose, initialTab }: SettingsProps) {
                         />
                       </div>
                       <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-1">Kısa Kod (Önek)</label>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">
+                          Kısa Kod (Önek) <span className="font-normal text-gray-400">— boşsa adın ilk harfi</span>
+                        </label>
                         <input
                           type="text"
                           value={groupPrefix}
-                          onChange={(e) => setGroupPrefix(e.target.value.toUpperCase())}
+                          onChange={(e) => setGroupPrefix(e.target.value.toLocaleUpperCase('tr-TR'))}
                           placeholder="Örn: S"
                           maxLength={3}
                           className="w-full px-3 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-orange-500 focus:border-transparent uppercase"
-                          required
                         />
                       </div>
                     </div>
@@ -2897,8 +2917,8 @@ export function Settings({ onClose, initialTab }: SettingsProps) {
                   </div>
                   <div className="text-[11px] text-gray-400 pt-1 border-t border-gray-100">
                     Şu anki sürüm: <code className="text-gray-600">{appVersion}</code> · Otomatik
-                    kontrol uygulama açıldıktan birkaç saniye içinde (4 sn, 30 sn, 2 dk) ve
-                    yaklaşık her 45 dakikada bir yapılır.
+                    kontrol uygulama açıldıktan birkaç saniye içinde (4 sn, 30 sn, 2 dk, 5 dk) ve
+                    yaklaşık her 20 dakikada bir yapılır. Oturum açılınca da kontrol edilir.
                   </div>
                 </div>
               )}
@@ -5018,15 +5038,16 @@ function BranchDefaultDiscountRow({
   branch: Branch;
   onChange: (branchId: string, patch: { percent?: number; active?: boolean }) => Promise<void> | void;
 }) {
-  const initialPercent = Number(branch.default_discount_percent || 0);
-  const initialActive = branch.default_discount_active === true;
+  const savedPercent = Number(branch.default_discount_percent || 0);
+  const savedActive = branch.default_discount_active === true;
 
   // Input metnini olduğu gibi tut (virgül de nokta da kabul). Sayıya çevirme
   // ancak blur/commit anında olur — böylece "3," yazarken "3" olarak yenilenmez.
   const formatForInput = (n: number) => (n === 0 ? '' : String(n).replace('.', ','));
-  const [inputText, setInputText] = useState<string>(formatForInput(initialPercent));
-  const [active, setActive] = useState<boolean>(initialActive);
+  const [inputText, setInputText] = useState<string>(formatForInput(savedPercent));
+  const [active, setActive] = useState<boolean>(savedActive);
   const [saving, setSaving] = useState(false);
+  const [savedFlash, setSavedFlash] = useState(false);
 
   useEffect(() => {
     setInputText(formatForInput(Number(branch.default_discount_percent || 0)));
@@ -5037,13 +5058,26 @@ function BranchDefaultDiscountRow({
     const raw = s.trim().replace(',', '.');
     if (!raw) return 0;
     const n = Number(raw);
-    if (Number.isNaN(n)) return initialPercent;
+    if (Number.isNaN(n)) return savedPercent;
     return Math.min(100, Math.max(0, Math.round(n * 100) / 100));
   };
 
-  const commit = async (next: { percent?: number; active?: boolean }) => {
+  const draftPercent = parsePercent(inputText);
+  const dirty = draftPercent !== savedPercent || active !== savedActive;
+
+  const commit = async (next?: { percent?: number; active?: boolean }) => {
+    const percent = next?.percent ?? draftPercent;
+    const nextActive = next?.active ?? active;
     setSaving(true);
-    try { await onChange(branch.id, next); } finally { setSaving(false); }
+    try {
+      await onChange(branch.id, { percent, active: nextActive });
+      setInputText(formatForInput(percent));
+      setActive(nextActive);
+      setSavedFlash(true);
+      window.setTimeout(() => setSavedFlash(false), 1800);
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -5059,7 +5093,7 @@ function BranchDefaultDiscountRow({
           </div>
         </div>
       </div>
-      <div className="flex items-center gap-2 shrink-0">
+      <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
         <div className="relative">
           <input
             type="text"
@@ -5071,10 +5105,11 @@ function BranchDefaultDiscountRow({
               const cleaned = e.target.value.replace(/[^\d.,]/g, '');
               setInputText(cleaned);
             }}
-            onBlur={() => {
-              const parsed = parsePercent(inputText);
-              setInputText(formatForInput(parsed));
-              if (parsed !== initialPercent) void commit({ percent: parsed });
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                void commit();
+              }
             }}
             disabled={saving}
             className="w-20 px-2 py-1.5 pr-7 rounded-lg border-2 border-slate-200 focus:border-orange-400 focus:outline-none text-right font-bold text-sm"
@@ -5086,8 +5121,6 @@ function BranchDefaultDiscountRow({
           onClick={() => {
             const next = !active;
             setActive(next);
-            const parsed = parsePercent(inputText);
-            void commit({ active: next, percent: parsed });
           }}
           disabled={saving}
           className="transition-all active:scale-95"
@@ -5097,6 +5130,20 @@ function BranchDefaultDiscountRow({
             ? <ToggleRight className="w-9 h-9 text-orange-500" />
             : <ToggleLeft  className="w-9 h-9 text-slate-300" />
           }
+        </button>
+        <button
+          type="button"
+          onClick={() => void commit()}
+          disabled={saving || !dirty}
+          className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all active:scale-95 ${
+            dirty
+              ? 'bg-orange-600 hover:bg-orange-700 text-white shadow-sm'
+              : savedFlash
+                ? 'bg-emerald-100 text-emerald-700'
+                : 'bg-slate-100 text-slate-400 cursor-not-allowed'
+          }`}
+        >
+          {saving ? 'Kaydediliyor…' : savedFlash && !dirty ? 'Kaydedildi' : 'Kaydet'}
         </button>
       </div>
     </div>

@@ -179,6 +179,40 @@ export const MODULE_HIGHLIGHTS = [
   { label: 'Bildirim', icon: Sparkles },
 ] as const;
 
+/** Ana sayfa — sistemi baştan sona tanıtan tur */
+export const SYSTEM_TOUR = [
+  {
+    icon: Monitor,
+    title: 'Salon',
+    desc: 'Masa haritası, açık adisyon, birleştirme ve garson ataması. Hangi masa dolu, hesap ne kadar — bir bakışta.',
+  },
+  {
+    icon: Package,
+    title: 'Paket',
+    desc: 'Telefon çalınca müşteri gelir (Caller ID). Adres, sipariş ve kurye ataması aynı formda biter.',
+  },
+  {
+    icon: Globe,
+    title: 'Online',
+    desc: 'Getir, Yemeksepeti, Trendyol, Migros ve HemenYolda siparişleri tek listede; onay, fiş, mutfak ve kurye.',
+  },
+  {
+    icon: Wallet,
+    title: 'Kasa',
+    desc: 'Nakit, kart, parçalı ödeme, açık hesap ve sadakat puanı. Vardiya açılış–kapanış ve gün sonu.',
+  },
+  {
+    icon: Printer,
+    title: 'Mutfak',
+    desc: 'Kategori bazlı yazıcı yönlendirme. Adisyon, mutfak ve bar fişi siparişle birlikte çıkar.',
+  },
+  {
+    icon: Scale,
+    title: 'Stok & rapor',
+    desc: 'Ürün sayımı, stok hareketi, iptal logları ve şube satış raporları — her akşam net kapanış.',
+  },
+] as const;
+
 export const CORE_FEATURES: FeatureItem[] = [
   {
     icon: Monitor,

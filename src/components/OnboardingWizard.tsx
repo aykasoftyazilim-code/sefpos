@@ -1,11 +1,15 @@
 import { useState, useEffect, useMemo } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
-import { isLocalMode } from '../lib/sqlDb';
+import { isLocalMode, isVdsSelfHost, patchSqlSessionRecord } from '../lib/sqlDb';
 import { TR_CITY_NAMES, getDistricts } from '../lib/turkeyCitiesDistricts';
 import { getTrialInfo } from '../lib/tenantTrial';
 import { CheckCircle, ChefHat, UtensilsCrossed, MapPin, Phone, Globe, Building2, ArrowRight, ArrowLeft, LayoutGrid, Users, Wifi, Star, WifiOff, RefreshCw, Server, Zap, Shield, Globe as Globe2 } from 'lucide-react';
 import { publicAsset } from '../lib/assetUrl';
+import { SefposSmartGuide } from './guide/SefposSmartGuide';
+/** Vite bundle — public/ yolundan bağımsız, canlıda kesin yüklenir */
+import sefposRoundUrl from '../assets/brand/sefpos-round.png';
+import sefposLogoUrl from '../assets/brand/logo.png';
 
 /** Zorunlu alan etiketinde kucuk kirmizi nokta */
 const ReqDot = () => (
@@ -48,25 +52,16 @@ const DEPLOYMENT_MODES: {
   border: string;
   dotColor: string;
   badge?: string;
+  /** VDS web'de bu mod masaüstü ister */
+  desktopOnly?: boolean;
 }[] = [
   {
-    id: 'offline',
-    title: 'Bağımsız',
-    subtitle: 'Offline Mod',
-    description: 'İnternet bağlantısı olmadan tam çalışır. Tüm veriler yerel olarak saklanır.',
-    features: ['İnternet gerektirmez', 'Tek şube / tek cihaz', 'En hızlı yanıt süresi', 'Güvenli, yerel depolama'],
-    icon: WifiOff,
-    accent: 'text-slate-700',
-    bg: 'bg-slate-50',
-    border: 'border-slate-300',
-    dotColor: 'bg-slate-600',
-  },
-  {
     id: 'online',
-    title: 'Bulut Bağlantılı',
+    title: 'Sunucu / Bulut',
     subtitle: 'Online Mod',
-    description: 'Merkezi sunucu ile çalışır. Birden fazla şube ve cihazdan erişim sağlanır.',
-    features: ['Çoklu şube desteği', 'Gerçek zamanlı senkron', 'Uzaktan erişim & raporlar', 'Online sipariş entegrasyonu'],
+    description:
+      'Veriler sunucuda tutulur. Tarayıcı veya birden fazla cihazdan giriş yapabilirsiniz. Web (VDS) kurulumu için önerilen mod.',
+    features: ['Çoklu cihaz', 'Uzaktan erişim', 'Online sipariş entegrasyonu', 'Merkezi yedek'],
     icon: Globe2,
     accent: 'text-blue-700',
     bg: 'bg-blue-50',
@@ -75,21 +70,38 @@ const DEPLOYMENT_MODES: {
     badge: 'Önerilen',
   },
   {
+    id: 'offline',
+    title: 'Bağımsız',
+    subtitle: 'Offline Mod',
+    description:
+      'İnternet olmadan kasada çalışır. Veriler bilgisayarda tutulur. Masaüstü ŞefPOS kurulumu gerekir.',
+    features: ['İnternet gerektirmez', 'Tek şube / kasa', 'En hızlı yanıt', 'Yerel depolama'],
+    icon: WifiOff,
+    accent: 'text-slate-700',
+    bg: 'bg-slate-50',
+    border: 'border-slate-300',
+    dotColor: 'bg-slate-600',
+    desktopOnly: true,
+  },
+  {
     id: 'hybrid',
     title: 'Karma',
     subtitle: 'Hybrid Mod',
-    description: 'Çevrimdışı çalışır, internet gelince otomatik senkronize eder. En güçlü mod.',
-    features: ['İnternetsiz çalışır', 'Otomatik senkronizasyon', 'Veri kaybı riski sıfır', 'Çoklu şube desteği'],
+    description:
+      'Kasada çevrimdışı çalışır, internet gelince sunucuyla senkronize eder. Masaüstü ŞefPOS + sunucu gerekir.',
+    features: ['İnternetsiz çalışır', 'Otomatik senkron', 'Veri kaybı riski düşük', 'Çoklu şube'],
     icon: RefreshCw,
     accent: 'text-emerald-700',
     bg: 'bg-emerald-50',
     border: 'border-emerald-300',
     dotColor: 'bg-emerald-600',
+    desktopOnly: true,
   },
 ];
 
 export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
-  const { tenant, activeBranch, refreshProfile } = useAuth();
+  const { tenant, activeBranch, refreshProfile, user } = useAuth();
+  const vdsWeb = isVdsSelfHost();
   const [step, setStep] = useState(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -106,7 +118,9 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
     }
   }, []);
 
-  const [deploymentMode, setDeploymentMode] = useState<DeploymentMode>('online');
+  const [deploymentMode, setDeploymentMode] = useState<DeploymentMode>(
+    () => (vdsWeb ? 'online' : 'online'),
+  );
 
   const [bizInfo, setBizInfo] = useState({
     address: '',
@@ -150,16 +164,43 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
     }
   };
 
+  const markOnboardingCompleteInDb = async () => {
+    if (!tenant?.id) return;
+    if (isLocalMode()) {
+      await markLocalOnboardingDone();
+      return;
+    }
+    const { error: tErr } = await supabase
+      .from('tenants')
+      .update({ onboarding_completed: true })
+      .eq('id', tenant.id);
+    if (tErr) throw tErr;
+    const uid = user?.id;
+    if (uid) {
+      await supabase.from('profiles').update({ onboarding_completed: true }).eq('id', uid);
+    }
+    patchSqlSessionRecord({
+      tenant_onboarding: true,
+      onboarding_completed: true,
+      deployment_mode: deploymentMode,
+    });
+  };
+
   const handleModeNext = async () => {
     setLoading(true);
     setError('');
     try {
       if (!isLocalMode() && tenant) {
-        await supabase.from('tenants').update({ deployment_mode: deploymentMode }).eq('id', tenant.id);
+        const { error: modeErr } = await supabase
+          .from('tenants')
+          .update({ deployment_mode: deploymentMode })
+          .eq('id', tenant.id);
+        if (modeErr) throw modeErr;
+        patchSqlSessionRecord({ deployment_mode: deploymentMode });
       }
       setStep(3);
-    } catch {
-      setError('Mod kaydedilemedi, lütfen tekrar deneyin.');
+    } catch (err: any) {
+      setError('Mod kaydedilemedi: ' + (err?.message || 'Lütfen tekrar deneyin.'));
     } finally {
       setLoading(false);
     }
@@ -182,22 +223,35 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
     setError('');
     try {
       const cleanPhone = bizInfo.phone.replace(/\s+/g, '');
-      if (!isLocalMode() && tenant) {
-        await supabase.from('tenants').update({
-          address: bizInfo.address.trim(),
-          phone: cleanPhone,
-          city: bizInfo.city,
-          district: bizInfo.district,
-        }).eq('id', tenant.id);
+      // SQL şemasında city/district kolonları yok — adrese göm
+      const fullAddress = [bizInfo.address.trim(), bizInfo.district, bizInfo.city]
+        .filter(Boolean)
+        .join(', ');
 
-        if (activeBranch) {
-          await supabase.from('branches').update({
-            address: bizInfo.address.trim(),
+      if (!isLocalMode() && tenant) {
+        const { error: tErr } = await supabase
+          .from('tenants')
+          .update({
+            address: fullAddress,
             phone: cleanPhone,
-            city: bizInfo.city,
-            district: bizInfo.district,
-          }).eq('id', activeBranch.id);
+          })
+          .eq('id', tenant.id);
+        if (tErr) throw tErr;
+
+        if (activeBranch?.id) {
+          const { error: bErr } = await supabase
+            .from('branches')
+            .update({
+              address: fullAddress,
+              phone: cleanPhone,
+            })
+            .eq('id', activeBranch.id);
+          if (bErr) throw bErr;
         }
+        patchSqlSessionRecord({
+          tenant_address: fullAddress,
+          tenant_phone: cleanPhone,
+        });
       } else if (isLocalMode()) {
         const api = (window as any).electronAPI;
         if (api?.localDbWrite && tenant) {
@@ -205,7 +259,7 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
             table: 'tenants',
             row: {
               id: tenant.id,
-              address: bizInfo.address.trim(),
+              address: fullAddress,
               phone: cleanPhone,
               city: bizInfo.city,
               district: bizInfo.district,
@@ -222,7 +276,14 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
   };
 
   const handleCreateTables = async () => {
-    if (!tenant || !activeBranch) return;
+    if (!tenant) {
+      setError('Oturum / işletme bilgisi eksik. Sayfayı yenileyip tekrar deneyin.');
+      return;
+    }
+    if (!activeBranch?.id) {
+      setError('Şube bulunamadı. Sayfayı yenileyip tekrar deneyin.');
+      return;
+    }
     if (finalTableCount < 1 || finalTableCount > 100) {
       setError('Lütfen 1 ile 100 arasında bir masa sayısı girin.');
       return;
@@ -321,15 +382,7 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
         return;
       }
 
-      await supabase.from('tenants').update({ onboarding_completed: true }).eq('id', tenant.id);
-
-      try {
-        const { data: userData } = await supabase.auth.getUser();
-        if (userData?.user?.id) {
-          await supabase.from('profiles').update({ onboarding_completed: true }).eq('id', userData.user.id);
-        }
-      } catch {}
-
+      await markOnboardingCompleteInDb();
       setStep(5);
     } catch (err: any) {
       setError('Bir hata oluştu: ' + (err?.message || 'Lütfen tekrar deneyin.'));
@@ -340,45 +393,86 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
 
   const handleComplete = async () => {
     setLoading(true);
-    await onComplete();
-    setLoading(false);
+    setError('');
+    try {
+      await markOnboardingCompleteInDb();
+      await onComplete();
+      try {
+        await refreshProfile();
+      } catch {
+        /* ignore */
+      }
+    } catch (err: any) {
+      setError(err?.message || 'Kurulum tamamlanamadı');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSkipAll = async () => {
+    setLoading(true);
+    setError('');
+    try {
+      await markOnboardingCompleteInDb();
+      await onComplete();
+    } catch (err: any) {
+      setError(err?.message || 'Atlanamadı');
+    } finally {
+      setLoading(false);
+    }
   };
 
   const progress = ((step - 1) / (STEPS.length - 1)) * 100;
   const selectedMode = DEPLOYMENT_MODES.find(m => m.id === deploymentMode)!;
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-orange-500 via-red-500 to-rose-600 flex items-center justify-center p-4">
-      <div className="bg-white rounded-3xl shadow-2xl w-full max-w-2xl overflow-hidden">
-        <div className="bg-gradient-to-r from-orange-500 to-red-600 px-8 pt-8 pb-6">
-          <div className="flex items-center justify-center mb-6">
-            <img src={publicAsset('logo.png')} alt="ŞefPOS" className="h-14 w-auto brightness-0 invert" />
+    <div className="h-[100dvh] max-h-[100dvh] bg-gradient-to-br from-orange-500 via-red-500 to-rose-600 flex items-center justify-center p-2 sm:p-3 overflow-hidden">
+      <div className="bg-white rounded-2xl sm:rounded-3xl shadow-2xl w-full max-w-2xl max-h-[min(100dvh-1rem,900px)] flex flex-col overflow-hidden">
+        <div className="bg-gradient-to-r from-orange-500 to-red-600 px-4 sm:px-6 pt-3 sm:pt-4 pb-3 shrink-0">
+          <div className="flex items-center justify-center mb-2 sm:mb-3">
+            <img
+              src={sefposRoundUrl}
+              alt="ŞefPOS"
+              width={56}
+              height={56}
+              decoding="async"
+              className="h-12 w-12 sm:h-14 sm:w-14 rounded-full object-cover bg-white shadow-md ring-2 ring-white/70"
+              onError={(e) => {
+                const el = e.currentTarget;
+                if (el.dataset.fallback === '1') {
+                  el.src = publicAsset('sefpos-round.png');
+                  return;
+                }
+                el.dataset.fallback = '1';
+                el.src = sefposLogoUrl;
+              }}
+            />
           </div>
 
-          <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center justify-between mb-1.5">
             {STEPS.map((s, idx) => {
               const Icon = s.icon;
               const isActive = s.id === step;
               const isDone = s.id < step;
               return (
-                <div key={s.id} className="flex items-center flex-1">
-                  <div className="flex flex-col items-center">
-                    <div className={`w-9 h-9 rounded-full flex items-center justify-center border-2 transition-all ${
+                <div key={s.id} className="flex items-center flex-1 min-w-0">
+                  <div className="flex flex-col items-center w-full">
+                    <div className={`w-7 h-7 sm:w-8 sm:h-8 rounded-full flex items-center justify-center border-2 transition-all ${
                       isDone ? 'bg-white border-white' :
                       isActive ? 'bg-white/20 border-white' :
                       'bg-white/10 border-white/30'
                     }`}>
                       {isDone
-                        ? <CheckCircle className="w-5 h-5 text-orange-600" />
-                        : <Icon className={`w-4 h-4 ${isActive ? 'text-white' : 'text-white/50'}`} />
+                        ? <CheckCircle className="w-4 h-4 text-orange-600" />
+                        : <Icon className={`w-3.5 h-3.5 ${isActive ? 'text-white' : 'text-white/50'}`} />
                       }
                     </div>
-                    <span className={`text-[10px] font-semibold mt-1 whitespace-nowrap ${isActive ? 'text-white' : 'text-white/50'}`}>
+                    <span className={`text-[9px] sm:text-[10px] font-semibold mt-0.5 truncate max-w-full ${isActive ? 'text-white' : 'text-white/50'}`}>
                       {s.title}
                     </span>
                   </div>
                   {idx < STEPS.length - 1 && (
-                    <div className="flex-1 h-0.5 mx-2 bg-white/20 mb-5">
+                    <div className="flex-1 h-0.5 mx-1 bg-white/20 mb-4 hidden sm:block">
                       <div
                         className="h-full bg-white transition-all duration-500"
                         style={{ width: step > s.id ? '100%' : '0%' }}
@@ -389,63 +483,64 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
               );
             })}
           </div>
-          <div className="h-1 bg-white/20 rounded-full mt-2">
+          <div className="h-1 bg-white/20 rounded-full">
             <div className="h-full bg-white rounded-full transition-all duration-500" style={{ width: `${progress}%` }} />
           </div>
         </div>
 
-        <div className="p-8">
+        <div className="p-4 sm:p-5 overflow-y-auto flex-1 min-h-0 overscroll-contain">
+          <div className="mb-3">
+            <SefposSmartGuide embedded compact onboardingStep={step} />
+          </div>
+
           {step === 1 && (
             <div className="text-center">
               {phoneFirstSignupHint && (
-                <div className="mb-6 text-left rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
-                  <p className="font-bold text-emerald-800 mb-1">Cep telefonu ile kayıt tamamlandı</p>
+                <div className="mb-3 text-left rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs sm:text-sm text-emerald-900">
+                  <p className="font-bold text-emerald-800 mb-0.5">Cep telefonu ile kayıt tamamlandı</p>
                   <p className="text-emerald-800/90">
-                    Bir sonraki adımlarda çalışma modu, işletme adresi ve masalarınızı tamamlayarak ŞefPOS&apos;u kullanmaya
-                    başlayın.
+                    Çalışma modu, adres ve masalarınızı tamamlayarak kullanmaya başlayın.
                   </p>
                 </div>
               )}
-              <div className="w-20 h-20 bg-orange-100 rounded-full flex items-center justify-center mx-auto mb-6">
-                <UtensilsCrossed className="w-10 h-10 text-orange-600" />
+              <div className="w-12 h-12 sm:w-14 sm:h-14 bg-orange-100 rounded-full flex items-center justify-center mx-auto mb-3">
+                <UtensilsCrossed className="w-6 h-6 sm:w-7 sm:h-7 text-orange-600" />
               </div>
-              <h2 className="text-3xl font-black text-slate-800 mb-3">
+              <h2 className="text-xl sm:text-2xl font-black text-slate-800 mb-1">
                 ŞefPOS'a Hoş Geldiniz!
               </h2>
-              <p className="text-slate-500 text-lg mb-2">
+              <p className="text-slate-500 text-sm sm:text-base mb-1">
                 <span className="font-bold text-slate-700">{tenant?.name}</span> için hesabınız hazır.
               </p>
-              <p className="text-slate-400 mb-8">
-                Sizi birkaç adımda kuruluma yönlendireceğiz. Bu işlem yalnızca 2 dakika sürer.
+              <p className="text-slate-400 text-xs sm:text-sm mb-4">
+                Birkaç adımda kurulum — yaklaşık 2 dakika.
               </p>
 
-              <div className="grid grid-cols-3 gap-4 mb-8">
+              <div className="grid grid-cols-3 gap-2 sm:gap-3 mb-4">
                 {[
                   { icon: LayoutGrid, label: 'Masa Yönetimi', desc: 'Masaları takip edin' },
                   { icon: Users, label: 'Sipariş Takibi', desc: 'Anlık siparişler' },
                   { icon: Wifi, label: 'Online Siparişler', desc: 'Entegre platform' },
                 ].map(({ icon: Icon, label, desc }) => (
-                  <div key={label} className="bg-slate-50 rounded-2xl p-4 text-center">
-                    <Icon className="w-7 h-7 text-orange-500 mx-auto mb-2" />
-                    <div className="font-bold text-slate-700 text-sm">{label}</div>
-                    <div className="text-xs text-slate-400 mt-0.5">{desc}</div>
+                  <div key={label} className="bg-slate-50 rounded-xl p-2.5 sm:p-3 text-center">
+                    <Icon className="w-5 h-5 sm:w-6 sm:h-6 text-orange-500 mx-auto mb-1" />
+                    <div className="font-bold text-slate-700 text-[11px] sm:text-xs leading-tight">{label}</div>
+                    <div className="text-[10px] text-slate-400 mt-0.5 hidden sm:block">{desc}</div>
                   </div>
                 ))}
               </div>
 
               <button
                 onClick={() => setStep(2)}
-                className="w-full bg-gradient-to-r from-orange-500 to-red-600 hover:from-orange-600 hover:to-red-700 text-white font-bold py-4 rounded-2xl transition flex items-center justify-center gap-2 text-lg shadow-lg"
+                className="w-full bg-gradient-to-r from-orange-500 to-red-600 hover:from-orange-600 hover:to-red-700 text-white font-bold py-3 sm:py-3.5 rounded-xl sm:rounded-2xl transition flex items-center justify-center gap-2 text-base shadow-lg"
               >
                 Kuruluma Başla
                 <ArrowRight className="w-5 h-5" />
               </button>
               <button
-                onClick={async () => {
-                  if (isLocalMode()) await markLocalOnboardingDone();
-                  onComplete();
-                }}
-                className="mt-3 w-full text-slate-400 hover:text-slate-600 text-sm py-2 transition"
+                onClick={() => void handleSkipAll()}
+                disabled={loading}
+                className="mt-2 w-full text-slate-400 hover:text-slate-600 text-sm py-1.5 transition"
               >
                 Şimdi atla, daha sonra yapayım
               </button>
@@ -455,7 +550,13 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
           {step === 2 && (
             <div>
               <h2 className="text-2xl font-black text-slate-800 mb-1">Çalışma Modunu Seçin</h2>
-              <p className="text-slate-400 mb-6">Sistemin nasıl çalışmasını istiyorsunuz? İşletmenize en uygun modu seçin.</p>
+              <p className="text-slate-400 mb-2">Sistemin nasıl çalışmasını istiyorsunuz?</p>
+              {vdsWeb && (
+                <p className="text-sm text-blue-800 bg-blue-50 border border-blue-100 rounded-xl px-3 py-2 mb-4">
+                  Bu site sunucu (VDS) üzerinde. Web için <strong>Sunucu / Bulut</strong> önerilir.
+                  Bağımsız ve Karma tercihler masaüstü ŞefPOS ister; yine de kaydedilir.
+                </p>
+              )}
 
               <div className="space-y-3 mb-6">
                 {DEPLOYMENT_MODES.map((mode) => {
@@ -464,6 +565,7 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
                   return (
                     <button
                       key={mode.id}
+                      type="button"
                       onClick={() => setDeploymentMode(mode.id)}
                       className={`w-full text-left rounded-2xl border-2 p-4 transition-all duration-200 ${
                         isSelected
@@ -494,6 +596,11 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
                                 {mode.badge}
                               </span>
                             )}
+                            {vdsWeb && mode.desktopOnly && (
+                              <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-200">
+                                Masaüstü
+                              </span>
+                            )}
                           </div>
                           <p className="text-sm text-slate-500 mb-2">{mode.description}</p>
                           <div className="flex flex-wrap gap-x-4 gap-y-1">
@@ -522,9 +629,15 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
                 <Shield className={`w-4 h-4 mt-0.5 shrink-0 ${selectedMode.accent}`} />
                 <p className={`text-sm font-medium ${selectedMode.accent}`}>
                   <span className="font-black">{selectedMode.title} modu seçildi. </span>
-                  {deploymentMode === 'offline' && 'Sistem tamamen yerel olarak çalışacak, internet bağlantısı gerekmeyecek.'}
-                  {deploymentMode === 'online' && 'Tüm veriler güvenli bulut sunucusunda saklanacak, çoklu cihaz erişimi mümkün.'}
-                  {deploymentMode === 'hybrid' && 'İnternetsiz çalışır, bağlantı kurulunca otomatik senkronize eder.'}
+                  {deploymentMode === 'online' && (vdsWeb
+                    ? 'Veriler bu sunucudaki veritabanında tutulur; tarayıcıdan giriş yapmaya devam edersiniz.'
+                    : 'Tüm veriler güvenli sunucuda saklanır, çoklu cihaz erişimi mümkün.')}
+                  {deploymentMode === 'offline' && (vdsWeb
+                    ? 'Tercih kaydedilir. Tam offline çalışma için kasaya masaüstü ŞefPOS kurulmalıdır; web şu an sunucu üzerinden çalışır.'
+                    : 'Sistem tamamen yerel olarak çalışacak, internet bağlantısı gerekmeyecek.')}
+                  {deploymentMode === 'hybrid' && (vdsWeb
+                    ? 'Tercih kaydedilir. Karma senkron için masaüstü ŞefPOS + sunucu gerekir.'
+                    : 'İnternetsiz çalışır, bağlantı kurulunca otomatik senkronize eder.')}
                 </p>
               </div>
 
@@ -797,14 +910,9 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
                 </button>
               </div>
               <button
-                onClick={async () => {
-                  if (isLocalMode()) {
-                    await markLocalOnboardingDone();
-                  } else {
-                    await supabase.from('tenants').update({ onboarding_completed: true }).eq('id', tenant?.id || '');
-                  }
-                  onComplete();
-                }}
+                type="button"
+                onClick={() => void handleSkipAll()}
+                disabled={loading}
                 className="mt-3 w-full text-slate-400 hover:text-slate-600 text-sm py-2 transition"
               >
                 Bu adımı atla, masaları sonra ekleyeyim

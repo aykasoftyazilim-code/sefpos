@@ -126,10 +126,10 @@ let _rendererReadyTimer = null;
 let _lastUserActivityUpdateCheckAt = 0;
 let _autoUpdaterErrorSent = false;
 let _appStartMs = Date.now();
-const USER_ACTIVITY_UPDATE_CHECK_MS = 5 * 60 * 1000;
+const USER_ACTIVITY_UPDATE_CHECK_MS = 3 * 60 * 1000;
 /** Periyodik arka plan kontrolü — açık kalan kasalar yeni sürümü yakalasın. */
-const UPDATER_PERIODIC_MS = 45 * 60 * 1000;
-const UPDATER_INITIAL_DELAYS_MS = [4000, 30000, 120000];
+const UPDATER_PERIODIC_MS = 20 * 60 * 1000;
+const UPDATER_INITIAL_DELAYS_MS = [4000, 30_000, 120_000, 300_000];
 /** `checkForUpdatesAndNotify` Windows'ta İngilizce yerel bildirim açar; yalnız `checkForUpdates` + olaylar → renderer Türkçe UI. */
 
 function notifyUpdaterErrorToRenderer(err) {
@@ -1179,6 +1179,15 @@ async function execSelectWithJoins(table, select, filters, orderBy, limitVal, cf
     const rel = getFkForJoin(table, j.table);
     if (!rel) continue;
 
+    const isCountOnly = j.cols.length === 1 && j.cols[0] === 'count';
+    if (isCountOnly && rel.direction === 'child') {
+      const alias = `c_${j.table}`;
+      joinSelectParts.push(
+        `(SELECT COUNT_BIG(*) FROM ${safeId(j.table)} ${alias} WHERE ${alias}.${safeId(rel.fk)} = t.${safeId(rel.pk)}) AS [${j.table}__count]`,
+      );
+      continue;
+    }
+
     const alias = `j_${j.table}`;
     if (rel.direction === 'parent') {
       joinClauses.push(`LEFT JOIN ${safeId(j.table)} ${alias} ON t.${safeId(rel.fk)} = ${alias}.${safeId(rel.pk)}`);
@@ -1238,6 +1247,10 @@ async function execSelectWithJoins(table, select, filters, orderBy, limitVal, cf
 
     for (const [tbl, data] of Object.entries(nested)) {
       const { categories: catSub, ...rest } = data;
+      if (Object.keys(rest).length === 1 && Object.prototype.hasOwnProperty.call(rest, 'count')) {
+        main[tbl] = [{ count: Number(rest.count) || 0 }];
+        continue;
+      }
       const allNull = Object.values(rest).every((v) => v === null);
       const base = allNull ? {} : rest;
       if (catSub && !Object.values(catSub).every((v) => v === null)) {
@@ -1867,6 +1880,9 @@ async function getSystemPrinters() {
 }
 
 function supabaseFetch(endpoint, options = {}) {
+  if (!isDev) {
+    return Promise.resolve({ ok: false, status: 0, data: null });
+  }
   return new Promise((resolve, reject) => {
     const url = new URL(SUPABASE_URL + endpoint);
     const reqOptions = {
@@ -2776,8 +2792,12 @@ function createWindow() {
     mainWindow.loadURL(`http://localhost:${readSefposDevServerPort()}`);
     mainWindow.webContents.openDevTools();
   } else {
-    const indexPath = path.join(app.getAppPath(), 'dist', 'index.html');
-    mainWindow.loadFile(indexPath);
+    const vdsWeb = String((loadSettings().vdsWebUrl || process.env.SEFPOS_VDS_WEB_URL || 'http://45.195.231.185')).replace(/\/$/, '');
+    mainWindow.loadURL(vdsWeb).catch((err) => {
+      paLog('error', 'VDS arayüz yüklenemedi: ' + (err?.message || err));
+      const indexPath = path.join(app.getAppPath(), 'dist', 'index.html');
+      mainWindow.loadFile(indexPath);
+    });
   }
 
   // Üretim: DevTools kapalı (müşteri EXE incelemesini zorlaştırır). Destek: Ctrl+Shift+Alt+S kilidi açar.
@@ -2811,8 +2831,8 @@ function createWindow() {
   mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription) => {
     if (!isDev && errorCode !== -3 && !mainLoadRetried) {
       mainLoadRetried = true;
-      const indexPath = path.join(app.getAppPath(), 'dist', 'index.html');
-      mainWindow.loadFile(indexPath);
+      const vdsWeb = String((loadSettings().vdsWebUrl || process.env.SEFPOS_VDS_WEB_URL || 'http://45.195.231.185')).replace(/\/$/, '');
+      mainWindow.loadURL(vdsWeb);
       return;
     }
     if (!isDev && errorCode !== -3) {
@@ -3579,6 +3599,7 @@ ipcMain.handle('hybrid-kasa-login', async (_, { email, password }) => {
     const loginEmail = String(email || '').trim().toLowerCase();
 
     const { cloudPasswordSignIn, fetchCloudProfile } = require('./hybridSync.cjs');
+    return { success: false, error: 'Supabase kapatıldı. VDS SQL hesabıyla giriş yapın.' };
     const auth = await cloudPasswordSignIn(loginEmail, password);
     const profile = await fetchCloudProfile(auth.access_token, auth.user?.id);
     if (!profile?.tenant_id || profile.tenant_id !== link.cloudTenantId) {
@@ -3856,7 +3877,7 @@ const SQL_ROW_ALLOWLIST = {
   order_items: ['id', 'order_id', 'tenant_id', 'product_id', 'variant_id', 'quantity', 'unit_price', 'tax_rate', 'discount_amount', 'total_amount', 'notes', 'variant_name', 'status', 'cancellation_reason', 'cancelled_by', 'cancelled_at', 'paid_quantity', 'paid_at', 'created_at'],
   tenants: ['id', 'name', 'slug', 'address', 'phone', 'email', 'logo_url', 'subscription_status', 'subscription_plan', 'subscription_expires_at', 'max_branches', 'notes', 'onboarding_completed', 'deployment_mode', 'printer_settings', 'require_cancel_reason', 'lock_pin', 'ip_lock_enabled', 'created_at'],
   branches: ['id', 'tenant_id', 'name', 'address', 'phone', 'is_active', 'is_main', 'created_at'],
-  orders: ['id', 'tenant_id', 'branch_id', 'table_id', 'order_number', 'order_type', 'order_subtype', 'status', 'payment_status', 'payment_method', 'subtotal', 'tax_amount', 'discount_amount', 'total_amount', 'notes', 'waiter_id', 'waiter_name', 'created_by', 'created_at', 'updated_at', 'completed_at', 'paid_at', 'session_id', 'customer_id', 'customer_name', 'customer_phone', 'customer_address', 'delivery_address', 'delivery_note', 'courier_id', 'courier_name', 'estimated_delivery_minutes'],
+  orders: ['id', 'tenant_id', 'branch_id', 'table_id', 'order_number', 'order_type', 'order_subtype', 'status', 'payment_status', 'payment_method', 'subtotal', 'tax_amount', 'discount_amount', 'total_amount', 'notes', 'waiter_id', 'waiter_name', 'created_by', 'created_at', 'updated_at', 'completed_at', 'paid_at', 'session_id', 'customer_id', 'customer_name', 'customer_phone', 'customer_address', 'delivery_address', 'delivery_note', 'courier_id', 'courier_name', 'estimated_delivery_minutes', 'delivery_status', 'payment_collected', 'delivery_customer_id', 'assigned_at', 'picked_up_at', 'delivered_at'],
   payment_transactions: ['id', 'tenant_id', 'order_id', 'payment_method', 'amount', 'notes', 'created_at', 'created_by'],
   customer_transactions: ['id', 'tenant_id', 'customer_id', 'order_id', 'type', 'amount', 'description', 'created_by', 'created_at'],
   customers: ['id', 'tenant_id', 'name', 'phone', 'email', 'address', 'tax_number', 'credit_limit', 'current_balance', 'is_active', 'notes', 'created_at', 'updated_at'],
@@ -3882,8 +3903,8 @@ const SQL_ROW_ALLOWLIST = {
   ingredient_movements: ['id', 'tenant_id', 'ingredient_id', 'movement_type', 'quantity', 'unit_cost', 'reference_type', 'reference_id', 'note', 'created_by', 'created_at'],
   waiters: ['id', 'tenant_id', 'phone', 'pin', 'name', 'status', 'created_at', 'updated_at'],
   waiter_calls: ['id', 'tenant_id', 'branch_id', 'table_label', 'call_type', 'message', 'status', 'created_at', 'resolved_at', 'resolved_by'],
-  delivery_customers: ['id', 'tenant_id', 'name', 'phone', 'address', 'notes', 'created_at'],
-  couriers: ['id', 'tenant_id', 'branch_id', 'full_name', 'phone', 'pin', 'status', 'is_active', 'latitude', 'longitude', 'created_at'],
+  delivery_customers: ['id', 'tenant_id', 'branch_id', 'name', 'full_name', 'phone', 'address', 'notes', 'last_order_at', 'order_count', 'created_at', 'updated_at'],
+  couriers: ['id', 'tenant_id', 'branch_id', 'full_name', 'phone', 'pin', 'pin_code', 'status', 'is_active', 'latitude', 'longitude', 'notification_token', 'location_updated_at', 'created_at'],
   online_orders: ['id', 'tenant_id', 'branch_id', 'platform_id', 'external_id', 'status', 'customer_name', 'customer_phone', 'delivery_address', 'total_amount', 'notes', 'created_at'],
   online_order_platforms: ['id', 'tenant_id', 'branch_id', 'platform', 'is_active', 'settings', 'created_at'],
   online_order_items: ['id', 'order_id', 'tenant_id', 'product_name', 'quantity', 'unit_price', 'total_price', 'notes'],
@@ -3899,6 +3920,14 @@ function pickSqlRow(table, row) {
   if (table === 'customer_transactions') {
     if (src.note != null && src.description == null) src.description = src.note;
     delete src.note;
+  }
+  if (table === 'delivery_customers') {
+    if (src.full_name == null && src.name != null) src.full_name = src.name;
+    delete src.name;
+  }
+  if (table === 'couriers') {
+    if (src.pin_code == null && src.pin != null) src.pin_code = src.pin;
+    delete src.pin;
   }
   const allowed = SQL_ROW_ALLOWLIST[table];
   if (!allowed) return src;
@@ -4060,6 +4089,9 @@ ipcMain.handle('sql-query', async (_, { table, operation, select, filters, order
       const results = [];
       for (const row of rowArr) {
         const clean = pickSqlRow(table, row) || {};
+        if (table === 'admin_tenant_impersonation' && clean.user_id) {
+          clean.id = clean.user_id;
+        }
         if (!clean.id) clean.id = require('crypto').randomUUID();
         const upserted = await sqlUpsertRowSafe(table, clean, cfg);
         if (upserted) results.push(upserted);

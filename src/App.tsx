@@ -68,6 +68,7 @@ import { OnlineOrderToast } from './components/OnlineOrderToast';
 import { GlobalGetirSync } from './components/GlobalGetirSync';
 import { GlobalHybridSync } from './components/GlobalHybridSync';
 import { PrintStatusToast } from './components/PrintStatusToast';
+import { SefposSmartGuide } from './components/guide/SefposSmartGuide';
 import { TerminalLogin, TerminalApp } from './components/TerminalMode';
 import { isTerminalMode, exitTerminalMode } from './lib/terminalMode';
 import { isCapacitorNative } from './lib/capacitorPlatform';
@@ -216,6 +217,11 @@ export default function App() {
   const [showLoginPage, setShowLoginPage] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
     try {
+      if (import.meta.env.VITE_VDS_SELFHOST === 'true') {
+        const path = (window.location.pathname || '/').toLowerCase();
+        if (isAuthRoutePath(path)) return true;
+        return false;
+      }
       const path = (window.location.pathname || '/').toLowerCase();
       if (isAuthRoutePath(path)) return true;
       const host = window.location.hostname;
@@ -266,8 +272,32 @@ export default function App() {
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
   }, []);
+
+  // Giriş sonrası /login URL'sinde kalma — soft refresh / eski SW karışıklığını azaltır
+  useEffect(() => {
+    if (!user || typeof window === 'undefined') return;
+    const path = (window.location.pathname || '/').toLowerCase();
+    if (!path.startsWith('/login') || isAykaAdminPath(path)) return;
+    try {
+      window.history.replaceState({}, '', '/');
+    } catch {
+      /* ignore */
+    }
+    setShowLoginPage(false);
+  }, [user]);
   const [onboardingDone, setOnboardingDone] = useState(() => {
     return localStorage.getItem('onboarding_dismissed') === 'true';
+  });
+  const [guideAutoOpen] = useState(() => {
+    try {
+      if (sessionStorage.getItem('shefpos_open_guide_once') === '1') {
+        sessionStorage.removeItem('shefpos_open_guide_once');
+        return true;
+      }
+    } catch {
+      /* ignore */
+    }
+    return false;
   });
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -685,6 +715,11 @@ export default function App() {
           localStorage.setItem('onboarding_dismissed', 'true');
           setOnboardingDone(true);
           setShowOnboarding(false);
+          try {
+            sessionStorage.setItem('shefpos_open_guide_once', '1');
+          } catch {
+            /* ignore */
+          }
           await refreshProfile();
         }} />
       </PosPageSuspense>
@@ -980,6 +1015,7 @@ export default function App() {
         currentPage={currentPage}
       />
       <PrintStatusToast />
+      <SefposSmartGuide currentPage={currentPage} defaultOpen={guideAutoOpen} />
     </div>
     </ActiveShiftProvider>
   );

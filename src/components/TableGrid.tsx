@@ -864,6 +864,11 @@ export function TableGrid({
     if (!tenant || !activeBranch || !isActive) {
       channelsRef.current.forEach((ch) => supabase.removeChannel(ch));
       channelsRef.current = [];
+      // Şube henüz yokken sonsuz skeleton kalmasın — şube gelince effect tekrar çalışır
+      if (!activeBranch && tenant && isActive) {
+        setLoading(true);
+        setGridFetchDone(false);
+      }
       return;
     }
 

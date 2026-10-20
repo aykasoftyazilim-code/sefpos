@@ -187,6 +187,8 @@ export function Products({ isActive = true }: { isActive?: boolean }) {
   const [showReceipt, setShowReceipt] = useState(false);
   const [showStockMovements, setShowStockMovements] = useState(false);
   const [showAddCategory, setShowAddCategory] = useState(false);
+  const [showQuickCategoryInProduct, setShowQuickCategoryInProduct] = useState(false);
+  const [addingCategory, setAddingCategory] = useState(false);
   const [productAdvancedOpen, setProductAdvancedOpen] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [editingProduct, setEditingProduct] = useState<string | null>(null);
@@ -724,43 +726,63 @@ export function Products({ isActive = true }: { isActive?: boolean }) {
     setImportDone(true);
   };
 
-  const handleAddCategory = async () => {
-    if (!tenant || !newCategory.name) return;
+  const handleAddCategory = async (opts?: { assignToProduct?: boolean }) => {
+    const name = newCategory.name.trim();
+    if (!tenant || !name || addingCategory) return;
 
-    // Optimistic update
-    const tempId = crypto.randomUUID();
+    setAddingCategory(true);
+    const catId = crypto.randomUUID();
+    const sortOrder = categories.length;
     const optimisticCategory: Category = {
-      id: tempId,
-      name: newCategory.name,
+      id: catId,
+      name,
       color: newCategory.color,
-      sort_order: categories.length,
+      sort_order: sortOrder,
+      vat_rate: newCategory.vat_rate,
+      hugin_department_id: newCategory.hugin_department_id,
     };
     setCategories(prev => [...prev, optimisticCategory]);
 
     const catPayload: Record<string, unknown> = {
+      id: catId,
       tenant_id: tenant.id,
-      name: newCategory.name,
+      name,
       color: newCategory.color,
-      sort_order: categories.length,
+      sort_order: sortOrder,
     };
     if (newCategory.vat_rate != null) catPayload.vat_rate = newCategory.vat_rate;
     if (newCategory.hugin_department_id != null) {
       catPayload.hugin_department_id = newCategory.hugin_department_id;
     }
 
-    const { error } = await supabase.from('categories').insert(catPayload);
+    const { data, error } = await supabase.from('categories').insert(catPayload).select().single();
 
     if (error) {
-      setCategories(prev => prev.filter(c => c.id !== tempId));
+      setCategories(prev => prev.filter(c => c.id !== catId));
       alert('Kategori eklenemedi: ' + (error.message || String(error)));
+      setAddingCategory(false);
+      return;
+    }
+
+    const saved = (data || optimisticCategory) as Category;
+    setCategories(prev => prev.map(c => (c.id === catId ? { ...c, ...saved, id: saved.id || catId } : c)));
+    queryCache.invalidate('categories', tenant.id);
+    queryCache.invalidate('products', tenant.id);
+    void loadCategories(true);
+
+    if (opts?.assignToProduct) {
+      setNewProduct(prev => ({
+        ...prev,
+        category_id: saved.id || catId,
+        ...(saved.vat_rate != null ? { tax_rate: String(saved.vat_rate) } : {}),
+      }));
+      setShowQuickCategoryInProduct(false);
     } else {
-      queryCache.invalidate('categories', tenant.id);
-      queryCache.invalidate('products', tenant.id);
-      void loadCategories(true);
+      setShowAddCategory(false);
     }
 
     setNewCategory({ name: '', color: '#F97316', vat_rate: null, hugin_department_id: null });
-    setShowAddCategory(false);
+    setAddingCategory(false);
   };
 
   const handleAddVariant = () => {
@@ -876,6 +898,7 @@ export function Products({ isActive = true }: { isActive?: boolean }) {
       });
       setVariantName('');
       setVariantPrice('');
+      setShowQuickCategoryInProduct(false);
       setShowAddProduct(false);
     } catch (e: any) {
       alert('Ürün eklenemedi: ' + (e?.message || String(e)));
@@ -1997,7 +2020,10 @@ export function Products({ isActive = true }: { isActive?: boolean }) {
             <div className="flex items-center justify-between px-5 sm:px-7 py-3 sm:py-4 border-b border-slate-200 shrink-0">
               <h2 className="text-lg sm:text-2xl font-bold">Yeni Ürün</h2>
               <button
-                onClick={() => setShowAddProduct(false)}
+                onClick={() => {
+                  setShowAddProduct(false);
+                  setShowQuickCategoryInProduct(false);
+                }}
                 className="p-2 rounded-lg hover:bg-slate-100 text-slate-500"
                 aria-label="Kapat"
               >
@@ -2013,24 +2039,97 @@ export function Products({ isActive = true }: { isActive?: boolean }) {
                   onChange={(e) => setNewProduct({ ...newProduct, name: e.target.value })}
                   className="md:col-span-2 w-full px-3 py-2.5 border-2 border-slate-200 rounded-xl focus:border-blue-500 focus:outline-none text-base"
                 />
-                <select
-                  value={newProduct.category_id}
-                  onChange={(e) => {
-                    const catId = e.target.value;
-                    const cat = categories.find(c => c.id === catId);
-                    const updates: Partial<typeof newProduct> = { category_id: catId };
-                    if (cat && cat.vat_rate != null) {
-                      updates.tax_rate = String(cat.vat_rate);
-                    }
-                    setNewProduct(prev => ({ ...prev, ...updates }));
-                  }}
-                  className="md:col-span-2 w-full px-3 py-2.5 border-2 border-slate-200 rounded-xl focus:border-blue-500 focus:outline-none text-base"
-                >
-                  <option value="">Kategorisiz (isteğe bağlı)</option>
-                  {categories.map(cat => (
-                    <option key={cat.id} value={cat.id}>{cat.name}{cat.vat_rate != null ? ` (KDV %${cat.vat_rate})` : ''}</option>
-                  ))}
-                </select>
+                <div className="md:col-span-2 space-y-2">
+                  <div className="flex gap-2">
+                    <select
+                      value={newProduct.category_id}
+                      onChange={(e) => {
+                        const catId = e.target.value;
+                        const cat = categories.find(c => c.id === catId);
+                        const updates: Partial<typeof newProduct> = { category_id: catId };
+                        if (cat && cat.vat_rate != null) {
+                          updates.tax_rate = String(cat.vat_rate);
+                        }
+                        setNewProduct(prev => ({ ...prev, ...updates }));
+                      }}
+                      className="flex-1 min-w-0 w-full px-3 py-2.5 border-2 border-slate-200 rounded-xl focus:border-blue-500 focus:outline-none text-base"
+                    >
+                      <option value="">Kategorisiz (isteğe bağlı)</option>
+                      {categories.map(cat => (
+                        <option key={cat.id} value={cat.id}>{cat.name}{cat.vat_rate != null ? ` (KDV %${cat.vat_rate})` : ''}</option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => setShowQuickCategoryInProduct(v => !v)}
+                      className={`shrink-0 px-3 py-2.5 rounded-xl border-2 font-semibold text-sm transition-all flex items-center gap-1 ${
+                        showQuickCategoryInProduct
+                          ? 'bg-blue-600 border-blue-600 text-white'
+                          : 'bg-white border-slate-200 text-slate-700 hover:border-blue-400 hover:text-blue-700'
+                      }`}
+                      title="Yeni kategori ekle"
+                      aria-label="Yeni kategori ekle"
+                    >
+                      <Plus size={18} />
+                      <span className="hidden sm:inline">Kategori</span>
+                    </button>
+                  </div>
+                  {showQuickCategoryInProduct && (
+                    <div className="rounded-xl border-2 border-blue-100 bg-slate-50 p-3 space-y-2.5">
+                      <p className="text-xs font-semibold text-slate-600">Yeni kategori (ürün ekranından)</p>
+                      <input
+                        type="text"
+                        placeholder="Kategori adı"
+                        value={newCategory.name}
+                        onChange={(e) => setNewCategory({ ...newCategory, name: e.target.value })}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            void handleAddCategory({ assignToProduct: true });
+                          }
+                        }}
+                        className="w-full px-3 py-2.5 border-2 border-slate-200 rounded-xl focus:border-blue-500 focus:outline-none text-base bg-white"
+                        autoFocus
+                      />
+                      <div className="flex flex-wrap gap-1.5">
+                        {['#F97316', '#EF4444', '#F59E0B', '#10B981', '#3B82F6', '#8B5CF6', '#EC4899', '#64748B'].map(color => (
+                          <button
+                            key={color}
+                            type="button"
+                            onClick={() => setNewCategory({ ...newCategory, color })}
+                            className="w-7 h-7 rounded-md border-2 transition-transform"
+                            style={{
+                              backgroundColor: color,
+                              borderColor: newCategory.color === color ? '#0f172a' : 'transparent',
+                              transform: newCategory.color === color ? 'scale(1.1)' : 'scale(1)',
+                            }}
+                            aria-label={`Renk ${color}`}
+                          />
+                        ))}
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowQuickCategoryInProduct(false);
+                            setNewCategory({ name: '', color: '#F97316', vat_rate: null, hugin_department_id: null });
+                          }}
+                          className="flex-1 px-3 py-2 rounded-xl bg-slate-200 text-slate-700 text-sm font-semibold hover:bg-slate-300"
+                        >
+                          İptal
+                        </button>
+                        <button
+                          type="button"
+                          disabled={addingCategory || !newCategory.name.trim()}
+                          onClick={() => void handleAddCategory({ assignToProduct: true })}
+                          className="flex-1 px-3 py-2 rounded-xl bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {addingCategory ? 'Ekleniyor…' : 'Ekle ve seç'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
                 <input
                   type="number"
                   placeholder={`Fiyat (${currencySymbol})`}
@@ -2283,7 +2382,10 @@ export function Products({ isActive = true }: { isActive?: boolean }) {
               <button
                 type="button"
                 disabled={addProductSaving}
-                onClick={() => setShowAddProduct(false)}
+                onClick={() => {
+                  setShowAddProduct(false);
+                  setShowQuickCategoryInProduct(false);
+                }}
                 className="flex-1 px-6 py-3 bg-slate-200 text-slate-700 rounded-xl hover:bg-slate-300 transition-all disabled:opacity-50"
               >
                 İptal

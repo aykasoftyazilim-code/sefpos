@@ -8,7 +8,7 @@
 //   const res = await callGetir({ platformId, action: 'pos-status-set', status: 100 });
 
 import { supabase } from './supabase';
-import { isSqlServerMode } from './sqlDb';
+import { isSqlServerMode, isVdsSelfHost } from './sqlDb';
 import {
   GETIR_NUMERIC_STATUS_MAP,
   INTERNAL_UNKNOWN_STATUS,
@@ -141,7 +141,7 @@ async function ensureFreshSession(): Promise<{ access_token: string } | null> {
  */
 export async function callGetir(payload: GetirActionPayload): Promise<GetirActionResult> {
   const run = async (): Promise<GetirActionResult> => {
-    if (isSqlServerMode()) {
+    if (isVdsSelfHost() || isSqlServerMode()) {
       const api = (window as any).electronAPI;
       if (api?.sqlGetirCall) {
         try {
@@ -159,6 +159,33 @@ export async function callGetir(payload: GetirActionPayload): Promise<GetirActio
           };
         } catch (e: any) {
           return { ok: false, error: e?.message || 'SQL Getir hatasi' };
+        }
+      }
+      if (isVdsSelfHost()) {
+        try {
+          const { data: sess } = await supabase.auth.getSession();
+          const token = sess?.session?.access_token;
+          const resp = await fetch('/vds-api/fn/getir-api', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+            body: JSON.stringify(payload),
+            credentials: 'same-origin',
+          });
+          const data = await resp.json().catch(() => ({}));
+          return {
+            ok: !!data?.ok,
+            status: data?.status ?? resp.status,
+            error: data?.error,
+            data: data?.data,
+            fetched: data?.fetched,
+            saved: data?.saved,
+            newCount: data?.newCount,
+          };
+        } catch (e: any) {
+          return { ok: false, error: e?.message || 'VDS Getir hatasi' };
         }
       }
       return { ok: false, error: 'SQL Getir koprusu bulunamadi (Electron gerekli)' };

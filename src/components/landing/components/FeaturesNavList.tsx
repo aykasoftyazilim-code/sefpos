@@ -6,10 +6,11 @@ type FeaturesNavListProps = {
   onSelect: (id: string) => void;
   /** Üst menü mega paneli — daha kompakt satırlar */
   compact?: boolean;
+  onHover?: (id: string) => void;
 };
 
 /** İkon + modül adı, iki sütun — ŞefPOS marka stilleri */
-export function FeaturesNavList({ activeId, onSelect, compact = false }: FeaturesNavListProps) {
+export function FeaturesNavList({ activeId, onSelect, compact = false, onHover }: FeaturesNavListProps) {
   return (
     <ul
       className={`grid grid-cols-1 sm:grid-cols-2 gap-0.5 ${compact ? 'gap-0' : 'gap-1'}`}
@@ -24,6 +25,8 @@ export function FeaturesNavList({ activeId, onSelect, compact = false }: Feature
               role="listitem"
               aria-current={isActive ? 'true' : undefined}
               onClick={() => onSelect(cat.id)}
+              onMouseEnter={() => onHover?.(cat.id)}
+              onFocus={() => onHover?.(cat.id)}
               className={`landing-feature-row group w-full ${isActive ? 'is-active' : ''} ${compact ? 'is-compact' : ''}`}
             >
               <span className="landing-feature-row-icon" aria-hidden>

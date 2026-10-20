@@ -1,0 +1,247 @@
+import { StrictMode, Component, type ErrorInfo, type ReactNode } from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+/* index.css → index.html <link> (dev HMR tüm App ağacını yenilemesin) */
+import { AuthProvider } from './contexts/AuthContext';
+import { ElectronDesktopShell } from './components/ElectronDesktopShell';
+import { PublicMenu } from './components/PublicMenu';
+import { hideBootSplash } from './lib/bootSplash';
+import { installDevPerfBoot } from './lib/devPerfBoot';
+import { installElectronSessionHygiene } from './lib/electronSessionHygiene';
+
+/**
+ * Üst seviye Error Boundary. Tek bir alt component runtime hatası verirse
+ * tüm React ağacını çökertip beyaz ekran / inline boot splash'e dönmek
+ * yerine kullanıcıya açıklayıcı bir kart gösterir (yenile / oturumu kapat).
+ * Geliştirme sırasında stack trace'i de görünür kılar.
+ */
+type ErrorBoundaryState = { error: Error | null };
+class AppErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryState> {
+  state: ErrorBoundaryState = { error: null };
+  static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+    return { error };
+  }
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    try {
+      console.error('[ŞefPOS] Üst seviye hata:', error, info?.componentStack);
+    } catch {}
+  }
+  private reset = () => {
+    this.setState({ error: null });
+  };
+  private reload = () => {
+    try { window.location.reload(); } catch {}
+  };
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div
+        style={{
+          position: 'fixed',
+          inset: 0,
+          background: '#ffffff',
+          color: '#0f172a',
+          fontFamily: '"Inter", "Segoe UI", Arial, sans-serif',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: 16,
+          zIndex: 2147483646,
+        }}
+      >
+        <div
+          style={{
+            maxWidth: 520,
+            width: '100%',
+            background: '#fff',
+            border: '1px solid #e2e8f0',
+            borderRadius: 16,
+            boxShadow: '0 12px 32px rgba(15, 23, 42, .08)',
+            padding: 24,
+          }}
+        >
+          <div style={{ fontSize: 22, fontWeight: 800, marginBottom: 8 }}>
+            ŞefPOS — Beklenmedik hata
+          </div>
+          <div style={{ fontSize: 14, color: '#475569', marginBottom: 16 }}>
+            Ekran çizilirken bir sorun oluştu. Lütfen sayfayı yenileyin. Sorun devam
+            ederse ayarlardan dil/yazıcı seçimini değiştirip tekrar deneyin veya
+            destekle iletişime geçin.
+          </div>
+          <pre
+            style={{
+              fontSize: 12,
+              background: '#f8fafc',
+              border: '1px solid #e2e8f0',
+              borderRadius: 8,
+              padding: 12,
+              maxHeight: 160,
+              overflow: 'auto',
+              color: '#0f172a',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+            }}
+          >
+            {String(this.state.error?.message || this.state.error)}
+          </pre>
+          <div style={{ display: 'flex', gap: 8, marginTop: 16, flexWrap: 'wrap' }}>
+            <button
+              onClick={this.reload}
+              style={{
+                padding: '10px 16px',
+                borderRadius: 10,
+                background: '#f97316',
+                color: '#fff',
+                fontWeight: 700,
+                border: 'none',
+                cursor: 'pointer',
+              }}
+            >
+              Sayfayı yenile
+            </button>
+            <button
+              onClick={this.reset}
+              style={{
+                padding: '10px 16px',
+                borderRadius: 10,
+                background: '#fff',
+                color: '#0f172a',
+                fontWeight: 700,
+                border: '1px solid #cbd5e1',
+                cursor: 'pointer',
+              }}
+            >
+              Tekrar dene
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+}
+
+/** Dev: eski SW önbelleği (üretim HTML / hash'li chunk) localhost'ta beyaz sayfa yapabiliyor */
+if (import.meta.env.DEV && typeof navigator !== 'undefined' && navigator.serviceWorker) {
+  void navigator.serviceWorker.getRegistrations().then((regs) => {
+    for (const r of regs) void r.unregister();
+  });
+}
+
+/**
+ * Prod web:
+ * - VDS (VITE_VDS_SELFHOST): SW kaydı YOK — soft refresh / giriş sonrası skeleton kilidini önler.
+ *   Eski SW varsa unregister + cache temizle.
+ * - Diğer web (Pages vb.): PWA SW (Electron file:// hariç)
+ */
+if (
+  typeof navigator !== 'undefined' &&
+  'serviceWorker' in navigator &&
+  typeof window !== 'undefined' &&
+  window.location.protocol !== 'file:' &&
+  !(window as Window & { electronAPI?: unknown }).electronAPI
+) {
+  const isVds = import.meta.env.VITE_VDS_SELFHOST === 'true';
+
+  if (isVds || import.meta.env.PROD) {
+    window.addEventListener('message', (ev) => {
+      if (ev?.data?.type === 'SEFPOS_SW_KILLED') {
+        window.location.reload();
+      }
+    });
+  }
+
+  if (isVds) {
+    window.addEventListener('load', () => {
+      void (async () => {
+        try {
+          const regs = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(regs.map((r) => r.unregister()));
+        } catch {
+          /* ignore */
+        }
+        try {
+          if (typeof caches !== 'undefined') {
+            const keys = await caches.keys();
+            await Promise.all(keys.map((k) => caches.delete(k)));
+          }
+        } catch {
+          /* ignore */
+        }
+        // Eski SW hâlâ kontrol ediyorsa kill script'i bir kez çek (VDS'de sw.js = kill)
+        try {
+          const base = import.meta.env.BASE_URL || '/';
+          const swPath = `${base}sw.js`.replace(/\/{2,}/g, '/');
+          await navigator.serviceWorker.register(swPath);
+        } catch {
+          /* ignore */
+        }
+      })();
+    });
+  } else if (import.meta.env.PROD) {
+    window.addEventListener('load', () => {
+      const base = import.meta.env.BASE_URL || '/';
+      const swPath = `${base}sw.js`.replace(/\/{2,}/g, '/');
+      navigator.serviceWorker.register(swPath).catch(() => {});
+    });
+  }
+}
+
+/**
+ * Public QR menü modu — `?menu=BRANCH_UUID` ve isteğe bağlı `masa=` / `table=`.
+ * Login/Auth bypass: AuthProvider yok; doğrudan PublicMenu render edilir.
+ * RLS anon policy'leri sayesinde sadece aktif + menüde görünür kayıtlar gelir.
+ */
+const params = new URLSearchParams(window.location.search);
+const menuBranchId = params.get('menu');
+/** QR'da sabit masa / bölüm etiketi (?masa= veya ?table=) */
+const qrTableHint = (params.get('masa') || params.get('table') || '').trim();
+
+const ROOT_CACHE_KEY = '__sefpos_react_root__';
+
+/** Vite HMR main.tsx'i yeniden çalıştırınca aynı #root için ikinci createRoot uyarısını önler. */
+function getOrCreateRoot(container: HTMLElement) {
+  type CachedRoot = ReturnType<typeof createRoot>;
+  const cached = container as HTMLElement & { [ROOT_CACHE_KEY]?: CachedRoot };
+  if (!cached[ROOT_CACHE_KEY]) {
+    cached[ROOT_CACHE_KEY] = createRoot(container);
+  }
+  return cached[ROOT_CACHE_KEY]!;
+}
+
+function renderApp() {
+  const container = document.getElementById('root');
+  if (!container) return;
+  const root = getOrCreateRoot(container);
+
+  if (menuBranchId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(menuBranchId)) {
+    root.render(
+      <StrictMode>
+        <AppErrorBoundary>
+          <PublicMenu branchId={menuBranchId} qrTableHint={qrTableHint} />
+        </AppErrorBoundary>
+      </StrictMode>,
+    );
+  } else {
+    root.render(
+      <StrictMode>
+        <AppErrorBoundary>
+          <AuthProvider>
+            <App />
+            <ElectronDesktopShell />
+          </AuthProvider>
+        </AppErrorBoundary>
+      </StrictMode>,
+    );
+  }
+}
+
+renderApp();
+installDevPerfBoot();
+installElectronSessionHygiene();
+
+// React mount sonrasi HTML splash hemen kalksin (cift splash suresi kisalir)
+requestAnimationFrame(() => hideBootSplash());
+window.setTimeout(() => hideBootSplash(), 8000);
+
+// Self-accept + renderApp() tüm import grafiğini sürekli yenileyip binlerce
+// "[vite] hot updated" loguna yol açabiliyor. createRoot önbelleği yeterli.

@@ -96,7 +96,7 @@ export interface PrintSettings {
   printStyle: PrintStyleSettings;
 }
 
-import { supabase } from './supabase';
+import { supabase, getEdgeFunctionInvokeUrl } from './supabase';
 import { dispatchPrintToast } from './printToasts';
 import { formatMoneyReceipt, getActiveCurrencyCode } from './currency';
 
@@ -1423,10 +1423,6 @@ async function tryLocalPrintAgent(
   }
 }
 
-const DEFAULT_SUPABASE_FN_BASE =
-  (import.meta.env.VITE_SUPABASE_URL as string | undefined)?.replace(/\/$/, '') ||
-  'https://xdfnozfuuzctubijbnds.supabase.co';
-
 /** Edge `online-order-reprint` ile onay fişi HTML üretir. */
 export async function fetchOnlineOrderReceiptHtml(
   onlineOrderId: string,
@@ -1435,7 +1431,7 @@ export async function fetchOnlineOrderReceiptHtml(
   const { data: sess } = await supabase.auth.getSession();
   const token = sess?.session?.access_token;
   if (!token) return null;
-  const res = await fetch(`${DEFAULT_SUPABASE_FN_BASE}/functions/v1/online-order-reprint`, {
+  const res = await fetch(getEdgeFunctionInvokeUrl('online-order-reprint'), {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,

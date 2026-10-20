@@ -27,7 +27,7 @@ function buildProductionContentSecurityPolicy(opts = {}) {
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
     "font-src 'self' https://fonts.gstatic.com data:",
     "img-src 'self' data: blob: file: https:",
-    `connect-src 'self' ${PRIMARY_SUPABASE_URL} ${PRIMARY_SUPABASE_WS} https: wss:`,
+    "connect-src 'self'",
     "media-src 'self' blob:",
     "worker-src 'self' blob:",
     "object-src 'none'",

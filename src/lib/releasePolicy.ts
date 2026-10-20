@@ -1,5 +1,4 @@
-import { supabase, getCloudSupabaseClient } from './supabase';
-import { isSqlServerMode } from './sqlDb';
+import { supabase } from './supabase';
 
 export type PlatformReleasePolicy = {
   min_required_version: string;
@@ -37,11 +36,7 @@ export function versionLessThan(a: string, b: string): boolean {
 }
 
 export async function fetchPlatformReleasePolicy(): Promise<PlatformReleasePolicy> {
-  const useCloudClient =
-    typeof window !== 'undefined' &&
-    !!(window as any).electronAPI &&
-    isSqlServerMode();
-  const client = useCloudClient ? getCloudSupabaseClient() : supabase;
+  const client = supabase;
   const { data, error } = await client
     .from('platform_release_policy')
     .select('min_required_version, force_update, message, updated_at')

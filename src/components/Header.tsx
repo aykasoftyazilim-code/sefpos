@@ -1,7 +1,7 @@
 import { useState, useEffect, memo, useRef } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { usePersonalActiveShift } from '../contexts/ActiveShiftContext';
-import { LogOut, User, Settings, ChevronDown, MapPin, Check, Building2, Zap, ZoomIn, ZoomOut, Bell, Headphones as HeadphonesIcon, X, Send, Sparkles, Phone, Mail, ArrowLeft, LayoutGrid, PlayCircle, Lock, Minimize2, UserCheck, Trash2, Home, ChevronRight, Key } from 'lucide-react';
+import { LogOut, User, Settings, ChevronDown, MapPin, Check, Building2, Zap, ZoomIn, ZoomOut, Bell, Headphones as HeadphonesIcon, X, Send, Sparkles, Phone, Mail, ArrowLeft, LayoutGrid, PlayCircle, Lock, Minimize2, UserCheck, Trash2, Home, ChevronRight, Key, BookOpen } from 'lucide-react';
 import { WaiterCallBell } from './WaiterCallBell';
 import { supabase } from '../lib/supabase';
 import { getTrialInfo, formatTrialRemaining } from '../lib/tenantTrial';
@@ -28,6 +28,7 @@ import {
 } from '../lib/remoteWipe';
 import { dispatchSupportNotifBanner } from '../lib/supportNotificationBridge';
 import { publicAsset } from '../lib/assetUrl';
+import { requestOpenGuide } from '../lib/sefposGuideKnowledge';
 import {
   ELECTRON_HEADER_BAR_CLASS,
   ELECTRON_HEADER_CHIP_CLASS,
@@ -728,6 +729,16 @@ function HeaderInner({ onOpenSettings, onOpenOnboarding, currentPage, onBackToTa
                   <span>Kurulum</span>
                 </button>
               )}
+
+              <button
+                type="button"
+                onClick={() => requestOpenGuide('manual')}
+                className={`hidden sm:inline-flex ${isElectron ? ELECTRON_HEADER_CHIP_CLASS : 'items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-50'} text-xs font-semibold`}
+                title="Kullanım kılavuzu ve rehber"
+              >
+                <BookOpen className="w-3.5 h-3.5" />
+                <span>Kılavuz</span>
+              </button>
 
               <div className={isElectron ? ELECTRON_HEADER_TOOLBAR_GROUP : 'hidden sm:contents'}>
               <WaiterCallBell headerVariant={isElectron ? 'electron-bar' : 'default'} />

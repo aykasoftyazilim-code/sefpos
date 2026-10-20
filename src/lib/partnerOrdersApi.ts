@@ -3,6 +3,9 @@
 import { getPartnerWebhookBaseUrl } from './publicWebhookBaseUrl';
 
 export function getPartnerOrdersApiBaseUrl(): string {
+  if (import.meta.env.VITE_VDS_SELFHOST === 'true' && typeof window !== 'undefined') {
+    return `${window.location.origin.replace(/\/$/, '')}/vds-api/integrations/partner`;
+  }
   const base = getPartnerWebhookBaseUrl().replace(/\/$/, '');
   return `${base}/integrations/partner`;
 }

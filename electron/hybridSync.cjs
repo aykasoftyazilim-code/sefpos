@@ -18,6 +18,7 @@ function supabaseAnonKey() {
 }
 
 async function supabaseRest(path, accessToken, { method = 'GET', body } = {}) {
+  throw new Error('Supabase kapatıldı — hibrit senkron yok. VDS SQL kullanın.');
   const url = `${supabaseBaseUrl()}/rest/v1/${path}`;
   const prefer =
     method === 'POST'
@@ -48,6 +49,7 @@ async function supabaseRest(path, accessToken, { method = 'GET', body } = {}) {
 }
 
 async function ensureHybridAccessToken(link, saveSettings) {
+  throw new Error('Supabase kapatıldı — hibrit senkron yok.');
   if (!link?.accessToken) throw new Error('Bulut accessToken yok');
   const exp = Number(link.expiresAt || 0);
   if (exp && exp > Math.floor(Date.now() / 1000) + 90) {
@@ -80,6 +82,7 @@ async function ensureHybridAccessToken(link, saveSettings) {
 }
 
 async function cloudPasswordSignIn(email, password) {
+  throw new Error('Supabase kapatıldı — VDS SQL kullanın.');
   const url = `${supabaseBaseUrl()}/auth/v1/token?grant_type=password`;
   const res = await fetch(url, {
     method: 'POST',

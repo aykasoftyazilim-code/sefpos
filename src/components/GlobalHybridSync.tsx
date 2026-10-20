@@ -8,6 +8,7 @@ import {
 } from '../lib/hybridMode';
 import { getActivePosPage, PAGE_CHANGE_EVENT } from '../lib/pageActivity';
 import { getCloudSupabaseClient } from '../lib/supabase';
+import { isVdsSelfHost } from '../lib/sqlDb';
 
 /** Yedek periyodik senkron — kasa kasmasin diye seyrek (45sn → 120sn). */
 const BACKUP_SYNC_MS = 120_000;
@@ -33,6 +34,7 @@ export function GlobalHybridSync() {
   const lastBackupAtRef = useRef(0);
 
   useEffect(() => {
+    if (isVdsSelfHost()) return;
     if (!isHybridMode() || !isHybridCloudLinked()) return;
     const api = (window as any).electronAPI;
     if (!api?.hybridSyncNow) return;

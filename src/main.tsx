@@ -127,20 +127,63 @@ if (import.meta.env.DEV && typeof navigator !== 'undefined' && navigator.service
   });
 }
 
-/** Prod: PWA — Electron (file://) ve dev dışında */
+/**
+ * Prod web:
+ * - VDS (VITE_VDS_SELFHOST): SW kaydı YOK — soft refresh / giriş sonrası skeleton kilidini önler.
+ *   Eski SW varsa unregister + cache temizle.
+ * - Diğer web (Pages vb.): PWA SW (Electron file:// hariç)
+ */
 if (
-  import.meta.env.PROD &&
   typeof navigator !== 'undefined' &&
   'serviceWorker' in navigator &&
   typeof window !== 'undefined' &&
   window.location.protocol !== 'file:' &&
   !(window as Window & { electronAPI?: unknown }).electronAPI
 ) {
-  window.addEventListener('load', () => {
-    const base = import.meta.env.BASE_URL || '/';
-    const swPath = `${base}sw.js`.replace(/\/{2,}/g, '/');
-    navigator.serviceWorker.register(swPath).catch(() => {});
-  });
+  const isVds = import.meta.env.VITE_VDS_SELFHOST === 'true';
+
+  if (isVds || import.meta.env.PROD) {
+    window.addEventListener('message', (ev) => {
+      if (ev?.data?.type === 'SEFPOS_SW_KILLED') {
+        window.location.reload();
+      }
+    });
+  }
+
+  if (isVds) {
+    window.addEventListener('load', () => {
+      void (async () => {
+        try {
+          const regs = await navigator.serviceWorker.getRegistrations();
+          await Promise.all(regs.map((r) => r.unregister()));
+        } catch {
+          /* ignore */
+        }
+        try {
+          if (typeof caches !== 'undefined') {
+            const keys = await caches.keys();
+            await Promise.all(keys.map((k) => caches.delete(k)));
+          }
+        } catch {
+          /* ignore */
+        }
+        // Eski SW hâlâ kontrol ediyorsa kill script'i bir kez çek (VDS'de sw.js = kill)
+        try {
+          const base = import.meta.env.BASE_URL || '/';
+          const swPath = `${base}sw.js`.replace(/\/{2,}/g, '/');
+          await navigator.serviceWorker.register(swPath);
+        } catch {
+          /* ignore */
+        }
+      })();
+    });
+  } else if (import.meta.env.PROD) {
+    window.addEventListener('load', () => {
+      const base = import.meta.env.BASE_URL || '/';
+      const swPath = `${base}sw.js`.replace(/\/{2,}/g, '/');
+      navigator.serviceWorker.register(swPath).catch(() => {});
+    });
+  }
 }
 
 /**

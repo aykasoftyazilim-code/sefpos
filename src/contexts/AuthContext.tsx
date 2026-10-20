@@ -2,7 +2,7 @@ import { createContext, useContext, useEffect, useRef, useState } from 'react';
 import { User, Session } from '@supabase/supabase-js';
 import { supabase, getRealSupabaseClient, consumeInvalidRefreshHandled } from '../lib/supabase';
 import { Database } from '../lib/supabase';
-import { isSqlServerMode, isLocalMode, isElectronCloudMode } from '../lib/sqlDb';
+import { isSqlServerMode, isLocalMode, isElectronCloudMode, sqlDb, isVdsSelfHost, sqlTruth, patchSqlSessionRecord } from '../lib/sqlDb';
 import { isHybridMode } from '../lib/hybridMode';
 import { prefetchCloudTableGrid } from '../lib/tableGridData';
 import { prefetchTakeawayActiveOrders } from '../lib/takeawayOrdersApi';
@@ -370,9 +370,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           id: profileData.tenant_id,
           name: rec2?.tenant_name || profileData.tenant_id,
           slug: rec2?.tenant_slug || profileData.tenant_id,
-          subscription_status: rec2?.subscription_status || 'active',
-          subscription_plan: null,
-          subscription_expires_at: null,
+          subscription_status: rec2?.subscription_status || 'trial',
+          subscription_plan: rec2?.subscription_plan || 'trial',
+          subscription_expires_at: rec2?.subscription_expires_at || null,
           max_branches: null,
           notes: null,
           deployment_mode: 'local',
@@ -439,26 +439,78 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           avatar_url: null,
           branch_id: rec.branch_id || null,
           is_super_admin: rec.is_super_admin || false,
-          onboarding_completed: rec.onboarding_completed ?? null,
+          onboarding_completed: sqlTruth(rec.onboarding_completed) ? true : false,
           allowed_ips: rec.allowed_ips || null,
           created_at: new Date().toISOString(),
         };
 
+        let tenantOnboarding =
+          sqlTruth(rec?.tenant_onboarding) || sqlTruth(rec?.onboarding_completed);
+        let deploymentMode =
+          String(rec?.deployment_mode || (isVdsSelfHost() ? 'online' : 'offline')).toLowerCase();
+        if (!['online', 'offline', 'hybrid'].includes(deploymentMode)) {
+          deploymentMode = isVdsSelfHost() ? 'online' : 'offline';
+        }
+        let tenantAddress = rec?.tenant_address || null;
+        let tenantPhone = rec?.tenant_phone || null;
+        let tenantName = rec?.tenant_name || profileData.tenant_id;
+        let subStatus = rec?.subscription_status || 'trial';
+        let subPlan = rec?.subscription_plan || 'trial';
+        let subExpires = rec?.subscription_expires_at || null;
+
+        // Canlı DB'den tenant oku — oturumdaki bayraklar eski kalmasın (sihirbaz döngüsü)
+        try {
+          const { data: trow } = await supabase
+            .from('tenants')
+            .select(
+              'name, onboarding_completed, deployment_mode, address, phone, subscription_status, subscription_plan, subscription_expires_at',
+            )
+            .eq('id', profileData.tenant_id)
+            .maybeSingle();
+          if (trow) {
+            tenantOnboarding = sqlTruth((trow as any).onboarding_completed) || tenantOnboarding;
+            if ((trow as any).deployment_mode) {
+              deploymentMode = String((trow as any).deployment_mode).toLowerCase();
+            }
+            tenantAddress = (trow as any).address ?? tenantAddress;
+            tenantPhone = (trow as any).phone ?? tenantPhone;
+            tenantName = (trow as any).name || tenantName;
+            subStatus = (trow as any).subscription_status || subStatus;
+            subPlan = (trow as any).subscription_plan || subPlan;
+            subExpires = (trow as any).subscription_expires_at ?? subExpires;
+            patchSqlSessionRecord({
+              tenant_onboarding: tenantOnboarding,
+              onboarding_completed: tenantOnboarding,
+              deployment_mode: deploymentMode,
+              tenant_name: tenantName,
+              tenant_address: tenantAddress,
+              tenant_phone: tenantPhone,
+              subscription_status: subStatus,
+              subscription_plan: subPlan,
+              subscription_expires_at: subExpires,
+            });
+          }
+        } catch {
+          /* oturum alanlarıyla devam */
+        }
+
+        if (isHybridMode()) deploymentMode = 'hybrid';
+
         const fakeTenant: Tenant = {
           id: profileData.tenant_id,
-          name: rec?.tenant_name || profileData.tenant_id,
+          name: tenantName,
           slug: rec?.tenant_slug || profileData.tenant_id,
-          subscription_status: rec?.subscription_status || 'active',
-          subscription_plan: rec?.subscription_plan || 'professional',
-          subscription_expires_at: rec?.subscription_expires_at || null,
+          subscription_status: subStatus,
+          subscription_plan: subPlan,
+          subscription_expires_at: subExpires,
           max_branches: null,
           notes: null,
-          deployment_mode: isHybridMode() ? 'hybrid' : 'offline',
-          onboarding_completed: rec?.tenant_onboarding === true ? true : (rec?.onboarding_completed === true ? true : false),
+          deployment_mode: deploymentMode,
+          onboarding_completed: tenantOnboarding,
           created_at: new Date().toISOString(),
           logo_url: null,
-          address: rec?.tenant_address || null,
-          phone: rec?.tenant_phone || null,
+          address: tenantAddress,
+          phone: tenantPhone,
           email: rec?.email || null,
           printer_settings: null,
           require_cancel_reason: rec?.require_cancel_reason ?? false,
@@ -476,6 +528,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           : null;
         setPermissions(buildPermissionsFromRole(profileData, roleData));
 
+        // Şubeleri DB'den çek (Electron sqlGetBranches veya VDS query)
+        let branchRows: Branch[] = [];
         const api = (window as any).electronAPI;
         if (api?.sqlGetBranches) {
           const brRes = await api.sqlGetBranches({
@@ -483,26 +537,43 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             userId: profileData.id,
             userRole: profileData.role,
           });
-          const branchRows = (brRes?.data || []) as Branch[];
-          if (branchRows.length > 0) {
-            setBranches(branchRows);
-            const preferred =
-              branchRows.find((b) => b.id === profileData.branch_id) ||
-              branchRows.find((b) => b.is_main) ||
-              branchRows[0];
-            setActiveBranchState(preferred);
-            const sqlPerms = buildPermissionsFromRole(profileData, roleData);
-            persistAuthSessionSnap({
-              userId,
-              profile: profileData,
-              tenant: fakeTenant,
-              branches: branchRows,
-              activeBranchId: preferred.id,
-              impersonationTenantId: null,
-              permissions: sqlPerms,
-            });
-            return;
+          branchRows = (brRes?.data || []) as Branch[];
+        }
+        if (branchRows.length === 0) {
+          try {
+            let bq = supabase
+              .from('branches')
+              .select('*')
+              .eq('tenant_id', profileData.tenant_id)
+              .eq('is_active', true);
+            if (profileData.role !== 'owner' && profileData.role !== 'admin' && profileData.branch_id) {
+              bq = bq.eq('id', profileData.branch_id);
+            }
+            const { data: brows } = await bq.order('is_main', { ascending: false });
+            branchRows = (brows || []) as unknown as Branch[];
+          } catch {
+            branchRows = [];
           }
+        }
+
+        if (branchRows.length > 0) {
+          setBranches(branchRows);
+          const preferred =
+            branchRows.find((b) => b.id === profileData.branch_id) ||
+            branchRows.find((b) => b.is_main) ||
+            branchRows[0];
+          setActiveBranchState(preferred);
+          const sqlPerms = buildPermissionsFromRole(profileData, roleData);
+          persistAuthSessionSnap({
+            userId,
+            profile: profileData,
+            tenant: fakeTenant,
+            branches: branchRows,
+            activeBranchId: preferred.id,
+            impersonationTenantId: null,
+            permissions: sqlPerms,
+          });
+          return;
         }
 
         const fakeBranch: Branch = {
@@ -946,6 +1017,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     contactEmail?: string,
     phone?: string,
   ) => {
+    // VDS: Proxy/localDb karışmasın — doğrudan sqlDb (HTTP /vds-api/register)
+    if (import.meta.env.VITE_VDS_SELFHOST === 'true') {
+      const { data, error } = await sqlDb.auth.signUp({
+        email,
+        password,
+        options: {
+          data: {
+            full_name: fullName,
+            tenant_name: tenantName,
+            contact_email: contactEmail || null,
+            phone: phone || null,
+          },
+        },
+      });
+      if (error) return { error };
+      if (!data?.user) return { error: new Error('Kullanıcı oluşturulamadı') };
+      return { error: null };
+    }
+
     const { data, error } = await supabase.auth.signUp({
       email,
       password,

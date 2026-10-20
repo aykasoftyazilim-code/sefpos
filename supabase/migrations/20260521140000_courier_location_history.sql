@@ -18,21 +18,25 @@ CREATE INDEX IF NOT EXISTS idx_courier_location_history_order
 
 ALTER TABLE public.courier_location_history ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Tenant members read courier location history" ON public.courier_location_history;
 CREATE POLICY "Tenant members read courier location history"
   ON public.courier_location_history FOR SELECT
   TO authenticated
   USING (tenant_id = public.get_my_tenant_id_direct());
 
+DROP POLICY IF EXISTS "Couriers insert own location history anon" ON public.courier_location_history;
 CREATE POLICY "Couriers insert own location history anon"
   ON public.courier_location_history FOR INSERT
   TO anon
   WITH CHECK (true);
 
+DROP POLICY IF EXISTS "Couriers read own location history anon" ON public.courier_location_history;
 CREATE POLICY "Couriers read own location history anon"
   ON public.courier_location_history FOR SELECT
   TO anon
   USING (true);
 
+DROP POLICY IF EXISTS "Tenant members insert courier location history" ON public.courier_location_history;
 CREATE POLICY "Tenant members insert courier location history"
   ON public.courier_location_history FOR INSERT
   TO authenticated

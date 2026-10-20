@@ -42,9 +42,9 @@ CREATE TABLE tenants (
     phone NVARCHAR(50),
     email NVARCHAR(255),
     logo_url NVARCHAR(1000),
-    subscription_status NVARCHAR(20) DEFAULT 'active'
-        CHECK (subscription_status IN ('active', 'suspended', 'cancelled')),
-    subscription_plan NVARCHAR(50),
+    subscription_status NVARCHAR(20) DEFAULT 'trial'
+        CHECK (subscription_status IN ('active', 'suspended', 'cancelled', 'trial')),
+    subscription_plan NVARCHAR(50) DEFAULT 'trial',
     subscription_expires_at DATETIME2,
     max_branches INT DEFAULT 1,
     notes NVARCHAR(MAX),
@@ -74,6 +74,8 @@ CREATE TABLE branches (
     is_active BIT DEFAULT 1,
     is_main BIT DEFAULT 0,
     use_central_products BIT DEFAULT 1,
+    default_discount_percent DECIMAL(5,2) NOT NULL DEFAULT 0,
+    default_discount_active BIT NOT NULL DEFAULT 0,
     created_at DATETIME2 DEFAULT GETDATE(),
     CONSTRAINT uq_branches_tenant_name UNIQUE (tenant_id, name)
 );
@@ -1038,8 +1040,14 @@ BEGIN
             INSERT INTO app_users (id, email, password_hash)
             VALUES (@user_id, @email, @password_hash);
 
-            INSERT INTO tenants (id, name, slug, email, onboarding_completed)
-            VALUES (@tenant_id, @tenant_name, @tenant_slug, @email, 0);
+            INSERT INTO tenants (
+                id, name, slug, email, onboarding_completed,
+                subscription_status, subscription_plan, subscription_expires_at
+            )
+            VALUES (
+                @tenant_id, @tenant_name, @tenant_slug, @email, 0,
+                N'trial', N'trial', DATEADD(day, 3, GETUTCDATE())
+            );
 
             INSERT INTO branches (id, tenant_id, name, is_main, is_active)
             VALUES (@branch_id, @tenant_id, N'Ana Sube', 1, 1);

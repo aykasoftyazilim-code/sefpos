@@ -166,6 +166,13 @@ export function ElectronDesktopShell() {
     };
   }, [isElectron]);
 
+  // Oturum açılınca güncelleme kontrolü (kasada login sonrası yeni sürümü erken yakala).
+  useEffect(() => {
+    if (!isElectron || !user?.id) return;
+    const api = (window as any).electronAPI;
+    void api?.checkForUpdates?.().catch(() => {});
+  }, [isElectron, user?.id]);
+
   // Lisans panelinden zorunlu güncelleme politikası (periyodik yenile).
   useEffect(() => {
     if (!isElectron) return;

@@ -3,7 +3,7 @@ import { startAdaptivePoller } from './pollSchedule';
 import { isElectronRuntime } from './electronSessionHygiene';
 
 export const PROFILE_BASE_SELECT =
-  'id, tenant_id, full_name, email, role, branch_id' as const;
+  'id, tenant_id, full_name, email, role, branch_id, phone' as const;
 
 /** Admin: bu süreden yeni ping = çevrimiçi */
 export const ACTIVE_ONLINE_MS = 120_000;
@@ -27,6 +27,7 @@ export type TenantProfileRow = {
   email: string;
   role: string;
   branch_id: string | null;
+  phone?: string | null;
   last_active_at?: string | null;
 };
 
@@ -226,4 +227,28 @@ export function formatOnlineLabel(count: number): string {
   if (count <= 0) return 'Çevrimdışı';
   if (count === 1) return '1 çevrimiçi';
   return `${count} çevrimiçi`;
+}
+
+/** Admin listesi: son nabız zamanı (TR). */
+export function formatLastSeenLabel(lastActiveAt: string | null | undefined): string {
+  if (!lastActiveAt) return 'Hiç bağlanmadı / çıkış yapılmış';
+  const ms = Date.now() - new Date(lastActiveAt).getTime();
+  if (!Number.isFinite(ms) || ms < 0) return 'Son görülme bilinmiyor';
+  if (ms < 60_000) return 'Az önce aktif';
+  if (ms < ACTIVE_ONLINE_MS) return `${Math.max(1, Math.floor(ms / 60_000))} dk önce (çevrimiçi)`;
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)} dk önce`;
+  if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)} sa önce`;
+  const days = Math.floor(ms / 86_400_000);
+  if (days === 1) return 'Dün';
+  if (days < 14) return `${days} gün önce`;
+  try {
+    return new Date(lastActiveAt).toLocaleString('tr-TR', {
+      day: '2-digit',
+      month: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return 'Eski oturum';
+  }
 }

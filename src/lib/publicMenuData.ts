@@ -1,4 +1,5 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { isVdsSelfHost } from './sqlDb';
 
 /**
  * Public/QR menu için **ayrı** bir Supabase client.
@@ -135,6 +136,33 @@ export class PublicMenuError extends Error {
  * verileri çeker. RLS policy'leri yalnızca aktif + menüde görünür kayıtları döner.
  */
 export async function loadPublicMenu(branchId: string): Promise<PublicMenuData> {
+  if (isVdsSelfHost()) {
+    const res = await fetch(`/vds-api/public-menu?branchId=${encodeURIComponent(branchId)}`, { credentials: 'same-origin' });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || data?.error || !data?.branch || !data?.tenant) {
+      throw new PublicMenuError('NOT_FOUND', data?.error || 'Menü yüklenemedi');
+    }
+    const productIds = (data.products || []).map((p: { id: string }) => p.id);
+    let variants: PublicVariant[] = [];
+    if (productIds.length) {
+      /* varyantlar public-menu yanıtında yoksa boş */
+    }
+    const products: PublicProduct[] = (data.products || []).map((p: any) => ({
+      id: p.id,
+      category_id: p.category_id,
+      name: p.name,
+      description: p.description,
+      price: Number(p.price) || 0,
+      image_url: p.image_url,
+      variants: variants,
+    }));
+    return {
+      tenant: { ...data.tenant, menu_theme: data.menu_theme || null },
+      branch: data.branch,
+      categories: data.categories || [],
+      products,
+    };
+  }
   const branchRes = await supabase
     .from('branches')
     .select('id, tenant_id, name, address, phone')
@@ -270,6 +298,17 @@ export async function createWaiterCall(input: {
   callType: 'service' | 'bill' | 'water' | 'help';
   message?: string;
 }): Promise<void> {
+  if (isVdsSelfHost()) {
+    const res = await fetch('/vds-api/public-waiter-call', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(input),
+    });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || data?.error) throw new Error(data?.error || 'Garson çağrısı gönderilemedi');
+    return;
+  }
   const { error } = await supabase
     .from('waiter_calls')
     .insert({

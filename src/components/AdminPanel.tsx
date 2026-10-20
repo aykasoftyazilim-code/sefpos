@@ -16,7 +16,9 @@ import { canAccessAdminPanel, isAdminAllowedEmail } from '../lib/adminAccess';
 import {
   fetchOnlineProfileIdsByTenant,
   fetchTenantProfiles,
+  formatLastSeenLabel,
   formatOnlineLabel,
+  isProfileOnline,
   onlineUserIdsFromProfiles,
 } from '../lib/tenantPresence';
 import { resolveProvinceSlug, provinceDisplayName } from '../lib/resellerProvince';
@@ -48,6 +50,7 @@ interface ProfileRow {
   email: string;
   role: string;
   branch_id: string | null;
+  phone?: string | null;
   last_active_at?: string | null;
 }
 
@@ -463,6 +466,81 @@ interface TenantDetailProps {
 
 function TenantDetailPanel({ tenant, onlineUserIds, onClose, onEdit, onDelete, onImpersonate, onApplyPlan, planUpdating, onStatusChange, statusChanging, onWipeLocal, wipeSending }: TenantDetailProps) {
   const [showUsers, setShowUsers] = useState(true);
+  const [userPresenceFilter, setUserPresenceFilter] = useState<'all' | 'online' | 'offline'>('all');
+  const [pwTarget, setPwTarget] = useState<ProfileRow | null>(null);
+  const [pwValue, setPwValue] = useState('');
+  const [pwNotifySms, setPwNotifySms] = useState(true);
+  const [pwSaving, setPwSaving] = useState(false);
+  const [pwMsg, setPwMsg] = useState('');
+
+  const onlineIdSet = new Set(onlineUserIds);
+  const sortedProfiles = [...(tenant._profiles || [])].sort((a, b) => {
+    const ao = onlineIdSet.has(a.id) || isProfileOnline(a.last_active_at) ? 1 : 0;
+    const bo = onlineIdSet.has(b.id) || isProfileOnline(b.last_active_at) ? 1 : 0;
+    if (ao !== bo) return bo - ao;
+    return (a.full_name || '').localeCompare(b.full_name || '', 'tr');
+  });
+  const filteredProfiles = sortedProfiles.filter((p) => {
+    const on = onlineIdSet.has(p.id) || isProfileOnline(p.last_active_at);
+    if (userPresenceFilter === 'online') return on;
+    if (userPresenceFilter === 'offline') return !on;
+    return true;
+  });
+  const onlineCount = sortedProfiles.filter(
+    (p) => onlineIdSet.has(p.id) || isProfileOnline(p.last_active_at),
+  ).length;
+  const offlineCount = Math.max(0, sortedProfiles.length - onlineCount);
+
+  const openPasswordReset = (p: ProfileRow) => {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let gen = '';
+    for (let i = 0; i < 8; i++) gen += alphabet[Math.floor(Math.random() * alphabet.length)];
+    setPwTarget(p);
+    setPwValue(gen);
+    setPwNotifySms(!!p.phone);
+    setPwMsg('');
+  };
+
+  const savePasswordReset = async () => {
+    if (!pwTarget) return;
+    const next = pwValue.trim();
+    if (next.length < 6) {
+      setPwMsg('Şifre en az 6 karakter olmalı');
+      return;
+    }
+    setPwSaving(true);
+    setPwMsg('');
+    try {
+      const data = await invokeEdgeFunction<{
+        success?: boolean;
+        error?: string;
+        sms_sent?: boolean;
+        sms_error?: string;
+      }>('update-user', {
+        target_user_id: pwTarget.id,
+        new_password: next,
+        notify_sms: pwNotifySms,
+        phone: pwTarget.phone || undefined,
+      });
+      if (!data?.success) {
+        setPwMsg(data?.error || 'Şifre güncellenemedi');
+        return;
+      }
+      if (pwNotifySms) {
+        setPwMsg(
+          data.sms_sent
+            ? `Şifre kaydedildi ve SMS gönderildi.\nYeni şifre: ${next}`
+            : `Şifre kaydedildi. SMS gönderilemedi: ${data.sms_error || 'telefon yok'}\nYeni şifre: ${next}`,
+        );
+      } else {
+        setPwMsg(`Şifre kaydedildi.\nYeni şifre: ${next}`);
+      }
+    } catch (e: any) {
+      setPwMsg(e?.message || 'Şifre güncellenemedi');
+    } finally {
+      setPwSaving(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-start justify-end z-50 p-4">
@@ -571,49 +649,179 @@ function TenantDetailPanel({ tenant, onlineUserIds, onClose, onEdit, onDelete, o
               className="w-full flex items-center justify-between py-2 text-sm font-bold text-slate-700 hover:text-slate-900 transition"
             >
               <span className="flex items-center gap-2">
-                <UserCheck className="w-4 h-4" /> Kullanıcı Listesi ({tenant._profiles?.length || 0})
+                <UserCheck className="w-4 h-4" /> Kullanıcı durumu ({tenant._profiles?.length || 0})
               </span>
               {showUsers ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
             </button>
-            {showUsers && tenant._profiles && tenant._profiles.length > 0 && (
+            {showUsers && sortedProfiles.length > 0 && (
               <div className="mt-2 space-y-2">
-                {tenant._profiles.map(p => (
-                  <div key={p.id} className="flex items-center gap-3 px-3 py-2.5 bg-slate-50 rounded-xl">
-                    <div className="w-8 h-8 bg-orange-100 rounded-full flex items-center justify-center shrink-0">
-                      <span className="text-xs font-black text-orange-700">
-                        {p.full_name?.charAt(0)?.toUpperCase() || '?'}
+                <div className="flex flex-wrap items-center gap-2 px-1">
+                  <span className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 border border-emerald-100 px-2.5 py-1 rounded-full">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                    {onlineCount} çevrimiçi
+                  </span>
+                  <span className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-500 bg-slate-100 border border-slate-200 px-2.5 py-1 rounded-full">
+                    <span className="w-2 h-2 rounded-full bg-slate-400" />
+                    {offlineCount} çevrimdışı
+                  </span>
+                  <div className="flex gap-1 ml-auto">
+                    {(
+                      [
+                        ['all', 'Tümü'],
+                        ['online', 'Çevrimiçi'],
+                        ['offline', 'Çevrimdışı'],
+                      ] as const
+                    ).map(([key, label]) => (
+                      <button
+                        key={key}
+                        type="button"
+                        onClick={() => setUserPresenceFilter(key)}
+                        className={`text-[10px] font-bold px-2 py-1 rounded-lg border transition ${
+                          userPresenceFilter === key
+                            ? 'bg-slate-800 text-white border-slate-800'
+                            : 'bg-white text-slate-500 border-slate-200 hover:border-slate-300'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <p className="text-[10px] text-slate-400 px-1">
+                  Çevrimiçi = son ~2 dk içinde uygulama açık (sekme görünür). Çıkış / sekme kapanınca çevrimdışı.
+                </p>
+                {filteredProfiles.map((p) => {
+                  const online = onlineIdSet.has(p.id) || isProfileOnline(p.last_active_at);
+                  return (
+                    <div
+                      key={p.id}
+                      className={`flex items-center gap-3 px-3 py-2.5 rounded-xl border ${
+                        online
+                          ? 'bg-emerald-50/70 border-emerald-100'
+                          : 'bg-slate-50 border-slate-100'
+                      }`}
+                    >
+                      <div className="relative shrink-0">
+                        <div
+                          className={`w-8 h-8 rounded-full flex items-center justify-center ${
+                            online ? 'bg-emerald-100' : 'bg-orange-100'
+                          }`}
+                        >
+                          <span
+                            className={`text-xs font-black ${
+                              online ? 'text-emerald-800' : 'text-orange-700'
+                            }`}
+                          >
+                            {p.full_name?.charAt(0)?.toUpperCase() || '?'}
+                          </span>
+                        </div>
+                        <span
+                          className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-white ${
+                            online ? 'bg-emerald-500' : 'bg-slate-300'
+                          }`}
+                          title={online ? 'Çevrimiçi' : 'Çevrimdışı'}
+                        />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-semibold text-slate-800 truncate">{p.full_name}</p>
+                        <p className="text-xs text-slate-400 truncate">
+                          {p.email?.includes('.shefpos.local') ? `@${p.email.split('@')[0]}` : p.email}
+                        </p>
+                        {p.phone && (
+                          <p className="text-[10px] text-slate-500 truncate">{p.phone}</p>
+                        )}
+                        <div className="flex flex-wrap items-center gap-2 mt-1">
+                          <span
+                            className={`text-[10px] font-black uppercase tracking-wide px-1.5 py-0.5 rounded ${
+                              online
+                                ? 'bg-emerald-600 text-white'
+                                : 'bg-slate-200 text-slate-600'
+                            }`}
+                          >
+                            {online ? 'Çevrimiçi' : 'Çevrimdışı'}
+                          </span>
+                          <span className="text-[10px] text-slate-500">
+                            {formatLastSeenLabel(p.last_active_at)}
+                          </span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => openPasswordReset(p)}
+                        className="p-2 rounded-lg text-orange-600 hover:bg-orange-50 border border-orange-100 shrink-0"
+                        title="Şifre yenile"
+                        aria-label="Şifre yenile"
+                      >
+                        <Key className="w-4 h-4" />
+                      </button>
+                      <span className={`text-xs font-bold px-2 py-0.5 rounded-full shrink-0 ${
+                        p.role === 'owner' ? 'bg-orange-100 text-orange-700' :
+                        p.role === 'admin' ? 'bg-blue-100 text-blue-700' :
+                        p.role === 'manager' ? 'bg-emerald-100 text-emerald-700' :
+                        p.role === 'cashier' ? 'bg-yellow-100 text-yellow-700' :
+                        'bg-slate-100 text-slate-600'
+                      }`}>
+                        {p.role === 'owner' ? 'Sahip' :
+                         p.role === 'admin' ? 'Yönetici' :
+                         p.role === 'manager' ? 'Müdür' :
+                         p.role === 'cashier' ? 'Kasiyer' :
+                         p.role === 'waiter' ? 'Garson' : p.role}
                       </span>
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-semibold text-slate-800 truncate">{p.full_name}</p>
-                      <p className="text-xs text-slate-400 truncate">
-                        {p.email?.includes('.shefpos.local') ? `@${p.email.split('@')[0]}` : p.email}
-                      </p>
-                      <p className={`text-[10px] font-bold mt-0.5 ${onlineUserIds.includes(p.id) ? 'text-emerald-600' : 'text-slate-400'}`}>
-                        {onlineUserIds.includes(p.id) ? 'Çevrimiçi' : 'Çevrimdışı'}
-                      </p>
-                    </div>
-                    <span className={`text-xs font-bold px-2 py-0.5 rounded-full shrink-0 ${
-                      p.role === 'owner' ? 'bg-orange-100 text-orange-700' :
-                      p.role === 'admin' ? 'bg-blue-100 text-blue-700' :
-                      p.role === 'manager' ? 'bg-emerald-100 text-emerald-700' :
-                      p.role === 'cashier' ? 'bg-yellow-100 text-yellow-700' :
-                      'bg-slate-100 text-slate-600'
-                    }`}>
-                      {p.role === 'owner' ? 'Sahip' :
-                       p.role === 'admin' ? 'Yönetici' :
-                       p.role === 'manager' ? 'Müdür' :
-                       p.role === 'cashier' ? 'Kasiyer' :
-                       p.role === 'waiter' ? 'Garson' : p.role}
-                    </span>
-                  </div>
-                ))}
+                  );
+                })}
+                {filteredProfiles.length === 0 && (
+                  <p className="text-sm text-slate-400 text-center py-3">
+                    Bu filtrede kullanıcı yok
+                  </p>
+                )}
               </div>
             )}
-            {showUsers && (!tenant._profiles || tenant._profiles.length === 0) && (
+            {showUsers && sortedProfiles.length === 0 && (
               <p className="text-sm text-slate-400 text-center py-4">Kullanıcı bulunamadı</p>
             )}
           </div>
+
+          {pwTarget && (
+            <div className="rounded-xl border-2 border-orange-200 bg-orange-50/60 p-4 space-y-3">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <p className="text-sm font-bold text-slate-800">Şifre yenile</p>
+                  <p className="text-xs text-slate-500">{pwTarget.full_name} · {pwTarget.email}</p>
+                </div>
+                <button type="button" onClick={() => setPwTarget(null)} className="p-1 text-slate-400 hover:text-slate-700">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <input
+                type="text"
+                value={pwValue}
+                onChange={(e) => setPwValue(e.target.value)}
+                className="w-full px-3 py-2 rounded-lg border-2 border-slate-200 focus:border-orange-400 focus:outline-none text-sm font-mono"
+                placeholder="Yeni şifre"
+              />
+              <label className="flex items-center gap-2 text-xs text-slate-600 select-none">
+                <input
+                  type="checkbox"
+                  checked={pwNotifySms}
+                  onChange={(e) => setPwNotifySms(e.target.checked)}
+                  disabled={!pwTarget.phone}
+                />
+                Kayıtlı telefona SMS gönder {pwTarget.phone ? `(${pwTarget.phone})` : '(telefon yok)'}
+              </label>
+              {pwMsg && (
+                <pre className="text-xs whitespace-pre-wrap bg-white border border-slate-200 rounded-lg p-2 text-slate-700">{pwMsg}</pre>
+              )}
+              <button
+                type="button"
+                disabled={pwSaving}
+                onClick={() => void savePasswordReset()}
+                className="w-full py-2.5 rounded-xl bg-orange-600 hover:bg-orange-700 text-white text-sm font-bold disabled:opacity-50"
+              >
+                {pwSaving ? 'Kaydediliyor…' : 'Şifreyi kaydet'}
+              </button>
+            </div>
+          )}
 
           <div className="border-t border-slate-100 pt-4">
             <p className="text-xs font-bold text-slate-400 uppercase mb-3">Hızlı Aksiyonlar</p>
@@ -1537,7 +1745,7 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
     const timer = setInterval(() => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
       void refreshOnlineFromDb(tenants);
-    }, 45_000);
+    }, 20_000);
 
     return () => clearInterval(timer);
   }, [activeTab, tenants, adminAllowed]);

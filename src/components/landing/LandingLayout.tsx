@@ -62,7 +62,7 @@ export function LandingLayout({ parsed, onNavigate, onLogin, children }: Props) 
         type="button"
         key={path}
         onClick={() => onNavigate(path)}
-        className={`text-sm font-semibold transition-colors ${
+        className={`text-sm font-medium transition-colors ${
           staticRoute === path ? 'text-orange-600' : 'text-slate-600 hover:text-orange-600'
         }`}
       >
@@ -83,7 +83,7 @@ export function LandingLayout({ parsed, onNavigate, onLogin, children }: Props) 
             <button
               type="button"
               onClick={() => onNavigate('/')}
-              className="flex items-center gap-2 group rounded-full transition-transform hover:scale-[1.02]"
+              className="flex items-center gap-2 group rounded-md"
             >
               <BrandLogo size="lg" />
             </button>
@@ -93,14 +93,14 @@ export function LandingLayout({ parsed, onNavigate, onLogin, children }: Props) 
             <div className="hidden lg:flex items-center gap-3">
               <a
                 href={SITE.phoneTel}
-                className="text-sm font-semibold flex items-center gap-1 text-slate-600 hover:text-orange-600"
+                className="text-sm font-medium flex items-center gap-1 text-slate-600 hover:text-orange-600"
               >
                 <Phone className="w-4 h-4" /> {SITE.phone}
               </a>
-              <button type="button" onClick={onLogin} className="bg-slate-900 hover:bg-slate-800 text-white font-bold px-5 py-2.5 rounded-xl text-sm transition">
+              <button type="button" onClick={onLogin} className="border border-orange-200 hover:border-orange-400 text-orange-700 font-semibold px-4 py-2 rounded-xl text-sm transition">
                 Giriş Yap
               </button>
-              <button type="button" onClick={onLogin} className="bg-orange-500 hover:bg-orange-600 text-white font-bold px-5 py-2.5 rounded-xl text-sm transition inline-flex items-center gap-1 shadow-md shadow-orange-500/35">
+              <button type="button" onClick={onLogin} className="bg-gradient-to-r from-orange-500 to-red-600 hover:from-orange-600 hover:to-red-700 text-white font-bold px-4 py-2 rounded-xl text-sm transition inline-flex items-center gap-1 shadow-sm">
                 Ücretsiz Dene <ArrowRight className="w-4 h-4" />
               </button>
             </div>
@@ -180,7 +180,7 @@ export function LandingLayout({ parsed, onNavigate, onLogin, children }: Props) 
                 </button>
               ),
             )}
-            <button type="button" onClick={onLogin} className="w-full bg-orange-600 text-white font-bold py-3 rounded-xl">Giriş Yap</button>
+            <button type="button" onClick={onLogin} className="w-full bg-gradient-to-r from-orange-500 to-red-600 text-white font-bold py-3 rounded-xl">Giriş Yap</button>
           </div>
         )}
       </header>

@@ -13,6 +13,10 @@ DROP POLICY IF EXISTS "print_settings_select_tenant_members" ON public.print_set
 DROP POLICY IF EXISTS "print_settings_insert_tenant_members" ON public.print_settings;
 DROP POLICY IF EXISTS "print_settings_update_tenant_members" ON public.print_settings;
 DROP POLICY IF EXISTS "print_settings_delete_tenant_members" ON public.print_settings;
+DROP POLICY IF EXISTS "print_settings_select_tenant" ON public.print_settings;
+DROP POLICY IF EXISTS "print_settings_insert_tenant" ON public.print_settings;
+DROP POLICY IF EXISTS "print_settings_update_tenant" ON public.print_settings;
+DROP POLICY IF EXISTS "print_settings_delete_tenant" ON public.print_settings;
 
 CREATE POLICY "print_settings_select_tenant"
   ON public.print_settings FOR SELECT

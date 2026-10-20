@@ -36,6 +36,7 @@ old_release_extracted/
 scripts/_tmp-*.json
 scripts/_tmp-*.txt
 scripts/_tmp-*.log
+tmp-vds-dump/
 
 .git_commit_msg.tmp
 
