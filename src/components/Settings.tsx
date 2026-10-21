@@ -715,9 +715,21 @@ export function Settings({ onClose, initialTab }: SettingsProps) {
       return;
     }
 
-    if (!data?.length) {
-      alert('Grup kaydı doğrulanamadı. Sayfayı yenileyip listeyi kontrol edin.');
-      return;
+    // VDS/SQL insert tek satırda dizi yerine nesne dönebilir; PostgREST ise dizi
+    const createdRows = Array.isArray(data) ? data : data ? [data] : [];
+    if (createdRows.length === 0) {
+      const { data: verify } = await supabase
+        .from('table_groups')
+        .select('id')
+        .eq('tenant_id', tenant.id)
+        .eq('name', name)
+        .eq('branch_id', branchForGroup)
+        .limit(1);
+      const ok = Array.isArray(verify) ? verify.length > 0 : !!verify;
+      if (!ok) {
+        alert('Grup kaydı doğrulanamadı. Sayfayı yenileyip listeyi kontrol edin.');
+        return;
+      }
     }
 
     alert('Grup oluşturuldu. Masaların görünmesi için aynı ekranda «Toplu Masa Oluştur» ile masa ekleyin ve şube seçili olsun.');

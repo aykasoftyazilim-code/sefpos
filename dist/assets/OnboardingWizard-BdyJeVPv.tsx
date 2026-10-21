@@ -424,32 +424,53 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
 
   const progress = ((step - 1) / (STEPS.length - 1)) * 100;
   const selectedMode = DEPLOYMENT_MODES.find(m => m.id === deploymentMode)!;
+  const logoCandidates = useMemo(
+    () => [
+      publicAsset('sefpos-round.png'),
+      sefposRoundUrl,
+      publicAsset('logo.png'),
+      sefposLogoUrl,
+      publicAsset('SEFPOS.png'),
+    ],
+    [],
+  );
+  const [logoIdx, setLogoIdx] = useState(0);
+  const [logoFailed, setLogoFailed] = useState(false);
 
   return (
-    <div className="h-[100dvh] max-h-[100dvh] bg-gradient-to-br from-orange-500 via-red-500 to-rose-600 flex items-center justify-center p-2 sm:p-3 overflow-hidden">
-      <div className="bg-white rounded-2xl sm:rounded-3xl shadow-2xl w-full max-w-2xl max-h-[min(100dvh-1rem,900px)] flex flex-col overflow-hidden">
-        <div className="bg-gradient-to-r from-orange-500 to-red-600 px-4 sm:px-6 pt-3 sm:pt-4 pb-3 shrink-0">
-          <div className="flex items-center justify-center mb-2 sm:mb-3">
-            <img
-              src={sefposRoundUrl}
-              alt="ŞefPOS"
-              width={56}
-              height={56}
-              decoding="async"
-              className="h-12 w-12 sm:h-14 sm:w-14 rounded-full object-cover bg-white shadow-md ring-2 ring-white/70"
-              onError={(e) => {
-                const el = e.currentTarget;
-                if (el.dataset.fallback === '1') {
-                  el.src = publicAsset('sefpos-round.png');
-                  return;
-                }
-                el.dataset.fallback = '1';
-                el.src = sefposLogoUrl;
-              }}
-            />
+    <div className="h-[100dvh] max-h-[100dvh] bg-gradient-to-br from-orange-500 via-red-500 to-rose-600 flex items-center justify-center p-3 sm:p-4 md:p-6 lg:p-8 overflow-hidden">
+      <div
+        className="bg-white rounded-2xl sm:rounded-3xl shadow-2xl w-full flex flex-col overflow-hidden
+          max-w-[min(100%,42rem)] md:max-w-3xl lg:max-w-4xl
+          h-[min(100%,calc(100dvh-1.5rem))] sm:h-[min(100%,calc(100dvh-2rem))] md:h-[min(52rem,calc(100dvh-3rem))]
+          max-h-[calc(100dvh-1.5rem)] sm:max-h-[calc(100dvh-2rem)] md:max-h-[calc(100dvh-3rem)]"
+      >
+        <div className="bg-gradient-to-r from-orange-500 to-red-600 px-4 sm:px-6 md:px-8 pt-4 sm:pt-5 md:pt-6 pb-3 sm:pb-4 shrink-0">
+          <div className="flex items-center justify-center mb-3 sm:mb-4">
+            {!logoFailed ? (
+              <img
+                src={logoCandidates[logoIdx]}
+                alt="ŞefPOS"
+                width={80}
+                height={80}
+                decoding="async"
+                className="h-14 w-14 sm:h-16 sm:w-16 md:h-20 md:w-20 rounded-full object-contain bg-white p-1 shadow-lg ring-2 ring-white/90"
+                onError={() => {
+                  if (logoIdx < logoCandidates.length - 1) {
+                    setLogoIdx((i) => i + 1);
+                  } else {
+                    setLogoFailed(true);
+                  }
+                }}
+              />
+            ) : (
+              <div className="h-14 w-14 sm:h-16 sm:w-16 md:h-20 md:w-20 rounded-full bg-white shadow-lg ring-2 ring-white/90 flex items-center justify-center">
+                <ChefHat className="w-7 h-7 sm:w-8 sm:h-8 md:w-10 md:h-10 text-orange-600" />
+              </div>
+            )}
           </div>
 
-          <div className="flex items-center justify-between mb-1.5">
+          <div className="flex items-center justify-between mb-2">
             {STEPS.map((s, idx) => {
               const Icon = s.icon;
               const isActive = s.id === step;
@@ -457,22 +478,22 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
               return (
                 <div key={s.id} className="flex items-center flex-1 min-w-0">
                   <div className="flex flex-col items-center w-full">
-                    <div className={`w-7 h-7 sm:w-8 sm:h-8 rounded-full flex items-center justify-center border-2 transition-all ${
+                    <div className={`w-8 h-8 sm:w-9 sm:h-9 md:w-10 md:h-10 rounded-full flex items-center justify-center border-2 transition-all ${
                       isDone ? 'bg-white border-white' :
                       isActive ? 'bg-white/20 border-white' :
                       'bg-white/10 border-white/30'
                     }`}>
                       {isDone
-                        ? <CheckCircle className="w-4 h-4 text-orange-600" />
-                        : <Icon className={`w-3.5 h-3.5 ${isActive ? 'text-white' : 'text-white/50'}`} />
+                        ? <CheckCircle className="w-4 h-4 sm:w-5 sm:h-5 text-orange-600" />
+                        : <Icon className={`w-3.5 h-3.5 sm:w-4 sm:h-4 ${isActive ? 'text-white' : 'text-white/50'}`} />
                       }
                     </div>
-                    <span className={`text-[9px] sm:text-[10px] font-semibold mt-0.5 truncate max-w-full ${isActive ? 'text-white' : 'text-white/50'}`}>
+                    <span className={`text-[9px] sm:text-[11px] md:text-xs font-semibold mt-1 truncate max-w-full leading-tight ${isActive ? 'text-white' : 'text-white/50'}`}>
                       {s.title}
                     </span>
                   </div>
                   {idx < STEPS.length - 1 && (
-                    <div className="flex-1 h-0.5 mx-1 bg-white/20 mb-4 hidden sm:block">
+                    <div className="flex-1 h-0.5 mx-1 bg-white/20 mb-5 hidden sm:block">
                       <div
                         className="h-full bg-white transition-all duration-500"
                         style={{ width: step > s.id ? '100%' : '0%' }}
@@ -488,51 +509,50 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
           </div>
         </div>
 
-        <div className="p-4 sm:p-5 overflow-y-auto flex-1 min-h-0 overscroll-contain">
-          <div className="mb-3">
+        <div className="px-4 sm:px-6 md:px-8 py-4 sm:py-5 md:py-6 overflow-y-auto flex-1 min-h-0 overscroll-contain">
+          <div className="mb-3 sm:mb-4">
             <SefposSmartGuide embedded compact onboardingStep={step} />
           </div>
 
           {step === 1 && (
-            <div className="text-center">
+            <div className="text-center flex flex-col min-h-0 max-w-2xl mx-auto w-full">
               {phoneFirstSignupHint && (
-                <div className="mb-3 text-left rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs sm:text-sm text-emerald-900">
-                  <p className="font-bold text-emerald-800 mb-0.5">Cep telefonu ile kayıt tamamlandı</p>
-                  <p className="text-emerald-800/90">
-                    Çalışma modu, adres ve masalarınızı tamamlayarak kullanmaya başlayın.
-                  </p>
+                <div className="mb-3 text-left rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
+                  <p className="font-bold text-emerald-800">Cep ile kayıt tamam — kurulumu bitirin.</p>
                 </div>
               )}
-              <div className="w-12 h-12 sm:w-14 sm:h-14 bg-orange-100 rounded-full flex items-center justify-center mx-auto mb-3">
-                <UtensilsCrossed className="w-6 h-6 sm:w-7 sm:h-7 text-orange-600" />
+              <div className="w-14 h-14 sm:w-16 sm:h-16 bg-orange-100 rounded-full flex items-center justify-center mx-auto mb-3 sm:mb-4">
+                <UtensilsCrossed className="w-7 h-7 sm:w-8 sm:h-8 text-orange-600" />
               </div>
-              <h2 className="text-xl sm:text-2xl font-black text-slate-800 mb-1">
+              <h2 className="text-xl sm:text-2xl md:text-3xl font-black text-slate-800 mb-1 sm:mb-2">
                 ŞefPOS'a Hoş Geldiniz!
               </h2>
               <p className="text-slate-500 text-sm sm:text-base mb-1">
                 <span className="font-bold text-slate-700">{tenant?.name}</span> için hesabınız hazır.
               </p>
-              <p className="text-slate-400 text-xs sm:text-sm mb-4">
-                Birkaç adımda kurulum — yaklaşık 2 dakika.
+              <p className="text-slate-400 text-xs sm:text-sm mb-4 sm:mb-6">
+                Kısa kurulum — yaklaşık 2 dakika.
               </p>
 
-              <div className="grid grid-cols-3 gap-2 sm:gap-3 mb-4">
+              <div className="grid grid-cols-3 gap-2 sm:gap-3 mb-4 sm:mb-6">
                 {[
-                  { icon: LayoutGrid, label: 'Masa Yönetimi', desc: 'Masaları takip edin' },
-                  { icon: Users, label: 'Sipariş Takibi', desc: 'Anlık siparişler' },
-                  { icon: Wifi, label: 'Online Siparişler', desc: 'Entegre platform' },
-                ].map(({ icon: Icon, label, desc }) => (
-                  <div key={label} className="bg-slate-50 rounded-xl p-2.5 sm:p-3 text-center">
-                    <Icon className="w-5 h-5 sm:w-6 sm:h-6 text-orange-500 mx-auto mb-1" />
-                    <div className="font-bold text-slate-700 text-[11px] sm:text-xs leading-tight">{label}</div>
-                    <div className="text-[10px] text-slate-400 mt-0.5 hidden sm:block">{desc}</div>
+                  { icon: LayoutGrid, label: 'Masa Yönetimi', short: 'Masa' },
+                  { icon: Users, label: 'Sipariş Takibi', short: 'Sipariş' },
+                  { icon: Wifi, label: 'Online Siparişler', short: 'Online' },
+                ].map(({ icon: Icon, label, short }) => (
+                  <div key={label} className="bg-slate-50 rounded-xl px-2 sm:px-3 py-3 sm:py-4 text-center border border-slate-100">
+                    <Icon className="w-5 h-5 sm:w-6 sm:h-6 text-orange-500 mx-auto mb-1.5" />
+                    <div className="font-bold text-slate-700 text-[11px] sm:text-sm leading-tight">
+                      <span className="sm:hidden">{short}</span>
+                      <span className="hidden sm:inline">{label}</span>
+                    </div>
                   </div>
                 ))}
               </div>
 
               <button
                 onClick={() => setStep(2)}
-                className="w-full bg-gradient-to-r from-orange-500 to-red-600 hover:from-orange-600 hover:to-red-700 text-white font-bold py-3 sm:py-3.5 rounded-xl sm:rounded-2xl transition flex items-center justify-center gap-2 text-base shadow-lg"
+                className="w-full bg-gradient-to-r from-orange-500 to-red-600 hover:from-orange-600 hover:to-red-700 text-white font-bold py-3 sm:py-3.5 md:py-4 rounded-xl sm:rounded-2xl transition flex items-center justify-center gap-2 text-base sm:text-lg shadow-lg"
               >
                 Kuruluma Başla
                 <ArrowRight className="w-5 h-5" />
@@ -540,7 +560,7 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
               <button
                 onClick={() => void handleSkipAll()}
                 disabled={loading}
-                className="mt-2 w-full text-slate-400 hover:text-slate-600 text-sm py-1.5 transition"
+                className="mt-2 w-full text-slate-400 hover:text-slate-600 text-sm py-2 transition"
               >
                 Şimdi atla, daha sonra yapayım
               </button>
@@ -548,9 +568,9 @@ export function OnboardingWizard({ onComplete }: OnboardingWizardProps) {
           )}
 
           {step === 2 && (
-            <div>
-              <h2 className="text-2xl font-black text-slate-800 mb-1">Çalışma Modunu Seçin</h2>
-              <p className="text-slate-400 mb-2">Sistemin nasıl çalışmasını istiyorsunuz?</p>
+            <div className="max-w-3xl mx-auto w-full">
+              <h2 className="text-xl sm:text-2xl md:text-3xl font-black text-slate-800 mb-1">Çalışma Modunu Seçin</h2>
+              <p className="text-slate-400 text-sm sm:text-base mb-3">Sistemin nasıl çalışmasını istiyorsunuz?</p>
               {vdsWeb && (
                 <p className="text-sm text-blue-800 bg-blue-50 border border-blue-100 rounded-xl px-3 py-2 mb-4">
                   Bu site sunucu (VDS) üzerinde. Web için <strong>Sunucu / Bulut</strong> önerilir.

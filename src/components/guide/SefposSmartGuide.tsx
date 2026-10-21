@@ -152,14 +152,23 @@ export function SefposSmartGuide({
     if (compact) {
       return (
         <div
-          className={`rounded-xl border border-orange-200/80 bg-orange-50/90 px-3 py-2 text-left ${className}`}
+          className={`rounded-xl sm:rounded-2xl border border-orange-200/80 bg-orange-50/90 px-3 py-2.5 sm:px-4 sm:py-3 text-left ${className}`}
         >
-          <div className="flex items-start gap-2">
-            <Sparkles className="w-4 h-4 text-orange-600 shrink-0 mt-0.5" />
-            <p className="text-xs text-slate-700 leading-snug line-clamp-2">
-              <span className="font-bold text-slate-800">Asistan: </span>
-              {a.coach}
-            </p>
+          <div className="flex items-start gap-2.5 sm:gap-3">
+            <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-lg bg-gradient-to-br from-orange-500 to-red-600 text-white flex items-center justify-center shrink-0 shadow-sm">
+              <Sparkles className="w-4 h-4" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="text-[11px] sm:text-xs font-black text-slate-800 mb-0.5">
+                ŞefPOS Asistan
+                <span className="ml-1.5 text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-orange-100 text-orange-700">
+                  Rehber
+                </span>
+              </p>
+              <p className="text-xs sm:text-sm text-slate-700 leading-snug line-clamp-2 sm:line-clamp-3">
+                {a.coach}
+              </p>
+            </div>
           </div>
         </div>
       );

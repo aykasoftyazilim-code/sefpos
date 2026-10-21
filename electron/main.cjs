@@ -4068,9 +4068,10 @@ ipcMain.handle('sql-query', async (_, { table, operation, select, filters, order
         const filteredRow = pickSqlRow(table, row) || {};
         if (!filteredRow.id) filteredRow.id = require('crypto').randomUUID();
         const inserted = await sqlInsertRowSafe(table, filteredRow, cfg);
-        if (inserted) results.push(inserted);
+        // PostgREST uyumu: insert her zaman dizi döner
+        results.push(inserted || filteredRow);
       }
-      return { data: rowArr.length === 1 ? results[0] || null : results, error: null };
+      return { data: results, error: null };
     }
 
     if (operation === 'update') {
