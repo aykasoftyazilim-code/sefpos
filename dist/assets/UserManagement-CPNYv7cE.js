@@ -1,4 +1,4 @@
-import{r as o,j as e}from"./react-vendor-BczfCC-3.js";import{u as qe,s as u,E as Me,F as ze}from"./admin-CDxQiCul.js";import{p as We,a as Be}from"./settings-CxzC7cEc.js";import{U as je,n as H,P as $e,i as ve,X as q,b1 as z,bJ as re,bH as ne,S as le,k as _e,T as we,B as Ge,p as Ye,q as He,b2 as Ee,aO as Se,aP as Ce,A as Re,a2 as Ve,aC as Qe,I as Je,V as Ze,aL as ea}from"./lucide-BZLnqsIO.js";import"./supabase-D9TaF1dD.js";import"./landing-CT7Gwwx2.js";import"./pdf-CmjsdvOr.js";const aa=`/*\r
+import{r as o,j as e}from"./react-vendor-BczfCC-3.js";import{u as qe,s as u,E as Me,F as ze}from"./admin-L0i4dI0B.js";import{p as We,a as Be}from"./settings-DVeo-Bxf.js";import{U as je,n as H,P as $e,i as ve,X as q,b1 as z,bJ as re,bH as ne,S as le,k as _e,T as we,B as Ge,p as Ye,q as He,b2 as Ee,aO as Se,aP as Ce,A as Re,a2 as Ve,aC as Qe,I as Je,V as Ze,aL as ea}from"./lucide-BZLnqsIO.js";import"./supabase-E-1I6FSQ.js";import"./landing-CdMJSkh_.js";import"./pdf-C0syoZ32.js";const aa=`/*\r
   # profiles DELETE: match Turkish roles.name + can_manage_users\r
 \r
   Default tenant roles use Turkish names (Yönetici, Şube Müdürü, …), not\r

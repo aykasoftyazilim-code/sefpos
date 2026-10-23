@@ -2,7 +2,7 @@
 <html lang="tr">
   <head>
     <meta charset="UTF-8" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://unpkg.com https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: file: https:; connect-src 'self' https://sefpos.com.tr https://www.sefpos.com.tr wss://sefpos.com.tr wss://www.sefpos.com.tr https://xdfnozfuuzctubijbnds.supabase.co wss://xdfnozfuuzctubijbnds.supabase.co; media-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://unpkg.com https://static.cloudflareinsights.com 'unsafe-hashes'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: file: https:; connect-src 'self' https://sefpos.com.tr https://www.sefpos.com.tr wss://sefpos.com.tr wss://www.sefpos.com.tr https://xdfnozfuuzctubijbnds.supabase.co wss://xdfnozfuuzctubijbnds.supabase.co http://127.0.0.1:7878 http://localhost:7878 ws://127.0.0.1:7878 ws://localhost:7878; media-src 'self' blob:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'" />
     <!-- Tum absolute (/foo) yollari dokuman konumuna gore cozer: Electron asar
          icindeki file:// protokolunde /logo.png artik C:\logo.png yerine
          dist/logo.png olarak cozulur. Web'de de root'a esit dusen ./ olur. -->
@@ -26,19 +26,19 @@
     <meta name="twitter:image" content="https://www.sefpos.com.tr/logo256.png" />
     <link rel="sitemap" type="application/xml" title="Sitemap" href="https://www.sefpos.com.tr/sitemap.xml" />
     <!-- CSS main.tsx'ten değil: Vite HMR'da index.css değişince tüm bileşen grafiği yenilenmesin -->
-    <script type="module" crossorigin src="/assets/index-m0nEu0-i.js"></script>
+    <script type="module" crossorigin src="/assets/index-Dy_fBw2L.js"></script>
     <link rel="modulepreload" crossorigin href="/assets/react-vendor-BczfCC-3.js">
-    <link rel="modulepreload" crossorigin href="/assets/supabase-D9TaF1dD.js">
+    <link rel="modulepreload" crossorigin href="/assets/supabase-E-1I6FSQ.js">
     <link rel="modulepreload" crossorigin href="/assets/lucide-BZLnqsIO.js">
-    <link rel="modulepreload" crossorigin href="/assets/landing-CT7Gwwx2.js">
-    <link rel="modulepreload" crossorigin href="/assets/admin-CDxQiCul.js">
-    <link rel="modulepreload" crossorigin href="/assets/pdf-CmjsdvOr.js">
-    <link rel="modulepreload" crossorigin href="/assets/settings-CxzC7cEc.js">
+    <link rel="modulepreload" crossorigin href="/assets/landing-CdMJSkh_.js">
+    <link rel="modulepreload" crossorigin href="/assets/admin-L0i4dI0B.js">
+    <link rel="modulepreload" crossorigin href="/assets/pdf-C0syoZ32.js">
+    <link rel="modulepreload" crossorigin href="/assets/settings-DVeo-Bxf.js">
     <link rel="modulepreload" crossorigin href="/assets/xlsx-uoQkVabA.js">
-    <link rel="modulepreload" crossorigin href="/assets/reports-W-kQVymu.js">
-    <link rel="modulepreload" crossorigin href="/assets/products-DOUFhqtj.js">
+    <link rel="modulepreload" crossorigin href="/assets/reports-BddQ_Rff.js">
+    <link rel="modulepreload" crossorigin href="/assets/products-xRZtKw59.js">
     <link rel="stylesheet" crossorigin href="/assets/admin-Cs4Kh21u.css">
-    <link rel="stylesheet" crossorigin href="/assets/index-Flld9wbW.css">
+    <link rel="stylesheet" crossorigin href="/assets/index-0Y_dxgU_.css">
   </head>
   <body style="margin:0;background-color:#ffffff;">
     <!-- Inline boot splash: React/Tailwind yuklenene kadar bos beyaz ekran yerine
@@ -170,7 +170,7 @@
         <div class="logo-wrap">
           <div class="sefpos-splash-glow" aria-hidden="true"></div>
           <div class="sefpos-splash-orbit" aria-hidden="true"><span class="sefpos-splash-orbit-dot"></span></div>
-          <img src="./logo.png?v=2" alt="ŞefPOS" class="logo" onerror="this.style.display='none'" />
+          <img src="./logo.png?v=2" alt="ŞefPOS" class="logo" />
         </div>
         <div class="name">ŞefPOS</div>
         <div class="tag">Yükleniyor…</div>
