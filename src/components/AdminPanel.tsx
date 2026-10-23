@@ -38,6 +38,7 @@ interface TenantRow {
   notes: string;
   onboarding_completed: boolean;
   deployment_mode: string | null;
+  disabled_modules?: string[] | null;
   created_at: string;
   _profileCount?: number;
   _branchCount?: number;
@@ -473,6 +474,16 @@ function TenantDetailPanel({ tenant, onlineUserIds, onClose, onEdit, onDelete, o
   const [pwSaving, setPwSaving] = useState(false);
   const [pwMsg, setPwMsg] = useState('');
 
+  const ownerProfile =
+    (tenant._profiles || []).find((p) => p.role === 'owner') ||
+    (tenant._profiles || [])[0] ||
+    null;
+  const displayEmail = (tenant.email || ownerProfile?.email || '').trim() || '—';
+  const displayPhone = (tenant.phone || ownerProfile?.phone || '').trim() || '—';
+  const enabledModuleLabels = TOGGLEABLE_MODULES.filter(
+    (m) => !(tenant.disabled_modules || []).includes(m.code),
+  ).map((m) => m.label);
+
   const onlineIdSet = new Set(onlineUserIds);
   const sortedProfiles = [...(tenant._profiles || [])].sort((a, b) => {
     const ao = onlineIdSet.has(a.id) || isProfileOnline(a.last_active_at) ? 1 : 0;
@@ -574,13 +585,13 @@ function TenantDetailPanel({ tenant, onlineUserIds, onClose, onEdit, onDelete, o
               <p className="text-xs font-bold text-slate-400 uppercase mb-1 flex items-center gap-1.5">
                 <Mail className="w-3 h-3" /> E-posta
               </p>
-              <p className="text-sm font-semibold text-slate-700 break-all">{tenant.email}</p>
+              <p className="text-sm font-semibold text-slate-700 break-all">{displayEmail}</p>
             </div>
             <div className="bg-slate-50 rounded-xl p-3">
               <p className="text-xs font-bold text-slate-400 uppercase mb-1 flex items-center gap-1.5">
                 <Phone className="w-3 h-3" /> Telefon
               </p>
-              <p className="text-sm font-semibold text-slate-700">{tenant.phone || '—'}</p>
+              <p className="text-sm font-semibold text-slate-700">{displayPhone}</p>
             </div>
             <div className="bg-slate-50 rounded-xl p-3">
               <p className="text-xs font-bold text-slate-400 uppercase mb-1 flex items-center gap-1.5">
@@ -623,16 +634,41 @@ function TenantDetailPanel({ tenant, onlineUserIds, onClose, onEdit, onDelete, o
                  tenant.deployment_mode === 'hybrid' ? '⚡ Hibrit' : '☁️ Bulut (Online)'}
               </span>
             </div>
+            <div className="bg-slate-50 rounded-xl p-3 col-span-2">
+              <p className="text-xs font-bold text-slate-400 uppercase mb-1.5 flex items-center gap-1.5">
+                <Package2 className="w-3 h-3" /> Açık Modüller
+              </p>
+              {enabledModuleLabels.length > 0 ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {enabledModuleLabels.map((label) => (
+                    <span
+                      key={label}
+                      className="inline-flex px-2 py-0.5 rounded-full text-[11px] font-bold bg-orange-50 text-orange-700 border border-orange-100"
+                    >
+                      {label}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm text-slate-500">—</p>
+              )}
+              {ownerProfile && (
+                <p className="text-xs text-slate-500 mt-2">
+                  Sahip: <span className="font-semibold text-slate-700">{ownerProfile.full_name || '—'}</span>
+                  {ownerProfile.email ? ` · ${ownerProfile.email}` : ''}
+                </p>
+              )}
+            </div>
           </div>
 
-          {tenant.address && (
+          {(tenant.address || '').trim() ? (
             <div className="bg-slate-50 rounded-xl p-3">
               <p className="text-xs font-bold text-slate-400 uppercase mb-1 flex items-center gap-1.5">
                 <MapPin className="w-3 h-3" /> Adres
               </p>
               <p className="text-sm text-slate-700">{tenant.address}</p>
             </div>
-          )}
+          ) : null}
 
           {tenant.notes && (
             <div className="bg-amber-50 border border-amber-200 rounded-xl p-3">
@@ -1827,7 +1863,12 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
     } catch {
       /* private mode */
     }
-    await refreshProfile();
+    try {
+      sessionStorage.removeItem('sefpos.auth.sessionSnap');
+    } catch {
+      /* */
+    }
+    await refreshProfile({ force: true });
     window.location.assign('/');
   };
 

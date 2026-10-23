@@ -1,5 +1,5 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { isVdsSelfHost } from './sqlDb';
+import { isVdsBackend, getVdsApiOrigin } from './sqlDb';
 
 /**
  * Public/QR menu için **ayrı** bir Supabase client.
@@ -136,8 +136,12 @@ export class PublicMenuError extends Error {
  * verileri çeker. RLS policy'leri yalnızca aktif + menüde görünür kayıtları döner.
  */
 export async function loadPublicMenu(branchId: string): Promise<PublicMenuData> {
-  if (isVdsSelfHost()) {
-    const res = await fetch(`/vds-api/public-menu?branchId=${encodeURIComponent(branchId)}`, { credentials: 'same-origin' });
+  if (isVdsBackend()) {
+    const origin = getVdsApiOrigin();
+    const res = await fetch(
+      `${origin}/vds-api/public-menu?branchId=${encodeURIComponent(branchId)}`,
+      { credentials: origin ? 'omit' : 'same-origin' },
+    );
     const data = await res.json().catch(() => null);
     if (!res.ok || data?.error || !data?.branch || !data?.tenant) {
       throw new PublicMenuError('NOT_FOUND', data?.error || 'Menü yüklenemedi');
@@ -298,11 +302,12 @@ export async function createWaiterCall(input: {
   callType: 'service' | 'bill' | 'water' | 'help';
   message?: string;
 }): Promise<void> {
-  if (isVdsSelfHost()) {
-    const res = await fetch('/vds-api/public-waiter-call', {
+  if (isVdsBackend()) {
+    const origin = getVdsApiOrigin();
+    const res = await fetch(`${origin}/vds-api/public-waiter-call`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      credentials: 'same-origin',
+      credentials: origin ? 'omit' : 'same-origin',
       body: JSON.stringify(input),
     });
     const data = await res.json().catch(() => null);

@@ -1,5 +1,5 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { sqlDb, localDb, isSqlServerMode, isLocalMode, isVdsSelfHost } from './sqlDb';
+import { sqlDb, localDb, isSqlServerMode, isLocalMode, isVdsSelfHost, isVdsBackend } from './sqlDb';
 import { isHybridMode } from './hybridMode';
 import { installSupabaseDiagnostics, recordHttpRequest } from './resourceDiagnostics';
 import {
@@ -406,20 +406,21 @@ sefposAuthClientBox.client = realSupabase;
 
 /** SQL proxy disinda gercek bulut oturumu (mod degisimi sonrasi). */
 export function getRealSupabaseClient(): SupabaseClient<Database> {
-  if (isVdsSelfHost()) return supabase;
+  if (isVdsBackend()) return supabase;
   return realSupabase;
 }
 
 /** Giriş ekranı / bulut auth — SQL proxy'den bağımsız (telefon→e-posta lookup). */
 export function getLoginLookupSupabase(): SupabaseClient<Database> {
-  if (isVdsSelfHost() || isSqlServerMode()) return sqlDb as unknown as SupabaseClient<Database>;
+  if (isVdsBackend() || isSqlServerMode()) return sqlDb as unknown as SupabaseClient<Database>;
   return realSupabase;
 }
 
 /** Hibrit kurulum / bulut baglantisi — SQL proxy fetch'inden bagimsiz, her zaman gercek ag. */
 let cloudOnlySupabase: SupabaseClient<Database> | null = null;
 export function getCloudSupabaseClient(): SupabaseClient<Database> {
-  if (isVdsSelfHost()) return supabase;
+  // Üretim backend = VDS; eski Supabase istemcisi yalnızca legacy/dev için kalır
+  if (isVdsBackend()) return supabase;
   if (!cloudOnlySupabase) {
     cloudOnlySupabase = createClient<Database>(supabaseUrl, supabaseAnonKey, {
       auth: {
@@ -441,8 +442,8 @@ if (typeof window !== 'undefined') {
 
 export const supabase: SupabaseClient<Database> = new Proxy({} as SupabaseClient<Database>, {
   get(_target, prop) {
-    // VDS self-host: her zaman sqlDb (Electron / local asla)
-    if (isVdsSelfHost() || isSqlServerMode()) {
+    // VDS (self-host veya uzak API): sqlDb — Supabase kullanılmaz
+    if (isVdsBackend() || isSqlServerMode()) {
       return (sqlDb as any)[prop];
     }
     if (isLocalMode()) {

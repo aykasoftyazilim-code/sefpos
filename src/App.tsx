@@ -169,20 +169,20 @@ export default function App() {
     !!(window as any).electronAPI ? 'desktop-home' : 'tables',
   );
   // Tenant'ın "Masalar" modülü kapalıysa açılış sayfası olarak ilk uygun
-  // modülü seç (hızlı satış / paket servis / vs.). Bu sayede sadece "Hızlı
-  // Satış" kullanan müşteri girer girmez doğru ekrana düşer.
+  // modülü seç (hızlı satış / paket servis / vs.). Impersonation / tenant
+  // değişiminde de yeniden uygulanır.
   useEffect(() => {
     if (!tenant) return;
     const disabled = Array.isArray((tenant as any).disabled_modules)
       ? new Set<string>((tenant as any).disabled_modules as string[])
       : new Set<string>();
-    if (currentPage === 'tables' && disabled.has('tables')) {
-      const fallback = ['quick-sale', 'takeaway', 'online-orders', 'products', 'reports']
+    if (disabled.has(currentPage) || (currentPage === 'tables' && disabled.has('tables'))) {
+      const fallback = ['quick-sale', 'takeaway', 'online-orders', 'products', 'reports', 'settings']
         .find((m) => !disabled.has(m));
       if (fallback) setCurrentPage(fallback);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tenant?.id]);
+  }, [tenant?.id, (tenant as any)?.disabled_modules]);
   const [showShiftQuickClose, setShowShiftQuickClose] = useState(false);
   const [dbMode, setDbMode] = useState<'cloud' | 'sqlserver' | 'hybrid' | null>(readInitialElectronDbMode);
   // Sıcak yol (masa/paket/online): bir kez açılınca display:none ile saklanır.
@@ -707,7 +707,16 @@ export default function App() {
     }
   }
 
-  const needsOnboarding = user && tenant && profile?.role === 'owner' && (tenant.onboarding_completed === false || tenant.onboarding_completed === null) && !onboardingDone;
+  // Masa modülü kapalıysa (sadece hızlı satış / paket vb.) kurulum sihirbazı gerekmez.
+  const tablesModuleOff = Array.isArray((tenant as any)?.disabled_modules)
+    && (tenant as any).disabled_modules.includes('tables');
+  const needsOnboarding =
+    user &&
+    tenant &&
+    profile?.role === 'owner' &&
+    !tablesModuleOff &&
+    (tenant.onboarding_completed === false || tenant.onboarding_completed === null) &&
+    !onboardingDone;
   if (needsOnboarding || showOnboarding) {
     return (
       <PosPageSuspense>

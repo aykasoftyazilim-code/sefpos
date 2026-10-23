@@ -24,7 +24,7 @@ import {
   savePrintSettings,
 } from '../lib/printService';
 import { syncTenantCurrencyCode } from '../lib/currency';
-import { isAykaAdminPath } from '../lib/aykaRoute';
+import { AYKA_ADMIN_PATH, isAykaAdminPath } from '../lib/aykaRoute';
 import { startTenantPresenceTracking, stopTenantPresenceTracking } from '../lib/tenantPresence';
 import { computeClientBusinessDate, fetchCurrentBusinessDate } from '../lib/businessDayApi';
 import { hideBootSplash } from '../lib/bootSplash';
@@ -168,7 +168,7 @@ interface AuthContextType {
     phone?: string,
   ) => Promise<{ error: any }>;
   signOut: () => Promise<void>;
-  refreshProfile: () => Promise<void>;
+  refreshProfile: (opts?: { force?: boolean }) => Promise<void>;
   refreshBranches: () => Promise<void>;
   setActiveBranch: (branch: Branch) => void;
   /** Süper-admin müşteri görünümü: hedef tenant (RLS ile uyumlu); yoksa null */
@@ -190,6 +190,122 @@ function parseStoredRolePermissions(raw: unknown): Record<string, unknown> | nul
   }
   if (typeof raw === 'object') return raw as Record<string, unknown>;
   return null;
+}
+
+/** Süper-admin "Oturum Aç": hedef tenant + (varsa) sahibi profili. VDS/SQL ve bulut ortak. */
+async function resolveAdminImpersonation(userId: string, isSuperAdmin: boolean): Promise<{
+  targetTenantId: string | null;
+  asProfile: Profile | null;
+  asRole: Role | null;
+}> {
+  if (!isSuperAdmin) {
+    try {
+      localStorage.removeItem('shefpos_admin_tenant_impersonation');
+      localStorage.removeItem('shefpos_admin_impersonation_as');
+    } catch {
+      /* */
+    }
+    return { targetTenantId: null, asProfile: null, asRole: null };
+  }
+
+  let targetTenantId: string | null = null;
+  try {
+    const { data: impRow, error: impErr } = await supabase
+      .from('admin_tenant_impersonation' as any)
+      .select('target_tenant_id')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (!impErr && impRow && (impRow as { target_tenant_id?: string }).target_tenant_id) {
+      targetTenantId = String((impRow as { target_tenant_id: string }).target_tenant_id);
+    }
+  } catch {
+    /* tablo yok / ağ */
+  }
+  if (!targetTenantId) {
+    try {
+      const ls = localStorage.getItem('shefpos_admin_tenant_impersonation');
+      const uuidRe =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+      if (ls && uuidRe.test(ls)) {
+        targetTenantId = ls;
+        const nowIso = new Date().toISOString();
+        void supabase.from('admin_tenant_impersonation' as any).upsert(
+          { user_id: userId, target_tenant_id: ls, updated_at: nowIso },
+          { onConflict: 'user_id' },
+        );
+      }
+    } catch {
+      /* storage */
+    }
+  }
+
+  if (!targetTenantId) {
+    try {
+      localStorage.removeItem('shefpos_admin_tenant_impersonation');
+      localStorage.removeItem('shefpos_admin_impersonation_as');
+    } catch {
+      /* */
+    }
+    return { targetTenantId: null, asProfile: null, asRole: null };
+  }
+
+  try {
+    localStorage.setItem('shefpos_admin_tenant_impersonation', targetTenantId);
+  } catch {
+    /* */
+  }
+
+  let asProfile: Profile | null = null;
+  let asRole: Role | null = null;
+  try {
+    const { data: ownerRows } = await supabase
+      .from('profiles')
+      .select(
+        'id, tenant_id, email, full_name, role, role_id, avatar_url, branch_id, phone, is_active, onboarding_completed, created_at',
+      )
+      .eq('tenant_id', targetTenantId)
+      .eq('is_active', true)
+      .order('created_at', { ascending: true })
+      .limit(20);
+    const rows = (ownerRows || []) as any[];
+    const asUser =
+      rows.find((p) => String(p.role || '').toLowerCase() === 'owner') ||
+      rows.find((p) => String(p.role || '').toLowerCase() === 'admin') ||
+      rows[0] ||
+      null;
+    if (asUser) {
+      asProfile = {
+        ...asUser,
+        tenant_id: targetTenantId,
+        is_super_admin: false,
+      } as Profile;
+      if (asUser.role_id) {
+        const { data: roleRow } = await supabase
+          .from('roles')
+          .select('*')
+          .eq('id', asUser.role_id)
+          .maybeSingle();
+        if (roleRow) asRole = roleRow as unknown as Role;
+      }
+      try {
+        localStorage.setItem(
+          'shefpos_admin_impersonation_as',
+          JSON.stringify({
+            profileId: asUser.id,
+            fullName: asUser.full_name || '',
+            email: asUser.email || '',
+            role: asUser.role || 'owner',
+          }),
+        );
+      } catch {
+        /* */
+      }
+    }
+  } catch {
+    /* sahip okunamazsa sadece tenant switch */
+  }
+
+  return { targetTenantId, asProfile, asRole };
 }
 
 function buildPermissionsFromRole(profile: Profile | null, roleData?: Role | null): UserPermissions {
@@ -429,7 +545,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         if (!rec) { setProfileLoadFailed(true); return; }
 
-        const profileData: Profile = {
+        const baseProfile: Profile = {
           id: rec.profile_id || userId,
           tenant_id: rec.tenant_id,
           email: rec.email,
@@ -444,6 +560,30 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           created_at: new Date().toISOString(),
         };
 
+        // VDS/SQL: bulut yolundaki Oturum Aç burada da uygulanmalı (yoksa ayka tenant kalır)
+        const imp = await resolveAdminImpersonation(
+          userId,
+          baseProfile.is_super_admin === true,
+        );
+        setImpersonationTenantId(imp.targetTenantId);
+
+        let profileData: Profile = baseProfile;
+        if (imp.targetTenantId) {
+          if (imp.asProfile) {
+            profileData = { ...imp.asProfile, is_super_admin: false };
+          } else {
+            profileData = {
+              ...baseProfile,
+              tenant_id: imp.targetTenantId,
+              role: 'owner',
+              is_super_admin: false,
+              branch_id: null,
+            };
+          }
+        }
+
+        const effectiveTenantId = profileData.tenant_id;
+
         let tenantOnboarding =
           sqlTruth(rec?.tenant_onboarding) || sqlTruth(rec?.onboarding_completed);
         let deploymentMode =
@@ -453,42 +593,54 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
         let tenantAddress = rec?.tenant_address || null;
         let tenantPhone = rec?.tenant_phone || null;
-        let tenantName = rec?.tenant_name || profileData.tenant_id;
+        let tenantName = rec?.tenant_name || effectiveTenantId;
         let subStatus = rec?.subscription_status || 'trial';
         let subPlan = rec?.subscription_plan || 'trial';
         let subExpires = rec?.subscription_expires_at || null;
+        let tenantDisabledModules: string[] | null = Array.isArray(rec?.disabled_modules)
+          ? (rec.disabled_modules as string[])
+          : null;
+        let tenantSlug = rec?.tenant_slug || effectiveTenantId;
 
-        // Canlı DB'den tenant oku — oturumdaki bayraklar eski kalmasın (sihirbaz döngüsü)
+        // Canlı DB'den tenant oku — impersonation hedefi veya kendi tenant
         try {
           const { data: trow } = await supabase
             .from('tenants')
             .select(
-              'name, onboarding_completed, deployment_mode, address, phone, subscription_status, subscription_plan, subscription_expires_at',
+              'id, name, slug, onboarding_completed, deployment_mode, address, phone, subscription_status, subscription_plan, subscription_expires_at, disabled_modules',
             )
-            .eq('id', profileData.tenant_id)
+            .eq('id', effectiveTenantId)
             .maybeSingle();
           if (trow) {
-            tenantOnboarding = sqlTruth((trow as any).onboarding_completed) || tenantOnboarding;
+            tenantOnboarding = sqlTruth((trow as any).onboarding_completed);
             if ((trow as any).deployment_mode) {
               deploymentMode = String((trow as any).deployment_mode).toLowerCase();
             }
             tenantAddress = (trow as any).address ?? tenantAddress;
             tenantPhone = (trow as any).phone ?? tenantPhone;
             tenantName = (trow as any).name || tenantName;
+            tenantSlug = (trow as any).slug || tenantSlug;
             subStatus = (trow as any).subscription_status || subStatus;
             subPlan = (trow as any).subscription_plan || subPlan;
             subExpires = (trow as any).subscription_expires_at ?? subExpires;
-            patchSqlSessionRecord({
-              tenant_onboarding: tenantOnboarding,
-              onboarding_completed: tenantOnboarding,
-              deployment_mode: deploymentMode,
-              tenant_name: tenantName,
-              tenant_address: tenantAddress,
-              tenant_phone: tenantPhone,
-              subscription_status: subStatus,
-              subscription_plan: subPlan,
-              subscription_expires_at: subExpires,
-            });
+            if (Array.isArray((trow as any).disabled_modules)) {
+              tenantDisabledModules = (trow as any).disabled_modules as string[];
+            }
+            // Impersonation sırasında admin oturum kaydını kalıcı bozma
+            if (!imp.targetTenantId) {
+              patchSqlSessionRecord({
+                tenant_onboarding: tenantOnboarding,
+                onboarding_completed: tenantOnboarding,
+                deployment_mode: deploymentMode,
+                tenant_name: tenantName,
+                tenant_address: tenantAddress,
+                tenant_phone: tenantPhone,
+                subscription_status: subStatus,
+                subscription_plan: subPlan,
+                subscription_expires_at: subExpires,
+                disabled_modules: tenantDisabledModules,
+              });
+            }
           }
         } catch {
           /* oturum alanlarıyla devam */
@@ -497,9 +649,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (isHybridMode()) deploymentMode = 'hybrid';
 
         const fakeTenant: Tenant = {
-          id: profileData.tenant_id,
+          id: effectiveTenantId,
           name: tenantName,
-          slug: rec?.tenant_slug || profileData.tenant_id,
+          slug: tenantSlug,
           subscription_status: subStatus,
           subscription_plan: subPlan,
           subscription_expires_at: subExpires,
@@ -511,29 +663,33 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           logo_url: null,
           address: tenantAddress,
           phone: tenantPhone,
-          email: rec?.email || null,
+          email: profileData.email || rec?.email || null,
           printer_settings: null,
           require_cancel_reason: rec?.require_cancel_reason ?? false,
           lock_pin: rec?.lock_pin || null,
           ip_lock_enabled: null,
-          disabled_modules: null,
+          disabled_modules: tenantDisabledModules,
         };
+
+        const rp = parseStoredRolePermissions(rec?.role_permissions);
+        let roleData: Role | null = imp.asRole;
+        if (!roleData && !imp.targetTenantId) {
+          roleData = rp
+            ? { id: '', tenant_id: effectiveTenantId, name: profileData.role, permissions: rp as Role['permissions'], created_at: '' }
+            : null;
+        }
+        const sqlPerms = buildPermissionsFromRole(profileData, roleData);
 
         setProfile(profileData);
         setTenant(fakeTenant);
+        setPermissions(sqlPerms);
 
-        const rp = parseStoredRolePermissions(rec?.role_permissions);
-        const roleData: Role | null = rp
-          ? { id: '', tenant_id: profileData.tenant_id, name: profileData.role, permissions: rp as Role['permissions'], created_at: '' }
-          : null;
-        setPermissions(buildPermissionsFromRole(profileData, roleData));
-
-        // Şubeleri DB'den çek (Electron sqlGetBranches veya VDS query)
+        // Şubeleri hedef tenant'tan çek
         let branchRows: Branch[] = [];
         const api = (window as any).electronAPI;
         if (api?.sqlGetBranches) {
           const brRes = await api.sqlGetBranches({
-            tenantId: profileData.tenant_id,
+            tenantId: effectiveTenantId,
             userId: profileData.id,
             userRole: profileData.role,
           });
@@ -544,9 +700,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             let bq = supabase
               .from('branches')
               .select('*')
-              .eq('tenant_id', profileData.tenant_id)
+              .eq('tenant_id', effectiveTenantId)
               .eq('is_active', true);
-            if (profileData.role !== 'owner' && profileData.role !== 'admin' && profileData.branch_id) {
+            if (
+              !imp.targetTenantId &&
+              profileData.role !== 'owner' &&
+              profileData.role !== 'admin' &&
+              profileData.branch_id
+            ) {
               bq = bq.eq('id', profileData.branch_id);
             }
             const { data: brows } = await bq.order('is_main', { ascending: false });
@@ -563,27 +724,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             branchRows.find((b) => b.is_main) ||
             branchRows[0];
           setActiveBranchState(preferred);
-          const sqlPerms = buildPermissionsFromRole(profileData, roleData);
           persistAuthSessionSnap({
             userId,
             profile: profileData,
             tenant: fakeTenant,
             branches: branchRows,
             activeBranchId: preferred.id,
-            impersonationTenantId: null,
+            impersonationTenantId: imp.targetTenantId,
             permissions: sqlPerms,
           });
           return;
         }
 
         const fakeBranch: Branch = {
-          id: rec.branch_id || profileData.tenant_id,
-          tenant_id: profileData.tenant_id,
+          id: profileData.branch_id || effectiveTenantId,
+          tenant_id: effectiveTenantId,
           name: rec.branch_name || 'Ana Şube',
           address: '',
           phone: '',
           is_active: true,
-          is_main: rec.branch_is_main ?? true,
+          is_main: true,
           created_at: new Date().toISOString(),
         };
         setBranches([fakeBranch]);
@@ -594,8 +754,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           tenant: fakeTenant,
           branches: [fakeBranch],
           activeBranchId: fakeBranch.id,
-          impersonationTenantId: null,
-          permissions: buildPermissionsFromRole(profileData, roleData),
+          impersonationTenantId: imp.targetTenantId,
+          permissions: sqlPerms,
         });
         return;
       }
@@ -634,71 +794,43 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         return;
       }
       const isSuperAdmin = (prof as any).is_super_admin === true;
-      let impersonationTarget: string | null = null;
-
-      if (isSuperAdmin) {
-        try {
-          const { data: impRow, error: impErr } = await supabase
-            .from('admin_tenant_impersonation' as any)
-            .select('target_tenant_id')
-            .eq('user_id', userId)
-            .maybeSingle();
-          if (!impErr && impRow && (impRow as { target_tenant_id?: string }).target_tenant_id) {
-            impersonationTarget = String((impRow as { target_tenant_id: string }).target_tenant_id);
-          }
-        } catch {
-          /* migration henüz yok / ağ */
-        }
-        if (!impersonationTarget) {
-          try {
-            const ls = localStorage.getItem('shefpos_admin_tenant_impersonation');
-            const uuidRe =
-              /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-            if (ls && uuidRe.test(ls)) {
-              impersonationTarget = ls;
-              const nowIso = new Date().toISOString();
-              void supabase.from('admin_tenant_impersonation' as any).upsert(
-                { user_id: userId, target_tenant_id: ls, updated_at: nowIso },
-                { onConflict: 'user_id' },
-              );
-            }
-          } catch {
-            /* storage */
-          }
-        }
-        setImpersonationTenantId(impersonationTarget);
-        if (impersonationTarget) {
-          try {
-            localStorage.setItem('shefpos_admin_tenant_impersonation', impersonationTarget);
-          } catch {
-            /* private mode */
-          }
-        } else {
-          try {
-            localStorage.removeItem('shefpos_admin_tenant_impersonation');
-          } catch {
-            /* */
-          }
-        }
-      } else {
-        setImpersonationTenantId(null);
-        try {
-          localStorage.removeItem('shefpos_admin_tenant_impersonation');
-        } catch {
-          /* */
-        }
-      }
+      const imp = await resolveAdminImpersonation(userId, isSuperAdmin);
+      const impersonationTarget = imp.targetTenantId;
+      setImpersonationTenantId(impersonationTarget);
 
       const effectiveTenantId =
         isSuperAdmin && impersonationTarget ? impersonationTarget : prof.tenant_id;
-      const effectiveProfile = {
+
+      let effectiveProfile = {
         ...(prof as any),
         tenant_id: effectiveTenantId,
       } as unknown as ProfileWithRole;
+      let effectiveRole = prof.roles ?? null;
+
+      if (isSuperAdmin && impersonationTarget) {
+        if (imp.asProfile) {
+          effectiveProfile = {
+            ...(imp.asProfile as any),
+            tenant_id: impersonationTarget,
+            is_super_admin: false,
+          } as unknown as ProfileWithRole;
+          effectiveRole = (imp.asRole as unknown as ProfileWithRole['roles']) ?? null;
+        } else {
+          effectiveProfile = {
+            ...(effectiveProfile as any),
+            role: 'owner',
+            is_super_admin: false,
+          } as unknown as ProfileWithRole;
+          effectiveRole = null;
+        }
+      }
 
       setProfile(effectiveProfile as unknown as Profile);
 
-      const perms = buildPermissionsFromRole(effectiveProfile as unknown as Profile, prof.roles ?? null);
+      const perms = buildPermissionsFromRole(
+        effectiveProfile as unknown as Profile,
+        effectiveRole,
+      );
       setPermissions(perms);
 
       const [{ data: tenantData }, { active: activeBranch, list: branchList }] = await Promise.all([
@@ -1104,16 +1236,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     try {
       localStorage.removeItem('shefpos_admin_tenant_impersonation');
+      localStorage.removeItem('shefpos_admin_impersonation_as');
     } catch {
       /* */
     }
     setImpersonationTenantId(null);
-    await loadProfile(user.id);
+    // Lisans paneline dön — admin profili yeniden yüklensin
+    window.location.assign(AYKA_ADMIN_PATH);
   };
 
-  const refreshProfile = async () => {
+  const refreshProfile = async (opts?: { force?: boolean }) => {
     if (user) {
-      await loadProfile(user.id);
+      await loadProfile(user.id, opts?.force ? { force: true } : undefined);
     }
   };
 

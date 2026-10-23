@@ -85,7 +85,7 @@ const SQL_ROW_ALLOWLIST = {
   products: ['id', 'tenant_id', 'category_id', 'name', 'description', 'barcode', 'price', 'cost', 'stock_quantity', 'unit', 'tax_rate', 'is_active', 'is_available', 'image_url', 'printer_name', 'scale_enabled', 'plu_code', 'scale_prefix', 'created_at', 'updated_at'],
   product_variants: ['id', 'tenant_id', 'product_id', 'name', 'price_modifier', 'sort_order', 'is_active', 'created_at', 'updated_at'],
   order_items: ['id', 'order_id', 'tenant_id', 'product_id', 'variant_id', 'quantity', 'unit_price', 'tax_rate', 'discount_amount', 'total_amount', 'notes', 'variant_name', 'status', 'cancellation_reason', 'cancelled_by', 'cancelled_at', 'paid_quantity', 'paid_at', 'created_at'],
-  tenants: ['id', 'name', 'slug', 'address', 'phone', 'email', 'logo_url', 'subscription_status', 'subscription_plan', 'subscription_expires_at', 'max_branches', 'notes', 'onboarding_completed', 'deployment_mode', 'printer_settings', 'require_cancel_reason', 'lock_pin', 'ip_lock_enabled', 'created_at'],
+  tenants: ['id', 'name', 'slug', 'address', 'phone', 'email', 'logo_url', 'subscription_status', 'subscription_plan', 'subscription_expires_at', 'max_branches', 'notes', 'onboarding_completed', 'deployment_mode', 'printer_settings', 'require_cancel_reason', 'lock_pin', 'ip_lock_enabled', 'disabled_modules', 'created_at'],
   branches: ['id', 'tenant_id', 'name', 'address', 'phone', 'is_active', 'is_main', 'use_central_products', 'menu_enabled', 'qr_menu_settings', 'default_discount_percent', 'default_discount_active', 'created_at'],
   orders: ['id', 'tenant_id', 'branch_id', 'table_id', 'order_number', 'order_type', 'order_subtype', 'status', 'payment_status', 'payment_method', 'subtotal', 'tax_amount', 'discount_amount', 'total_amount', 'notes', 'waiter_id', 'waiter_name', 'created_by', 'created_at', 'updated_at', 'completed_at', 'paid_at', 'session_id', 'customer_id', 'customer_name', 'customer_phone', 'customer_address', 'delivery_address', 'delivery_note', 'courier_id', 'courier_name', 'estimated_delivery_minutes', 'delivery_status', 'payment_collected', 'delivery_customer_id', 'assigned_at', 'picked_up_at', 'delivered_at'],
   payment_transactions: ['id', 'tenant_id', 'order_id', 'payment_method', 'amount', 'notes', 'created_at', 'created_by'],
@@ -188,8 +188,45 @@ function normalizeParamValue(val) {
   if (typeof val === 'string' && /^(true|false)$/i.test(val)) return val.toLowerCase() === 'true' ? 1 : 0;
   const dt = parseSqlDateTime(val);
   if (dt) return dt;
-  if (typeof val === 'object' && !Array.isArray(val) && !(val instanceof Date)) return JSON.stringify(val);
+  // disabled_modules / printer_settings gibi JSON alanlar
+  if (Array.isArray(val) || (typeof val === 'object' && !(val instanceof Date))) {
+    return JSON.stringify(val);
+  }
   return val;
+}
+
+const JSON_TEXT_COLUMNS = new Set([
+  'disabled_modules',
+  'printer_settings',
+  'permissions',
+  'opening_cash_breakdown',
+  'closing_cash_breakdown',
+  'qr_menu_settings',
+  'settings',
+  'payload',
+  'allowed_ips',
+]);
+
+function hydrateSqlRow(row) {
+  if (!row || typeof row !== 'object') return row;
+  const out = { ...row };
+  for (const key of Object.keys(out)) {
+    const v = out[key];
+    if (typeof v !== 'string') continue;
+    if (!JSON_TEXT_COLUMNS.has(key) && !(v.startsWith('[') || v.startsWith('{'))) continue;
+    if (!JSON_TEXT_COLUMNS.has(key)) continue;
+    try {
+      out[key] = JSON.parse(v);
+    } catch {
+      /* düz metin kalsın */
+    }
+  }
+  return out;
+}
+
+function hydrateSqlRows(rows) {
+  if (!Array.isArray(rows)) return rows;
+  return rows.map(hydrateSqlRow);
 }
 
 function bindParams(request, params) {
@@ -203,7 +240,7 @@ async function runSql(sqlText, params) {
   const request = pool.request();
   bindParams(request, params);
   const result = await request.query(sqlText);
-  return result.recordset || [];
+  return hydrateSqlRows(result.recordset || []);
 }
 
 function safeId(c) {
@@ -955,11 +992,37 @@ function readBody(req) {
   });
 }
 
+function corsHeaders(req) {
+  const origin = String(req.headers.origin || '').trim();
+  const allowed =
+    !origin ||
+    origin === 'https://sefpos.com.tr' ||
+    origin === 'https://www.sefpos.com.tr' ||
+    origin === 'http://localhost:5180' ||
+    origin === 'http://127.0.0.1:5180' ||
+    /^https:\/\/[a-z0-9.-]*sefpos\.com\.tr$/i.test(origin) ||
+    /^https:\/\/[a-z0-9-]+\.pages\.dev$/i.test(origin);
+  const headers = {
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '86400',
+  };
+  if (allowed) {
+    headers['Access-Control-Allow-Origin'] = origin || '*';
+    if (origin) headers['Vary'] = 'Origin';
+  }
+  return headers;
+}
+
+/** Her istekte set edilir — sendJson CORS için */
+let _corsReq = null;
+
 function sendJson(res, status, obj) {
   const body = JSON.stringify(obj);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
+    ...(_corsReq ? corsHeaders(_corsReq) : {}),
   });
   res.end(body);
 }
@@ -970,10 +1033,11 @@ function routePath(url) {
 }
 
 const server = http.createServer(async (req, res) => {
+  _corsReq = req;
   const method = String(req.method || 'GET').toUpperCase();
   const p = routePath(req.url);
   if (method === 'OPTIONS') {
-    res.writeHead(204);
+    res.writeHead(204, corsHeaders(req));
     return res.end();
   }
   try {

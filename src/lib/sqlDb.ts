@@ -6,7 +6,39 @@ export function isVdsSelfHost(): boolean {
   return import.meta.env.VITE_VDS_SELFHOST === 'true';
 }
 
-if (typeof window !== 'undefined' && isVdsSelfHost()) {
+/** Uzak VDS API kökü (Cloudflare www / Electron cloud). Boş = same-origin `/vds-api`. */
+export const DEFAULT_REMOTE_VDS_ORIGIN = 'https://sefpos.com.tr';
+
+export function getVdsApiOrigin(): string {
+  const fromEnv = String(import.meta.env.VITE_VDS_API_BASE || '')
+    .trim()
+    .replace(/\/$/, '');
+  if (fromEnv) return fromEnv;
+  if (isVdsSelfHost()) return '';
+  try {
+    // Electron "cloud" artık Supabase değil — VDS
+    if (eApi()?.isElectron && localStorage.getItem('dbMode') === 'cloud') {
+      return DEFAULT_REMOTE_VDS_ORIGIN;
+    }
+  } catch {
+    /* ignore */
+  }
+  return '';
+}
+
+/** VDS SQL API kullanılsın mı (self-host veya uzak). */
+export function isVdsBackend(): boolean {
+  if (isVdsSelfHost()) return true;
+  if (String(import.meta.env.VITE_VDS_API_BASE || '').trim()) return true;
+  try {
+    if (eApi()?.isElectron && localStorage.getItem('dbMode') === 'cloud') return true;
+  } catch {
+    /* ignore */
+  }
+  return false;
+}
+
+if (typeof window !== 'undefined' && (isVdsSelfHost() || String(import.meta.env.VITE_VDS_API_BASE || '').trim())) {
   try {
     localStorage.setItem('dbMode', 'sqlserver');
   } catch {
@@ -24,7 +56,7 @@ function isCloudLoginEmail(email: string): boolean {
 }
 
 export function isSqlServerMode(): boolean {
-  if (isVdsSelfHost()) return true;
+  if (isVdsBackend()) return true;
   if (!(eApi()?.isElectron)) return false;
   try {
     const saved = localStorage.getItem('dbMode');
@@ -124,12 +156,19 @@ function vdsAuthHeaders(): Record<string, string> {
   return headers;
 }
 
+function vdsApiUrl(path: string): string {
+  const origin = getVdsApiOrigin();
+  const p = path.startsWith('/') ? path : `/${path}`;
+  return `${origin}/vds-api${p}`;
+}
+
 async function vdsPost<T = any>(path: string, body: unknown): Promise<T> {
-  const res = await fetch(`/vds-api${path}`, {
+  const origin = getVdsApiOrigin();
+  const res = await fetch(vdsApiUrl(path), {
     method: 'POST',
     headers: vdsAuthHeaders(),
     body: JSON.stringify(body),
-    credentials: 'same-origin',
+    credentials: origin ? 'omit' : 'same-origin',
   });
   const json = (await res.json().catch(() => null)) as T & { error?: string };
   if (!res.ok) {
@@ -141,7 +180,7 @@ async function vdsPost<T = any>(path: string, body: unknown): Promise<T> {
 async function execQuery(
   state: QueryState,
 ): Promise<{ data: any; error: any; count?: number | null }> {
-  if (isVdsSelfHost()) {
+  if (isVdsBackend()) {
     try {
       const result = await vdsPost<{ data: any; error?: string; count?: number | null }>('/query', state);
       if (result.error) return { data: null, error: new Error(result.error) };
@@ -654,7 +693,7 @@ export const sqlDb = {
       p_opened_by: (params as any)?.p_opened_by ?? rec?.user_id,
       p_closed_by: (params as any)?.p_closed_by ?? rec?.user_id,
     };
-    if (isVdsSelfHost()) {
+    if (isVdsBackend()) {
       try {
         const result = await vdsPost<{ data: any; error?: string }>('/rpc', { fn, params: merged });
         if (result?.error) return { data: null, error: new Error(result.error) };
@@ -723,13 +762,14 @@ export const sqlDb = {
     },
 
     async signInWithPassword({ email, password }: { email: string; password: string }) {
-      if (isVdsSelfHost()) {
+      if (isVdsBackend()) {
         try {
-          const res = await fetch('/vds-api/login', {
+          const origin = getVdsApiOrigin();
+          const res = await fetch(vdsApiUrl('/login'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ email, password }),
-            credentials: 'same-origin',
+            credentials: origin ? 'omit' : 'same-origin',
           });
           const result = await res.json().catch(() => null) as { success?: boolean; error?: string; data?: any; token?: string } | null;
           if (res.status === 502 || res.status === 503) {
@@ -786,17 +826,37 @@ export const sqlDb = {
         return { data: { session, user: session.user }, error: null };
       }
 
-      /** SQL/hibrit kurulum yarım kaldıysa bulut e-postası SQL'e gitmesin — otomatik bulut modu. */
+      /** Bulut e-posta → VDS (Supabase yok). */
       if (isCloudLoginEmail(em)) {
         try {
           localStorage.setItem('dbMode', 'cloud');
           await api.setDbMode?.('cloud');
-          setSqlSession(null);
         } catch {
           /* ignore */
         }
-        const { getRealSupabaseClient } = await import('./supabase');
-        return getRealSupabaseClient().auth.signInWithPassword({ email: em, password });
+        try {
+          const res = await fetch(`${DEFAULT_REMOTE_VDS_ORIGIN}/vds-api/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: em, password }),
+            credentials: 'omit',
+          });
+          const result = (await res.json().catch(() => null)) as {
+            success?: boolean;
+            error?: string;
+            data?: any;
+            token?: string;
+          } | null;
+          if (!result?.success) {
+            return { data: null, error: new Error(result?.error || 'Giriş başarısız') };
+          }
+          const session = buildSessionFromRecord(result.data);
+          if (result.token) session.access_token = result.token;
+          setSqlSession(session);
+          return { data: { session, user: session.user }, error: null };
+        } catch (err: any) {
+          return { data: null, error: err };
+        }
       }
 
       const result = await api.sqlLogin({ email, password });
@@ -809,12 +869,13 @@ export const sqlDb = {
     },
 
     async signUp({ email, password, options }: { email: string; password: string; options?: any }) {
-      if (isVdsSelfHost()) {
+      if (isVdsBackend()) {
         try {
           const fullName = options?.data?.full_name || '';
           const tenantName = options?.data?.tenant_name || '';
           const phone = options?.data?.phone || '';
-          const res = await fetch('/vds-api/register', {
+          const origin = getVdsApiOrigin();
+          const res = await fetch(vdsApiUrl('/register'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -824,7 +885,7 @@ export const sqlDb = {
               tenantName,
               phone,
             }),
-            credentials: 'same-origin',
+            credentials: origin ? 'omit' : 'same-origin',
           });
           const result = (await res.json().catch(() => null)) as {
             success?: boolean;

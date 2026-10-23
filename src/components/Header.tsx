@@ -496,11 +496,13 @@ function HeaderInner({ onOpenSettings, onOpenOnboarding, currentPage, onBackToTa
             >
               {impersonationTenantId && (
                 <div
-                  className="flex items-center gap-1.5 max-w-[min(100%,14rem)] sm:max-w-xs rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-[10px] sm:text-xs font-bold text-amber-950"
-                  title="Lisans panelinden açılan müşteri kiracısı görünümü"
+                  className="flex items-center gap-1.5 max-w-[min(100%,16rem)] sm:max-w-sm rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-[10px] sm:text-xs font-bold text-amber-950"
+                  title={`${profile?.full_name || profile?.email || 'Kullanıcı'} olarak görüyorsunuz — müşterinin ekranı`}
                 >
                   <UserCheck className="w-3.5 h-3.5 flex-shrink-0 text-amber-700" aria-hidden />
-                  <span className="truncate hidden sm:inline">{tenant?.name || 'Müşteri'}</span>
+                  <span className="truncate hidden sm:inline">
+                    {profile?.full_name || profile?.email || tenant?.name || 'Müşteri'}
+                  </span>
                   <button
                     type="button"
                     onClick={() => void clearTenantImpersonation()}
