@@ -5,6 +5,10 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
+import { isSqlServerMode } from '../lib/sqlDb';
+import { isActivePosPage, PAGE_CHANGE_EVENT } from '../lib/pageActivity';
+import { startAdaptivePoller } from '../lib/pollSchedule';
+import { ELECTRON_HEADER_ICON_BTN_CLASS } from '../lib/electronLayout';
 
 interface WaiterCall {
   id: string;
@@ -46,7 +50,12 @@ const HISTORY_LIMIT = 60;
  * - Yeni çağrı geldiğinde: ses + titreşim + 3.5sn toast popup (sağ üstte).
  * - Realtime + SUBSCRIBED sonrası HTTP ile tam senkron; 12 sn yedek poll; sekme/odak/online yenileme.
  */
-export function WaiterCallBell() {
+type WaiterCallBellProps = {
+  /** Turuncu Electron ust barinda ikonlar beyaz gorunsun */
+  headerVariant?: 'default' | 'electron-bar';
+};
+
+export function WaiterCallBell({ headerVariant = 'default' }: WaiterCallBellProps) {
   const { tenant, activeBranch } = useAuth();
 
   const [calls, setCalls] = useState<WaiterCall[]>([]);
@@ -65,6 +74,13 @@ export function WaiterCallBell() {
   const initialPullDoneRef = useRef(false);
   const tenantIdRef = useRef<string | undefined>(undefined);
   tenantIdRef.current = tenant?.id;
+  const [pageRev, setPageRev] = useState(0);
+
+  useEffect(() => {
+    const bump = () => setPageRev((n) => n + 1);
+    window.addEventListener(PAGE_CHANGE_EVENT, bump);
+    return () => window.removeEventListener(PAGE_CHANGE_EVENT, bump);
+  }, []);
 
   useEffect(() => {
     mutedRef.current = muted;
@@ -135,14 +151,23 @@ export function WaiterCallBell() {
     };
   }, [tenant?.id, pullLatest]);
 
-  // Realtime + SUBSCRIBED sonrası tam senkron + periyodik yedek + sekme uyanınca yenile
-  useEffect(() => {
-    if (!tenant?.id) return;
+  // Realtime + yedek poll yalnızca masa / ana sayfa / garson — paket ekranında kanal açık kalmasın
+  const waiterChannelActive = isActivePosPage('tables', 'waiter-app', 'desktop-home');
 
-    const POLL_MS = 12_000;
-    const pollTimer = window.setInterval(() => {
-      void pullLatest({ notifyNew: true });
-    }, POLL_MS);
+  useEffect(() => {
+    if (!tenant?.id || !waiterChannelActive) return;
+
+    const stopPoll = startAdaptivePoller({
+      diagLabel: 'waiter-calls-poll',
+      baseMs: isSqlServerMode() ? 120_000 : 90_000,
+      idleMs: isSqlServerMode() ? 240_000 : 150_000,
+      hiddenMs: 0,
+      run: () => {
+        if (!isActivePosPage('tables', 'waiter-app', 'desktop-home')) return;
+        void pullLatest({ notifyNew: true });
+      },
+      immediate: false,
+    });
 
     const onVisible = () => {
       if (document.visibilityState === 'visible') void pullLatest({ notifyNew: true });
@@ -202,14 +227,14 @@ export function WaiterCallBell() {
       });
 
     return () => {
-      window.clearInterval(pollTimer);
+      stopPoll();
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('online', onOnline);
       window.removeEventListener('focus', onFocus);
       supabase.removeChannel(channel);
       if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
     };
-  }, [tenant?.id, pullLatest]);
+  }, [tenant?.id, waiterChannelActive, pageRev, pullLatest]);
 
   const playBeep = () => {
     try {
@@ -328,10 +353,14 @@ export function WaiterCallBell() {
       {/* Header butonu */}
       <button
         onClick={() => { setOpen(o => !o); setToast(null); }}
-        className={`relative p-1.5 md:p-2 rounded-lg transition-all active:scale-95 ${
+        className={`relative rounded-lg transition-all active:scale-95 ${
           pendingCount > 0
-            ? 'text-white bg-gradient-to-br from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 shadow-md animate-pulse'
-            : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+            ? headerVariant === 'electron-bar'
+              ? 'h-10 w-10 inline-flex items-center justify-center text-white bg-gradient-to-br from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 shadow-md animate-pulse'
+              : 'p-1.5 md:p-2 text-white bg-gradient-to-br from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 shadow-md animate-pulse'
+            : headerVariant === 'electron-bar'
+              ? `${ELECTRON_HEADER_ICON_BTN_CLASS}`
+              : 'p-1.5 md:p-2 text-slate-600 hover:text-slate-900 hover:bg-slate-100'
         }`}
         title={pendingCount > 0 ? `${pendingCount} bekleyen garson çağrısı` : 'Garson çağrıları'}
         aria-label="Garson çağrıları"

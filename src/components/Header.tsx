@@ -1,12 +1,51 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, memo, useRef } from 'react';
 import { useAuth } from '../contexts/AuthContext';
-import { LogOut, User, Settings, ChevronDown, MapPin, Check, Building2, Zap, ZoomIn, ZoomOut, Bell, Headphones as HeadphonesIcon, X, Send, Sparkles, Phone, Mail, ArrowLeft, LayoutGrid, PlayCircle, Lock, Minimize2, UserCheck } from 'lucide-react';
+import { usePersonalActiveShift } from '../contexts/ActiveShiftContext';
+import { LogOut, User, Settings, ChevronDown, MapPin, Check, Building2, Zap, ZoomIn, ZoomOut, Bell, Headphones as HeadphonesIcon, X, Send, Sparkles, Phone, Mail, ArrowLeft, LayoutGrid, PlayCircle, Lock, Minimize2, UserCheck, Trash2, Home, ChevronRight, Key, BookOpen } from 'lucide-react';
 import { WaiterCallBell } from './WaiterCallBell';
 import { supabase } from '../lib/supabase';
 import { getTrialInfo, formatTrialRemaining } from '../lib/tenantTrial';
-import { useActiveShift } from '../lib/useActiveShift';
+import { getLicenseInfo } from '../lib/licenseDisplay';
+import { readElectronDbMode } from '../lib/connectionMode';
+import { ConnectionModeBadge } from './electron/ConnectionModeBadge';
+import type { ActiveShift } from '../lib/useActiveShift';
 import { shiftDurationLabel, shiftIcon } from '../lib/businessDay';
 import { useUiPrefs, setHeaderHidden, setUiScale, bumpUiScale, resetUiScale, UI_SCALE_MIN, UI_SCALE_MAX, UI_SCALE_STEP } from '../lib/uiPrefs';
+import {
+  clearAllSupportNotifications,
+  countUnreadNotifications,
+  dismissSupportNotification,
+  fetchSupportNotifications,
+  isNotificationUnread,
+  markSupportNotificationsRead,
+  notificationTypeLabel,
+  type SupportNotificationRow,
+} from '../lib/supportNotifications';
+import {
+  processWipeLocalNotification,
+  shouldAutoProcessWipeLocal,
+  skipWipeLocalNotification,
+} from '../lib/remoteWipe';
+import { dispatchSupportNotifBanner } from '../lib/supportNotificationBridge';
+import { publicAsset } from '../lib/assetUrl';
+import { requestOpenGuide } from '../lib/sefposGuideKnowledge';
+import {
+  ELECTRON_HEADER_BAR_CLASS,
+  ELECTRON_HEADER_CHIP_CLASS,
+  ELECTRON_HEADER_ACCENT_CHIP_CLASS,
+  ELECTRON_HEADER_ICON_BTN_CLASS,
+  ELECTRON_HEADER_LOGO_CLASS,
+  ELECTRON_HEADER_BRAND_BLOCK,
+  ELECTRON_HEADER_BRAND_NAME,
+  ELECTRON_HEADER_SLOGAN_LINE,
+  ELECTRON_HEADER_SLOGAN_BLOCK,
+  ELECTRON_HEADER_HOME_BTN_CLASS,
+  ELECTRON_HEADER_TOOLBAR_GROUP,
+  ELECTRON_HEADER_ROW_CLASS,
+  ELECTRON_HEADER_PADDING,
+  ELECTRON_HEADER_TOOL_H,
+  ELECTRON_HEADER_LOGOUT_CLASS,
+} from '../lib/electronLayout';
 
 const isElectron = !!(window as any).electronAPI;
 
@@ -21,12 +60,8 @@ const roleLabels: Record<string, string> = {
   super_admin: 'Süper Admin',
 };
 
-// Header'da gosterilen ana logo. Kullanicinin atttigi yeni
-// "ŞefPOS chef-hat" logosu, sadece bu konumda kullanilir; Auth/Onboarding/Landing
-// hala /logo.png kullanir.
-const logoSrc = isElectron
-  ? new URL('../../public/logo-header.png', import.meta.url).href
-  : '/logo-header.png';
+// Web: yatay logo. Electron: turuncu barda kontrast icin yuvarlak logo (ana sayfa ile ayni).
+const logoSrc = isElectron ? publicAsset('sefpos-round.png') : '/logo-header.png';
 
 interface HeaderProps {
   onOpenSettings: () => void;
@@ -56,6 +91,7 @@ interface Notification {
 
 /** Sayfa anahtari → kullanici dostu Turkce ad. Header breadcrumb'inda gosterilir. */
 const PAGE_LABELS: Record<string, string> = {
+  'desktop-home': 'Ana Sayfa',
   tables: 'Masalar',
   takeaway: 'Paket Servis',
   'online-orders': 'Online Siparişler',
@@ -65,7 +101,7 @@ const PAGE_LABELS: Record<string, string> = {
   customers: 'Müşteriler',
   users: 'Kullanıcılar',
   reports: 'Raporlar',
-  'reports-stock-count': 'Sayım raporu',
+  'reports-stock-count': 'Raporlar — Sayım',
   endofday: 'Gün Sonu',
   'cancel-logs': 'İptal Kayıtları',
   inventory: 'Stok yönetimi',
@@ -73,7 +109,7 @@ const PAGE_LABELS: Record<string, string> = {
   shifts: 'Vardiyalar',
 };
 
-export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackToTables, onOpenShifts }: HeaderProps) {
+function HeaderInner({ onOpenSettings, onOpenOnboarding, currentPage, onBackToTables, onOpenShifts }: HeaderProps) {
   const {
     profile,
     tenant,
@@ -89,19 +125,14 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
     clearTenantImpersonation,
   } = useAuth();
   const canUseShifts = !!permissions?.can_use_shifts;
-  const { activeShift, todayClosure } = useActiveShift({
-    tenantId: tenant?.id || null,
-    branchId: activeBranch?.id || null,
-    userId: user?.id || null,
-    enabled: !!tenant && shiftsEnabled && canUseShifts,
-    cutoffHour: businessDayStartHour,
-  });
+  const { activeShift, todayClosure } = usePersonalActiveShift();
   const [showBranchMenu, setShowBranchMenu] = useState(false);
   const uiPrefs = useUiPrefs();
   const zoom = uiPrefs.uiScale;
   const [showSupport, setShowSupport] = useState(false);
   const [showNotifications, setShowNotifications] = useState(false);
   const [tickets, setTickets] = useState<Notification[]>([]);
+  const [systemNotifs, setSystemNotifs] = useState<SupportNotificationRow[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
   const [systemUnreadCount, setSystemUnreadCount] = useState(0);
   const [supportSubject, setSupportSubject] = useState('');
@@ -110,10 +141,21 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
   const [supportLoading, setSupportLoading] = useState(false);
   const [supportSent, setSupportSent] = useState(false);
   const [showTrialInfo, setShowTrialInfo] = useState(false);
+  const [showLicenseInfo, setShowLicenseInfo] = useState(false);
+  const [clearingNotifId, setClearingNotifId] = useState<string | null>(null);
+  const [clearingAllNotifs, setClearingAllNotifs] = useState(false);
+  const supportSentTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (supportSentTimerRef.current) clearTimeout(supportSentTimerRef.current);
+  }, []);
 
   const trialInfo = getTrialInfo(tenant as any);
+  const licenseInfo = getLicenseInfo(tenant as any);
   const showTrialBadge = trialInfo.isTrial;
+  const showLicenseBadge = !showTrialBadge && !!tenant;
   const trialUrgent = trialInfo.isTrial && (trialInfo.expired || trialInfo.remainingHours <= 24);
+  const licenseUrgent = showLicenseBadge && (licenseInfo.expired || licenseInfo.expiringSoon);
 
   // Electron uzerinde calisirken (varsa) Electron'in zoom state'ini de
   // uygulamamiz tercihine senkronize et — boylece pencere yenilense bile
@@ -127,40 +169,57 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
     }
   }, [isElectron, uiPrefs.uiScale]);
 
-  useEffect(() => {
-    if (!tenant || !user) return;
-    loadTickets();
-  }, [tenant, user]);
+  const loadSystemNotifications = async () => {
+    if (!tenant) return;
+    const rows = await fetchSupportNotifications(tenant.id);
+    setSystemNotifs(rows);
+    setSystemUnreadCount(countUnreadNotifications(rows, tenant.id));
+  };
+
+  const loadAllNotifications = async () => {
+    await Promise.all([loadTickets(), loadSystemNotifications()]);
+  };
+
+  const handleDismissNotification = async (notif: SupportNotificationRow) => {
+    if (!tenant || clearingNotifId) return;
+    setClearingNotifId(notif.id);
+    const result = await dismissSupportNotification(notif, tenant.id);
+    setClearingNotifId(null);
+    if (!result.ok) {
+      alert('Bildirim kaldırılamadı: ' + (result.error || 'hata'));
+      return;
+    }
+    if (notif.type === 'wipe_local') {
+      skipWipeLocalNotification(notif.id);
+    }
+    setSystemNotifs((prev) => {
+      const next = prev.filter((row) => row.id !== notif.id);
+      setSystemUnreadCount(countUnreadNotifications(next, tenant.id));
+      return next;
+    });
+  };
+
+  const handleClearAllNotifications = async () => {
+    if (!tenant || clearingAllNotifs || systemNotifs.length === 0) return;
+    if (!window.confirm('Tüm sistem bildirimleri listenizden kaldırılsın mı?')) return;
+    setClearingAllNotifs(true);
+    const result = await clearAllSupportNotifications(systemNotifs, tenant.id);
+    setClearingAllNotifs(false);
+    if (!result.ok) {
+      alert('Bildirimler temizlenemedi: ' + (result.error || 'hata'));
+      return;
+    }
+    setSystemNotifs([]);
+    setSystemUnreadCount(0);
+  };
 
   useEffect(() => {
     if (!tenant || !user) return;
+    void loadAllNotifications();
+  }, [tenant?.id, user?.id]);
 
-    const unreadKey = `notif_unread_${tenant.id}`;
-    const dismissedKey = `notif_dismissed_${tenant.id}`;
-    const sessionStartKey = `notif_session_start_${tenant.id}_${user.id}`;
-    const sessionStart = localStorage.getItem(sessionStartKey) || new Date().toISOString();
-    localStorage.setItem(sessionStartKey, sessionStart);
-    const stored = JSON.parse(localStorage.getItem(unreadKey) || '[]') as string[];
-    const dismissed = new Set(JSON.parse(localStorage.getItem(dismissedKey) || '[]') as string[]);
-    setSystemUnreadCount(stored.filter(id => !dismissed.has(id)).length);
-
-    supabase
-      .from('support_notifications')
-      .select('id, tenant_id, created_at, type')
-      .or(`tenant_id.eq.${tenant.id},tenant_id.is.null`)
-      .gte('created_at', sessionStart)
-      .order('created_at', { ascending: false })
-      .limit(100)
-      .then(({ data }) => {
-        const incoming = (data || [])
-          .filter((d: any) => d.type !== 'revoke')
-          .map((d: any) => d.id)
-          .filter((id: string) => !dismissed.has(id));
-        const current = new Set(stored.filter(id => !dismissed.has(id)));
-        incoming.forEach((id: string) => current.add(id));
-        localStorage.setItem(unreadKey, JSON.stringify(Array.from(current).slice(-300)));
-        setSystemUnreadCount(current.size);
-      });
+  useEffect(() => {
+    if (!tenant || !user) return;
 
     const channel = supabase
       .channel(`header-system-notifs-${tenant.id}`)
@@ -169,15 +228,47 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
         schema: 'public',
         table: 'support_notifications',
       }, (payload) => {
-        const n = payload.new as any;
+        const n = payload.new as SupportNotificationRow;
         if (n.tenant_id && n.tenant_id !== tenant.id) return;
         if (n.type === 'revoke') return;
-        if (n.created_at && n.created_at < sessionStart) return;
-        if (dismissed.has(n.id)) return;
-        const current = new Set(JSON.parse(localStorage.getItem(unreadKey) || '[]') as string[]);
-        current.add(n.id);
-        localStorage.setItem(unreadKey, JSON.stringify(Array.from(current).slice(-300)));
-        setSystemUnreadCount(current.size);
+        if (n.type === 'wipe_local') {
+          if (shouldAutoProcessWipeLocal(n, 'realtime')) {
+            void processWipeLocalNotification(n);
+          } else {
+            setSystemNotifs((prev) => {
+              if (prev.some((row) => row.id === n.id)) return prev;
+              const next = [n, ...prev].slice(0, 50);
+              setSystemUnreadCount(countUnreadNotifications(next, tenant.id));
+              return next;
+            });
+          }
+          return;
+        }
+        setSystemNotifs((prev) => {
+          if (prev.some((row) => row.id === n.id)) return prev;
+          const next = [n, ...prev].slice(0, 50);
+          setSystemUnreadCount(countUnreadNotifications(next, tenant.id));
+          return next;
+        });
+        dispatchSupportNotifBanner({
+          id: n.id,
+          title: n.title || 'Bildirim',
+          message: n.message || '',
+          type: n.type || 'info',
+        });
+      })
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'support_notifications',
+      }, (payload) => {
+        const n = payload.new as SupportNotificationRow;
+        if (n.tenant_id && n.tenant_id !== tenant.id && n.tenant_id !== null) return;
+        setSystemNotifs((prev) => {
+          const next = prev.map((row) => (row.id === n.id ? { ...row, ...n } : row));
+          setSystemUnreadCount(countUnreadNotifications(next, tenant.id));
+          return next;
+        });
       })
       .subscribe();
 
@@ -222,67 +313,196 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
     setSupportMessage('');
     setSupportPriority('medium');
     await loadTickets();
-    setTimeout(() => setSupportSent(false), 3000);
+    if (supportSentTimerRef.current) clearTimeout(supportSentTimerRef.current);
+    supportSentTimerRef.current = setTimeout(() => setSupportSent(false), 3000);
   };
 
   const totalUnread = unreadCount + systemUnreadCount;
+  const homePageKey = isElectron ? 'desktop-home' : 'tables';
+  const onTablesHub = isElectron && currentPage === 'tables';
+  const showBackNav =
+    !!currentPage &&
+    !!onBackToTables &&
+    (isElectron
+      ? currentPage !== 'desktop-home' && currentPage !== 'tables'
+      : currentPage !== 'tables');
+  const pageLabel = currentPage ? PAGE_LABELS[currentPage] : null;
+
   const userLabel = profile?.role === 'waiter'
     ? `Garson: ${profile?.full_name || user?.email?.split('@')[0] || 'Kullanıcı'}`
     : (profile?.full_name || user?.email?.split('@')[0] || 'Kullanıcı');
 
   return (
     <>
-      <header className="fixed top-0 left-0 right-0 bg-white shadow-sm border-b border-slate-200 z-30">
-        <div className="px-3 md:px-6">
-          <div className="flex justify-between items-center h-14 md:h-20">
-            <div className="flex items-center gap-2 md:gap-3 ml-12 md:ml-16 min-w-0">
-              <img
-                src={logoSrc}
-                alt="ŞefPOS"
-                className="h-9 md:h-12 w-auto object-contain flex-shrink-0 select-none"
-                draggable={false}
-              />
+      <header
+        className={
+          isElectron
+            ? `fixed top-0 left-0 right-0 z-30 ${ELECTRON_HEADER_BAR_CLASS}`
+            : 'fixed top-0 left-0 right-0 bg-white shadow-sm border-b border-slate-200 z-30'
+        }
+      >
+        <div className={isElectron ? `${ELECTRON_HEADER_PADDING} overflow-hidden` : 'px-3 md:px-6'}>
+          <div className={isElectron ? ELECTRON_HEADER_ROW_CLASS : 'flex justify-between items-center h-14 md:h-20 w-full'}>
+            <div
+              className={`flex items-center gap-2 min-w-0 flex-1 ${isElectron ? '' : 'ml-12 md:ml-16'}`}
+            >
+              {isElectron ? (
+                <>
+                  <div className={ELECTRON_HEADER_BRAND_BLOCK}>
+                    {onBackToTables && !onTablesHub ? (
+                      <button
+                        type="button"
+                        onClick={onBackToTables}
+                        title="Ana sayfa"
+                        aria-label="Ana sayfa"
+                        className="shrink-0 rounded-full hover:opacity-90 active:scale-95 transition focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-400"
+                      >
+                        <img
+                          src={logoSrc}
+                          alt="ŞefPOS"
+                          className={`${ELECTRON_HEADER_LOGO_CLASS} pointer-events-none`}
+                          draggable={false}
+                          onError={(e) => {
+                            (e.currentTarget as HTMLImageElement).src = publicAsset('logo.png');
+                          }}
+                        />
+                      </button>
+                    ) : (
+                      <img
+                        src={logoSrc}
+                        alt="ŞefPOS"
+                        className={ELECTRON_HEADER_LOGO_CLASS}
+                        draggable={false}
+                        onError={(e) => {
+                          (e.currentTarget as HTMLImageElement).src = publicAsset('logo.png');
+                        }}
+                      />
+                    )}
+                    <div className={ELECTRON_HEADER_SLOGAN_BLOCK}>
+                      <span className={ELECTRON_HEADER_BRAND_NAME}>ŞefPOS</span>
+                      <span className={ELECTRON_HEADER_SLOGAN_LINE}>Her Masada Var</span>
+                    </div>
+                  </div>
+                  {onTablesHub && onBackToTables && (
+                    <button
+                      type="button"
+                      onClick={onBackToTables}
+                      title="Ana sayfa"
+                      aria-label="Ana sayfa"
+                      className={ELECTRON_HEADER_HOME_BTN_CLASS}
+                    >
+                      <Home className="w-[18px] h-[18px] shrink-0" strokeWidth={2.25} />
+                      <span className="hidden sm:inline text-xs font-semibold whitespace-nowrap">Ana sayfa</span>
+                    </button>
+                  )}
+                  {showBackNav && pageLabel && (
+                    <button
+                      type="button"
+                      onClick={onBackToTables}
+                      title="Ana sayfaya dön"
+                      className={`hidden lg:inline-flex ${ELECTRON_HEADER_CHIP_CLASS} pl-2 pr-2.5 ml-1 flex-shrink-0`}
+                    >
+                      <ArrowLeft className="w-4 h-4 text-slate-500" strokeWidth={2.25} />
+                      <span className="text-xs font-semibold text-slate-600">Geri</span>
+                    </button>
+                  )}
+                </>
+              ) : (
+                <>
+                  {onBackToTables ? (
+                    <button
+                      type="button"
+                      onClick={onBackToTables}
+                      className="md:hidden flex-shrink-0 rounded-lg active:opacity-80 focus:outline-none focus-visible:ring-2 focus-visible:ring-orange-500"
+                      aria-label="Ana sayfa — Masalar"
+                    >
+                      <img
+                        src={logoSrc}
+                        alt="ŞefPOS"
+                        className="h-9 w-auto object-contain select-none pointer-events-none"
+                        draggable={false}
+                      />
+                    </button>
+                  ) : null}
+                  <img
+                    src={logoSrc}
+                    alt="ŞefPOS"
+                    className={`h-9 md:h-12 w-auto object-contain flex-shrink-0 select-none ${onBackToTables ? 'hidden md:block' : ''}`}
+                    draggable={false}
+                  />
+                </>
+              )}
 
-              {/* "Masalara Dön" hizli yonlendirici — sadece tables disindaki sayfalarda
-                  ve **sadece tablet/desktop**ta gosteriliyor. Mobilde sube secici
-                  ile yan yana sigmadigi icin gizlendi; mobil kullanicisi MainMenu
-                  hamburger menusunden "Masalar"a tek tikla doner. */}
-              {currentPage && currentPage !== 'tables' && onBackToTables && (
+              {!isElectron && onTablesHub && onBackToTables && (
+                <button
+                  type="button"
+                  onClick={onBackToTables}
+                  title="Ana sayfa"
+                  className={`hidden md:inline-flex ${ELECTRON_HEADER_CHIP_CLASS} w-10 px-0`}
+                >
+                  <Home className="w-[18px] h-[18px] opacity-95" strokeWidth={2.25} />
+                </button>
+              )}
+
+              {showBackNav && onBackToTables && !isElectron && (
                 <>
                   <button
                     type="button"
                     onClick={onBackToTables}
-                    title="Masalara dön"
-                    className="group hidden md:inline-flex items-center gap-2 pl-2 pr-3.5 py-1.5 rounded-full bg-gradient-to-r from-emerald-500 to-green-600 hover:from-emerald-600 hover:to-green-700 text-white shadow-sm hover:shadow transition active:scale-95 flex-shrink-0"
+                    title={isElectron ? 'Ana sayfaya dön' : 'Masalara dön'}
+                    className={
+                      isElectron
+                        ? `group hidden md:inline-flex ${ELECTRON_HEADER_CHIP_CLASS} pl-2.5 pr-3 flex-shrink-0`
+                        : 'group hidden md:inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-200 transition active:scale-95 flex-shrink-0'
+                    }
                   >
-                    <span className="w-7 h-7 rounded-full bg-white/20 flex items-center justify-center group-hover:-translate-x-0.5 transition-transform">
-                      <ArrowLeft className="w-4 h-4" strokeWidth={2.5} />
-                    </span>
-                    <span className="text-sm font-extrabold tracking-tight whitespace-nowrap">
-                      Masalara Dön
+                    <ArrowLeft
+                      className={`w-4 h-4 flex-shrink-0 text-slate-600 group-hover:-translate-x-0.5 transition-transform`}
+                      strokeWidth={2.25}
+                    />
+                    <span className="text-sm font-bold tracking-tight whitespace-nowrap">
+                      {isElectron ? 'Ana Sayfa' : 'Masalar'}
                     </span>
                   </button>
 
-                  {/* Breadcrumb: hangi sayfadayim — masaüstü icin */}
-                  {PAGE_LABELS[currentPage] && (
-                    <div className="hidden lg:flex items-center gap-1.5 text-xs text-slate-400 font-semibold pl-1">
-                      <ChevronDown className="w-3 h-3 -rotate-90" />
-                      <LayoutGrid className="w-3.5 h-3.5 text-slate-400" />
-                      <span className="text-slate-600">{PAGE_LABELS[currentPage]}</span>
+                  {pageLabel && (
+                    <div
+                      className={`hidden lg:flex items-center gap-1 text-sm font-semibold min-w-0 text-slate-500`}
+                    >
+                      <ChevronRight className="w-3.5 h-3.5 opacity-60 flex-shrink-0" />
+                      <span className="text-slate-800 truncate">
+                        {pageLabel}
+                      </span>
                     </div>
                   )}
                 </>
               )}
+
+              {!showBackNav && !onTablesHub && pageLabel && currentPage !== homePageKey && (
+                <div
+                  className="hidden md:flex items-center gap-2 pl-1 min-w-0 text-slate-800"
+                >
+                  <LayoutGrid className="w-4 h-4 flex-shrink-0 text-orange-500" />
+                  <span className="text-sm font-bold truncate">{pageLabel}</span>
+                </div>
+              )}
+
             </div>
 
-            <div className="flex items-center space-x-1.5 md:space-x-2">
+            <div
+              className={`flex items-center gap-1 md:gap-1.5 shrink-0 ${
+                isElectron ? 'md:gap-1.5' : 'space-x-1.5 md:space-x-2'
+              }`}
+            >
               {impersonationTenantId && (
                 <div
-                  className="flex items-center gap-1.5 max-w-[min(100%,14rem)] sm:max-w-xs rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-[10px] sm:text-xs font-bold text-amber-950"
-                  title="Lisans panelinden açılan müşteri kiracısı görünümü"
+                  className="flex items-center gap-1.5 max-w-[min(100%,16rem)] sm:max-w-sm rounded-lg border border-amber-200 bg-amber-50 px-2 py-1 text-[10px] sm:text-xs font-bold text-amber-950"
+                  title={`${profile?.full_name || profile?.email || 'Kullanıcı'} olarak görüyorsunuz — müşterinin ekranı`}
                 >
                   <UserCheck className="w-3.5 h-3.5 flex-shrink-0 text-amber-700" aria-hidden />
-                  <span className="truncate hidden sm:inline">{tenant?.name || 'Müşteri'}</span>
+                  <span className="truncate hidden sm:inline">
+                    {profile?.full_name || profile?.email || tenant?.name || 'Müşteri'}
+                  </span>
                   <button
                     type="button"
                     onClick={() => void clearTenantImpersonation()}
@@ -292,7 +512,7 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
                   </button>
                 </div>
               )}
-              {showTrialBadge && (
+              {showTrialBadge && !isElectron && (
                 <button
                   type="button"
                   onClick={() => setShowTrialInfo(true)}
@@ -301,7 +521,7 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
                       ? 'Deneme süreniz sona erdi — detay için tıklayın'
                       : `${formatTrialRemaining(trialInfo)} kaldı — detay için tıklayın`
                   }
-                  className="hidden sm:inline-flex items-center gap-2 pl-1 pr-3 py-1 rounded-full bg-transparent hover:bg-slate-100/70 transition active:scale-95"
+                  className={`hidden sm:inline-flex items-center gap-2 pl-1 pr-3 py-1 rounded-full transition active:scale-95 bg-transparent hover:bg-slate-100/70`}
                 >
                   <span
                     className={`w-7 h-7 rounded-full flex items-center justify-center shadow-inner ${
@@ -335,6 +555,79 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
                 </button>
               )}
 
+              {showLicenseBadge && !isElectron && (
+                <button
+                  type="button"
+                  onClick={() => setShowLicenseInfo(true)}
+                  title={
+                    licenseInfo.expired
+                      ? 'Lisans süresi doldu — detay için tıklayın'
+                      : `${licenseInfo.planLabel} · ${licenseInfo.remainingText} — detay için tıklayın`
+                  }
+                  className={`hidden sm:inline-flex items-center gap-2 pl-1 pr-3 py-1 rounded-full transition active:scale-95 bg-transparent hover:bg-slate-100/70`}
+                >
+                  <span
+                    className={
+                      isElectron
+                        ? ''
+                        : `w-7 h-7 rounded-full flex items-center justify-center shadow-inner ${
+                            licenseInfo.expired
+                              ? 'bg-gradient-to-br from-red-500 to-rose-600'
+                              : licenseUrgent
+                                ? 'bg-gradient-to-br from-amber-400 to-orange-500'
+                                : 'bg-gradient-to-br from-emerald-400 to-teal-600'
+                          }`
+                    }
+                  >
+                    <Key
+                      className={`${isElectron ? 'w-3.5 h-3.5' : 'w-3.5 h-3.5 text-white'} ${
+                        isElectron
+                          ? licenseInfo.expired
+                            ? 'text-red-600'
+                            : licenseUrgent
+                              ? 'text-orange-600'
+                              : 'text-emerald-600'
+                          : ''
+                      }`}
+                    />
+                  </span>
+                  {isElectron ? (
+                    <span
+                      className={`text-xs font-bold tabular-nums whitespace-nowrap ${
+                        licenseInfo.expired
+                          ? 'text-red-700'
+                          : licenseUrgent
+                            ? 'text-orange-700'
+                            : 'text-slate-700'
+                      }`}
+                    >
+                      {licenseInfo.expired ? 'Süre bitti' : licenseInfo.remainingText}
+                    </span>
+                  ) : (
+                    <span className="flex items-baseline gap-1.5 leading-none">
+                      <span
+                        className={`text-[9px] md:text-[10px] uppercase tracking-[0.12em] font-bold ${
+                          licenseInfo.expired ? 'text-red-600' : 'text-slate-500'
+                        }`}
+                      >
+                        Lisans
+                      </span>
+                      <span
+                        className={`text-sm md:text-base font-extrabold whitespace-nowrap ${
+                          licenseInfo.expired
+                            ? 'text-red-700'
+                            : licenseUrgent
+                              ? 'text-orange-700'
+                              : 'text-slate-800'
+                        }`}
+                      >
+                        {licenseInfo.expired ? 'Süre bitti' : licenseInfo.remainingText}
+                      </span>
+                    </span>
+                  )}
+                </button>
+              )}
+
               {tenant && shiftsEnabled && canUseShifts && (
                 <ShiftBadge
                   activeShift={activeShift}
@@ -347,14 +640,16 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
                 <div className="relative ml-1 md:ml-0">
                   <button
                     onClick={() => setShowBranchMenu(!showBranchMenu)}
-                    className="flex items-center gap-1 md:gap-1.5 px-1.5 py-1 md:px-3 md:py-2 bg-orange-50 hover:bg-orange-100 border border-orange-200 rounded-md md:rounded-lg transition-all active:scale-95 max-w-[88px] md:max-w-none"
+                    className={`flex items-center gap-1.5 px-2.5 rounded-lg transition-all active:scale-95 max-w-[7.5rem] md:max-w-[9rem] ${ELECTRON_HEADER_ACCENT_CHIP_CLASS}`}
                   >
-                    <MapPin className="w-3 h-3 md:w-4 md:h-4 text-orange-600 flex-shrink-0" />
-                    <span className="text-[10px] md:text-sm font-semibold text-orange-700 truncate leading-tight">
+                    <MapPin className="w-3 h-3 md:w-4 md:h-4 flex-shrink-0 text-orange-600" />
+                    <span className="text-[10px] md:text-sm font-semibold truncate leading-tight text-orange-700">
                       {activeBranch?.name || 'Şube Seç'}
                     </span>
                     {branches.length > 1 && (
-                      <ChevronDown className={`w-2.5 h-2.5 md:w-3.5 md:h-3.5 text-orange-500 flex-shrink-0 transition-transform ${showBranchMenu ? 'rotate-180' : ''}`} />
+                      <ChevronDown
+                        className={`w-2.5 h-2.5 md:w-3.5 md:h-3.5 flex-shrink-0 transition-transform text-orange-500 ${showBranchMenu ? 'rotate-180' : ''}`}
+                      />
                     )}
                   </button>
 
@@ -409,18 +704,27 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
                 </div>
               )}
 
-              <div className="flex items-center gap-1.5 sm:gap-2 px-1.5 py-1.5 sm:px-2.5 md:px-3 bg-slate-50 rounded-lg max-w-[44px] sm:max-w-[160px] md:max-w-[240px] min-w-0 flex-shrink overflow-hidden" title={userLabel}>
-                <User className="w-4 h-4 text-slate-500 flex-shrink-0" />
-                <div className="min-w-0 hidden sm:block">
-                  <p className="text-xs md:text-sm font-medium text-slate-700 truncate">{userLabel}</p>
-                  <p className="text-[10px] md:text-xs text-slate-500 truncate">{roleLabels[profile?.role || ''] || profile?.role}</p>
+              <div
+                className={`flex items-center gap-1.5 px-2 rounded-lg min-w-0 flex-shrink overflow-hidden ${ELECTRON_HEADER_CHIP_CLASS} ${
+                  isElectron ? 'w-10 md:w-auto max-w-none' : 'max-w-[44px] sm:max-w-[160px] md:max-w-[11rem]'
+                }`}
+                title={`${userLabel} — ${roleLabels[profile?.role || ''] || profile?.role}`}
+              >
+                <User className="w-[18px] h-[18px] flex-shrink-0 text-slate-500" />
+                <div className="min-w-0 hidden md:block leading-tight">
+                  <p className="text-xs font-bold truncate text-slate-700">
+                    {profile?.full_name?.split(' ')[0] || userLabel.split(':').pop()?.trim() || 'Kullanıcı'}
+                  </p>
+                  <p className="text-[10px] truncate text-slate-500">
+                    {roleLabels[profile?.role || ''] || profile?.role}
+                  </p>
                 </div>
               </div>
 
-              {(profile?.role === 'owner' || profile?.role === 'admin') && onOpenOnboarding && (
+              {(profile?.role === 'owner' || profile?.role === 'admin') && onOpenOnboarding && !onTablesHub && (
                 <button
                   onClick={onOpenOnboarding}
-                  className="hidden md:flex items-center gap-1.5 px-2.5 py-1.5 text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg transition-all active:scale-95 text-xs font-semibold"
+                  className={`hidden md:inline-flex ${ELECTRON_HEADER_ACCENT_CHIP_CLASS} px-3 text-xs font-semibold`}
                   title="Hızlı Kurulum"
                 >
                   <Zap className="w-3.5 h-3.5" />
@@ -428,26 +732,46 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
                 </button>
               )}
 
-              <WaiterCallBell />
+              <button
+                type="button"
+                onClick={() => requestOpenGuide('manual')}
+                className={`hidden sm:inline-flex ${isElectron ? ELECTRON_HEADER_CHIP_CLASS : 'items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white text-slate-600 hover:bg-slate-50'} text-xs font-semibold`}
+                title="Kullanım kılavuzu ve rehber"
+              >
+                <BookOpen className="w-3.5 h-3.5" />
+                <span>Kılavuz</span>
+              </button>
+
+              <div className={isElectron ? ELECTRON_HEADER_TOOLBAR_GROUP : 'hidden sm:contents'}>
+              <WaiterCallBell headerVariant={isElectron ? 'electron-bar' : 'default'} />
 
               <button
                 onClick={() => {
                   const next = !showNotifications;
                   setShowNotifications(next);
                   setShowSupport(false);
-                  loadTickets();
-                  if (next && tenant?.id) {
-                    const unreadKey = `notif_unread_${tenant.id}`;
-                    localStorage.removeItem(unreadKey);
-                    setSystemUnreadCount(0);
+                  if (next && tenant) {
+                    void (async () => {
+                      const rows = await fetchSupportNotifications(tenant.id);
+                      setSystemNotifs(rows);
+                      await loadTickets();
+                      await markSupportNotificationsRead(rows, tenant.id);
+                      const refreshed = await fetchSupportNotifications(tenant.id);
+                      setSystemNotifs(refreshed);
+                      setSystemUnreadCount(countUnreadNotifications(refreshed, tenant.id));
+                    })();
                   }
                 }}
-                className="relative p-1.5 md:p-2 text-slate-600 hover:text-slate-900 rounded-lg hover:bg-slate-100 transition-all active:scale-95"
+                className={`relative rounded-lg transition-all active:scale-95 ${
+                  isElectron ? 'p-2 hover:bg-white text-slate-600' : ELECTRON_HEADER_ICON_BTN_CLASS
+                }`}
                 title="Bildirimler"
               >
-                <Bell className="w-4 h-4 md:w-5 md:h-5" />
+                <Bell className="w-[18px] h-[18px]" strokeWidth={2} />
                 {totalUnread > 0 && (
-                  <span className="absolute -top-0.5 -right-0.5 w-4 h-4 bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
+                  <span
+                    className="absolute -top-0.5 -right-0.5 w-4 h-4 text-[10px] font-bold rounded-full flex items-center justify-center bg-red-500 text-white"
+                  >
                     {totalUnread > 9 ? '9+' : totalUnread}
                   </span>
                 )}
@@ -455,33 +779,45 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
 
               <button
                 onClick={() => { setShowSupport(!showSupport); setShowNotifications(false); }}
-                className="hidden sm:inline-flex p-1.5 md:p-2 text-slate-600 hover:text-slate-900 rounded-lg hover:bg-slate-100 transition-all active:scale-95"
+                className={`hidden sm:inline-flex rounded-lg transition-all active:scale-95 ${
+                  isElectron ? 'p-2 hover:bg-white text-slate-600' : ELECTRON_HEADER_ICON_BTN_CLASS
+                }`}
                 title="Destek"
               >
-                <HeadphonesIcon className="w-4 h-4 md:w-5 md:h-5" />
+                <HeadphonesIcon className="w-[18px] h-[18px]" strokeWidth={2} />
               </button>
 
               <button
                 onClick={onOpenSettings}
-                className="hidden sm:inline-flex p-1.5 md:p-2 text-slate-600 hover:text-slate-900 rounded-lg hover:bg-slate-100 transition-all active:scale-95"
+                className={`hidden sm:inline-flex rounded-lg transition-all active:scale-95 ${
+                  isElectron ? 'p-2 hover:bg-white text-slate-600' : ELECTRON_HEADER_ICON_BTN_CLASS
+                }`}
                 title="Ayarlar"
               >
-                <Settings className="w-4 h-4 md:w-5 md:h-5" />
+                <Settings className="w-[18px] h-[18px]" strokeWidth={2} />
               </button>
 
+              <span className={isElectron ? 'hidden md:block w-px h-6 bg-slate-200 mx-0.5' : 'hidden'} aria-hidden />
+
               {/* Arayuz olcegi (her ortamda calisir, kalicidir). */}
-              <div className="hidden md:flex items-center gap-1 bg-slate-100 rounded-lg px-1 py-1">
+              <div
+                className={
+                  isElectron
+                    ? 'hidden md:flex items-center gap-0.5 px-0.5'
+                    : `hidden md:flex items-center gap-0.5 rounded-lg px-1 ${ELECTRON_HEADER_CHIP_CLASS} w-auto px-1.5`
+                }
+              >
                 <button
                   onClick={() => changeZoom(-UI_SCALE_STEP)}
                   disabled={zoom <= UI_SCALE_MIN + 0.001}
-                  className="p-1.5 rounded hover:bg-slate-200 transition-all active:scale-95 text-slate-600 disabled:opacity-40"
+                  className="p-1.5 rounded transition-all active:scale-95 disabled:opacity-40 hover:bg-slate-200 text-slate-600"
                   title="Arayüzü küçült"
                 >
                   <ZoomOut className="w-4 h-4" />
                 </button>
                 <button
                   onClick={() => resetUiScale()}
-                  className="text-xs font-bold text-slate-600 w-12 text-center hover:bg-slate-200 rounded py-1 active:scale-95"
+                  className="text-xs font-bold w-12 text-center rounded py-1 active:scale-95 text-slate-600 hover:bg-slate-200"
                   title="%100'e döndür"
                 >
                   {Math.round(zoom * 100)}%
@@ -489,7 +825,7 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
                 <button
                   onClick={() => changeZoom(UI_SCALE_STEP)}
                   disabled={zoom >= UI_SCALE_MAX - 0.001}
-                  className="p-1.5 rounded hover:bg-slate-200 transition-all active:scale-95 text-slate-600 disabled:opacity-40"
+                  className="p-1.5 rounded transition-all active:scale-95 disabled:opacity-40 hover:bg-slate-200 text-slate-600"
                   title="Arayüzü büyüt"
                 >
                   <ZoomIn className="w-4 h-4" />
@@ -499,11 +835,14 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
               {/* Tam Ekran POS — ust meunyu gizler, kalicidir. Sadece masaustu. */}
               <button
                 onClick={() => setHeaderHidden(true)}
-                className="hidden md:inline-flex p-1.5 md:p-2 text-slate-600 hover:text-slate-900 rounded-lg hover:bg-slate-100 transition-all active:scale-95"
+                className={`hidden md:inline-flex rounded-lg transition-all active:scale-95 ${
+                  isElectron ? 'p-2 hover:bg-white text-slate-600' : ELECTRON_HEADER_ICON_BTN_CLASS
+                }`}
                 title="Tam Ekran POS modu (üst menüyü gizle)"
               >
-                <Minimize2 className="w-4 h-4 md:w-5 md:h-5" />
+                <Minimize2 className="w-[18px] h-[18px]" strokeWidth={2} />
               </button>
+              </div>
 
               <button
                 onClick={() => {
@@ -518,11 +857,13 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
                   }
                   signOut();
                 }}
-                className="flex items-center gap-1 md:gap-2 text-white bg-gradient-to-r from-red-600 to-red-700 px-2 py-1.5 md:px-4 md:py-2 rounded-lg hover:shadow-lg transition-all active:scale-95 flex-shrink-0"
+                className={`flex items-center gap-1.5 px-3 rounded-lg transition-all active:scale-95 flex-shrink-0 ${
+                  isElectron ? ELECTRON_HEADER_LOGOUT_CLASS : `${ELECTRON_HEADER_TOOL_H} text-white bg-gradient-to-r from-red-600 to-red-700 hover:shadow-lg`
+                }`}
                 title="Çıkış"
               >
-                <LogOut className="w-3.5 h-3.5 md:w-4 md:h-4" />
-                <span className="hidden sm:inline text-xs md:text-sm font-medium">Çıkış</span>
+                <LogOut className="w-[18px] h-[18px]" strokeWidth={2} />
+                <span className="hidden sm:inline text-xs font-bold">Çıkış</span>
               </button>
             </div>
           </div>
@@ -667,6 +1008,91 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
         </>
       )}
 
+      {showLicenseInfo && tenant && (
+        <>
+          <div
+            className="fixed inset-0 z-[60] bg-slate-900/40 backdrop-blur-sm"
+            onClick={() => setShowLicenseInfo(false)}
+          />
+          <div className="fixed inset-0 z-[61] flex items-center justify-center p-4 pointer-events-none">
+            <div className="pointer-events-auto w-full max-w-md bg-white rounded-3xl shadow-2xl overflow-hidden">
+              <div className="bg-gradient-to-br from-emerald-500 via-teal-600 to-slate-800 px-6 py-7 text-white text-center relative">
+                <button
+                  onClick={() => setShowLicenseInfo(false)}
+                  className="absolute top-3 right-3 p-1.5 rounded-lg hover:bg-white/20 transition"
+                  title="Kapat"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+                <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-white/20 backdrop-blur mb-3 ring-4 ring-white/20">
+                  <Key className="w-7 h-7" />
+                </div>
+                <h3 className="text-xl font-black tracking-tight">Lisans Bilgisi</h3>
+                <p className="text-white/90 text-sm mt-1">Ayka panelindeki kayıtla aynı</p>
+              </div>
+
+              <div className="p-6">
+                <div className="bg-slate-50 rounded-2xl p-4 mb-4 space-y-2 text-sm">
+                  <div className="flex justify-between gap-3">
+                    <span className="text-slate-500">Firma</span>
+                    <span className="font-bold text-slate-800 text-right truncate">{tenant.name}</span>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <span className="text-slate-500">Paket</span>
+                    <span className="font-semibold text-slate-800">{licenseInfo.planLabel}</span>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <span className="text-slate-500">Durum</span>
+                    <span
+                      className={`font-bold ${
+                        licenseInfo.expired ? 'text-red-600' : licenseInfo.expiringSoon ? 'text-orange-600' : 'text-emerald-700'
+                      }`}
+                    >
+                      {licenseInfo.statusLabel}
+                    </span>
+                  </div>
+                  {licenseInfo.expiresAt && (
+                    <div className="flex justify-between gap-3 pt-1 border-t border-slate-200">
+                      <span className="text-slate-500">Bitiş tarihi</span>
+                      <span className="font-semibold text-slate-800">
+                        {licenseInfo.expiresAt.toLocaleDateString('tr-TR', {
+                          day: '2-digit',
+                          month: 'long',
+                          year: 'numeric',
+                        })}
+                      </span>
+                    </div>
+                  )}
+                  {!licenseInfo.expired && licenseInfo.remainingText && (
+                    <div className="flex justify-between gap-3">
+                      <span className="text-slate-500">Kalan</span>
+                      <span className="font-extrabold text-slate-800">{licenseInfo.remainingText}</span>
+                    </div>
+                  )}
+                  {isElectron && (
+                    <div className="flex justify-between gap-3 items-center pt-1 border-t border-slate-200">
+                      <span className="text-slate-500">Bağlantı modu</span>
+                      <ConnectionModeBadge mode={readElectronDbMode()} compact />
+                    </div>
+                  )}
+                </div>
+
+                <p className="text-xs text-slate-500 text-center mb-4">
+                  Lisans uzatma ve paket değişikliği Ayka yönetim panelinden yapılır; masaüstünde otomatik güncellenir.
+                </p>
+
+                <button
+                  onClick={() => setShowLicenseInfo(false)}
+                  className="w-full py-2.5 text-slate-500 hover:text-slate-700 font-semibold text-sm transition"
+                >
+                  Kapat
+                </button>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
       {showNotifications && (
         <>
           <div className="fixed inset-0 z-40" onClick={() => setShowNotifications(false)} />
@@ -676,16 +1102,91 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
                 <Bell className="w-4 h-4 text-slate-600" />
                 <span className="font-bold text-slate-700">Bildirimler</span>
               </div>
-              <button onClick={() => setShowNotifications(false)} className="p-1 rounded hover:bg-slate-200 transition">
-                <X className="w-4 h-4 text-slate-500" />
-              </button>
+              <div className="flex items-center gap-1 shrink-0">
+                {systemNotifs.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => void handleClearAllNotifications()}
+                    disabled={clearingAllNotifs}
+                    className="px-2 py-1 text-[10px] font-bold text-red-600 hover:bg-red-50 rounded-md transition disabled:opacity-50"
+                    title="Tüm sistem bildirimlerini temizle"
+                  >
+                    {clearingAllNotifs ? '…' : 'Tümünü temizle'}
+                  </button>
+                )}
+                <button onClick={() => setShowNotifications(false)} className="p-1 rounded hover:bg-slate-200 transition">
+                  <X className="w-4 h-4 text-slate-500" />
+                </button>
+              </div>
             </div>
             <div className="max-h-80 overflow-y-auto">
-              {tickets.length === 0 ? (
+              {systemNotifs.length === 0 && tickets.length === 0 ? (
                 <div className="p-6 text-center text-slate-500 text-sm">Henüz bildirim yok</div>
               ) : (
-                tickets.map(ticket => (
+                <>
+                  {systemNotifs.map((notif) => {
+                    const unread = tenant ? isNotificationUnread(notif, tenant.id) : false;
+                    const typeClass =
+                      notif.type === 'error'
+                        ? 'bg-red-100 text-red-700'
+                        : notif.type === 'warning'
+                          ? 'bg-amber-100 text-amber-800'
+                          : notif.type === 'success'
+                            ? 'bg-green-100 text-green-700'
+                            : 'bg-blue-100 text-blue-700';
+                    return (
+                      <div
+                        key={notif.id}
+                        className={`px-4 py-3 border-b border-slate-100 ${unread ? 'bg-orange-50/60' : ''}`}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <p className="text-sm font-semibold text-slate-800 flex-1 min-w-0">{notif.title}</p>
+                          <div className="flex items-center gap-1 shrink-0">
+                            {unread && (
+                              <span className="text-[9px] font-bold uppercase tracking-wide text-orange-600">
+                                Yeni
+                              </span>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => void handleDismissNotification(notif)}
+                              disabled={clearingNotifId === notif.id}
+                              className="p-1 rounded-md text-slate-400 hover:text-red-600 hover:bg-red-50 transition disabled:opacity-40"
+                              title="Bildirimi kaldır"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                        <p className="text-xs text-slate-600 mt-1 line-clamp-3">{notif.message}</p>
+                        {notif.type === 'wipe_local' && (
+                          <button
+                            type="button"
+                            onClick={() => void processWipeLocalNotification(notif, { force: true })}
+                            className="mt-2 w-full py-2 rounded-lg text-xs font-bold bg-amber-500 hover:bg-amber-600 text-white transition"
+                          >
+                            Şimdi yerel veriyi temizle
+                          </button>
+                        )}
+                        <div className="flex items-center gap-2 mt-1.5">
+                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${typeClass}`}>
+                            {notificationTypeLabel(notif.type)}
+                          </span>
+                          <span className="text-[10px] text-slate-400">
+                            {new Date(notif.created_at).toLocaleString('tr-TR', {
+                              day: '2-digit',
+                              month: 'short',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                            })}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {tickets.map((ticket) => (
                   <div key={ticket.id} className="px-4 py-3 border-b border-slate-100 last:border-0">
+                    <p className="text-[10px] font-bold uppercase tracking-wide text-slate-400 mb-0.5">Destek yanıtı</p>
                     <p className="text-sm font-semibold text-slate-800">{ticket.subject}</p>
                     {ticket.admin_reply && (
                       <p className="text-xs text-slate-600 mt-1 line-clamp-2">{ticket.admin_reply}</p>
@@ -703,7 +1204,8 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
                       </span>
                     </div>
                   </div>
-                ))
+                  ))}
+                </>
               )}
             </div>
           </div>
@@ -801,7 +1303,7 @@ export function Header({ onOpenSettings, onOpenOnboarding, currentPage, onBackTo
 }
 
 interface ShiftBadgeProps {
-  activeShift: ReturnType<typeof useActiveShift>['activeShift'];
+  activeShift: ActiveShift | null;
   dayLocked: boolean;
   onClick?: () => void;
 }
@@ -856,3 +1358,5 @@ function ShiftBadge({ activeShift, dayLocked, onClick }: ShiftBadgeProps) {
     </button>
   );
 }
+
+export const Header = memo(HeaderInner);

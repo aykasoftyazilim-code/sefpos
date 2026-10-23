@@ -1,9 +1,18 @@
-import { createContext, useContext, useEffect, useState } from 'react';
+import { createContext, useContext, useEffect, useRef, useState } from 'react';
 import { User, Session } from '@supabase/supabase-js';
-import { supabase } from '../lib/supabase';
+import { supabase, getRealSupabaseClient, consumeInvalidRefreshHandled } from '../lib/supabase';
 import { Database } from '../lib/supabase';
-import { isSqlServerMode, isLocalMode } from '../lib/sqlDb';
+import { isSqlServerMode, isLocalMode, isElectronCloudMode, sqlDb, isVdsSelfHost, sqlTruth, patchSqlSessionRecord } from '../lib/sqlDb';
+import { isHybridMode } from '../lib/hybridMode';
 import { prefetchCloudTableGrid } from '../lib/tableGridData';
+import { prefetchTakeawayActiveOrders } from '../lib/takeawayOrdersApi';
+import { prefetchOnlineOrders } from '../lib/onlineOrdersWarm';
+import {
+  verifyWaiterAccessByAuthUser,
+  persistWaiterLogoutReason,
+  clearWaiterLocalSession,
+} from '../lib/waiterAccessGuard';
+import { startAdaptivePoller } from '../lib/pollSchedule';
 import {
   setPrintAgentBranchId,
   setPrintAgentTenantId,
@@ -14,6 +23,34 @@ import {
   loadPrintSettings,
   savePrintSettings,
 } from '../lib/printService';
+import { syncTenantCurrencyCode } from '../lib/currency';
+import { AYKA_ADMIN_PATH, isAykaAdminPath } from '../lib/aykaRoute';
+import { startTenantPresenceTracking, stopTenantPresenceTracking } from '../lib/tenantPresence';
+import { computeClientBusinessDate, fetchCurrentBusinessDate } from '../lib/businessDayApi';
+import { hideBootSplash } from '../lib/bootSplash';
+import { posDebugLog } from '../lib/posDebugLog';
+import {
+  clearAuthSessionSnap,
+  persistAuthSessionSnap,
+  readAuthSessionSnap,
+  resolveBootAuthState,
+  isRefreshTokenNotFoundError,
+  purgeSupabaseAuthLocalStorage,
+  readStoredSupabaseRefreshToken,
+} from '../lib/authSessionSnap';
+
+/** Electron acilisinda agir liste on-yuklemesi kasar — ilgili sayfa acilinca yuklenir. */
+function warmPosCachesIfWeb(tenantId: string, branchId: string): void {
+  if (typeof window !== 'undefined' && (window as any).electronAPI) return;
+  if (isLocalMode() || isSqlServerMode()) return;
+  prefetchCloudTableGrid(tenantId, branchId);
+  prefetchTakeawayActiveOrders(tenantId, branchId);
+  prefetchOnlineOrders(tenantId);
+}
+
+let profileLoadInflight: Promise<void> | null = null;
+let lastProfileLoadFinishedAt = 0;
+const PROFILE_LOAD_MIN_GAP_MS = 45_000;
 
 type Profile = Database['public']['Tables']['profiles']['Row'];
 type Tenant = Database['public']['Tables']['tenants']['Row'];
@@ -131,7 +168,7 @@ interface AuthContextType {
     phone?: string,
   ) => Promise<{ error: any }>;
   signOut: () => Promise<void>;
-  refreshProfile: () => Promise<void>;
+  refreshProfile: (opts?: { force?: boolean }) => Promise<void>;
   refreshBranches: () => Promise<void>;
   setActiveBranch: (branch: Branch) => void;
   /** Süper-admin müşteri görünümü: hedef tenant (RLS ile uyumlu); yoksa null */
@@ -140,6 +177,136 @@ interface AuthContextType {
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+function parseStoredRolePermissions(raw: unknown): Record<string, unknown> | null {
+  if (!raw) return null;
+  if (typeof raw === 'string') {
+    try {
+      const p = JSON.parse(raw);
+      return p && typeof p === 'object' ? (p as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  }
+  if (typeof raw === 'object') return raw as Record<string, unknown>;
+  return null;
+}
+
+/** Süper-admin "Oturum Aç": hedef tenant + (varsa) sahibi profili. VDS/SQL ve bulut ortak. */
+async function resolveAdminImpersonation(userId: string, isSuperAdmin: boolean): Promise<{
+  targetTenantId: string | null;
+  asProfile: Profile | null;
+  asRole: Role | null;
+}> {
+  if (!isSuperAdmin) {
+    try {
+      localStorage.removeItem('shefpos_admin_tenant_impersonation');
+      localStorage.removeItem('shefpos_admin_impersonation_as');
+    } catch {
+      /* */
+    }
+    return { targetTenantId: null, asProfile: null, asRole: null };
+  }
+
+  let targetTenantId: string | null = null;
+  try {
+    const { data: impRow, error: impErr } = await supabase
+      .from('admin_tenant_impersonation' as any)
+      .select('target_tenant_id')
+      .eq('user_id', userId)
+      .maybeSingle();
+    if (!impErr && impRow && (impRow as { target_tenant_id?: string }).target_tenant_id) {
+      targetTenantId = String((impRow as { target_tenant_id: string }).target_tenant_id);
+    }
+  } catch {
+    /* tablo yok / ağ */
+  }
+  if (!targetTenantId) {
+    try {
+      const ls = localStorage.getItem('shefpos_admin_tenant_impersonation');
+      const uuidRe =
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+      if (ls && uuidRe.test(ls)) {
+        targetTenantId = ls;
+        const nowIso = new Date().toISOString();
+        void supabase.from('admin_tenant_impersonation' as any).upsert(
+          { user_id: userId, target_tenant_id: ls, updated_at: nowIso },
+          { onConflict: 'user_id' },
+        );
+      }
+    } catch {
+      /* storage */
+    }
+  }
+
+  if (!targetTenantId) {
+    try {
+      localStorage.removeItem('shefpos_admin_tenant_impersonation');
+      localStorage.removeItem('shefpos_admin_impersonation_as');
+    } catch {
+      /* */
+    }
+    return { targetTenantId: null, asProfile: null, asRole: null };
+  }
+
+  try {
+    localStorage.setItem('shefpos_admin_tenant_impersonation', targetTenantId);
+  } catch {
+    /* */
+  }
+
+  let asProfile: Profile | null = null;
+  let asRole: Role | null = null;
+  try {
+    const { data: ownerRows } = await supabase
+      .from('profiles')
+      .select(
+        'id, tenant_id, email, full_name, role, role_id, avatar_url, branch_id, phone, is_active, onboarding_completed, created_at',
+      )
+      .eq('tenant_id', targetTenantId)
+      .eq('is_active', true)
+      .order('created_at', { ascending: true })
+      .limit(20);
+    const rows = (ownerRows || []) as any[];
+    const asUser =
+      rows.find((p) => String(p.role || '').toLowerCase() === 'owner') ||
+      rows.find((p) => String(p.role || '').toLowerCase() === 'admin') ||
+      rows[0] ||
+      null;
+    if (asUser) {
+      asProfile = {
+        ...asUser,
+        tenant_id: targetTenantId,
+        is_super_admin: false,
+      } as Profile;
+      if (asUser.role_id) {
+        const { data: roleRow } = await supabase
+          .from('roles')
+          .select('*')
+          .eq('id', asUser.role_id)
+          .maybeSingle();
+        if (roleRow) asRole = roleRow as unknown as Role;
+      }
+      try {
+        localStorage.setItem(
+          'shefpos_admin_impersonation_as',
+          JSON.stringify({
+            profileId: asUser.id,
+            fullName: asUser.full_name || '',
+            email: asUser.email || '',
+            role: asUser.role || 'owner',
+          }),
+        );
+      } catch {
+        /* */
+      }
+    }
+  } catch {
+    /* sahip okunamazsa sadece tenant switch */
+  }
+
+  return { targetTenantId, asProfile, asRole };
+}
 
 function buildPermissionsFromRole(profile: Profile | null, roleData?: Role | null): UserPermissions {
   if (!profile) return DEFAULT_WAITER_PERMISSIONS;
@@ -195,15 +362,22 @@ function buildPermissionsFromRole(profile: Profile | null, roleData?: Role | nul
 }
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
-  const [profile, setProfile] = useState<Profile | null>(null);
-  const [tenant, setTenant] = useState<Tenant | null>(null);
-  const [activeBranch, setActiveBranchState] = useState<Branch | null>(null);
-  const [branches, setBranches] = useState<Branch[]>([]);
-  const [permissions, setPermissions] = useState<UserPermissions>(DEFAULT_WAITER_PERMISSIONS);
-  const [loading, setLoading] = useState(true);
+  const boot = resolveBootAuthState();
+  const [user, setUser] = useState<User | null>(boot.user);
+  const [profile, setProfile] = useState<Profile | null>(boot.snap?.profile ?? null);
+  const [tenant, setTenant] = useState<Tenant | null>(boot.snap?.tenant ?? null);
+  const [activeBranch, setActiveBranchState] = useState<Branch | null>(boot.activeBranch);
+  const [branches, setBranches] = useState<Branch[]>(boot.snap?.branches ?? []);
+  const [permissions, setPermissions] = useState<UserPermissions>(
+    boot.snap?.permissions ?? DEFAULT_WAITER_PERMISSIONS,
+  );
+  const [loading, setLoading] = useState(boot.loading);
   const [profileLoadFailed, setProfileLoadFailed] = useState(false);
-  const [impersonationTenantId, setImpersonationTenantId] = useState<string | null>(null);
+  const [impersonationTenantId, setImpersonationTenantId] = useState<string | null>(
+    boot.snap?.impersonationTenantId ?? null,
+  );
+  const activeBranchRef = useRef<Branch | null>(boot.activeBranch);
+  activeBranchRef.current = activeBranch;
 
   const isProfileBlocked = (p: any) => p?.is_active === false;
 
@@ -222,6 +396,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       /* */
     }
     await supabase.auth.signOut();
+    clearAuthSessionSnap();
+    clearWaiterLocalSession();
     localStorage.removeItem('shefpos_admin_tenant_impersonation');
     setImpersonationTenantId(null);
     setUser(null);
@@ -232,7 +408,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setPermissions(DEFAULT_WAITER_PERMISSIONS);
   };
 
-  const loadBranches = async (tenantId: string, prof: Profile) => {
+  const loadBranches = async (
+    tenantId: string,
+    prof: Profile,
+  ): Promise<{ active: Branch | null; list: Branch[] }> => {
     try {
       let query = supabase.from('branches' as any).select('*').eq('tenant_id', tenantId).eq('is_active', true);
       if (prof.role !== 'owner' && prof.role !== 'admin' && prof.branch_id) {
@@ -255,16 +434,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // taraf indaki sessionStorage/RAM cache'inden anlik tile'lari cizer; bu
       // arka plan istegi tamamlandiginda da otomatik olarak guncellenir.
       if (nextBranch && !isLocalMode() && !isSqlServerMode()) {
-        prefetchCloudTableGrid(tenantId, nextBranch.id);
+        warmPosCachesIfWeb(tenantId, nextBranch.id);
       }
       setActiveBranchState(nextBranch);
+      return { active: nextBranch, list: branchList };
     } catch {
       setActiveBranchState(null);
       setBranches([]);
+      return { active: null, list: [] };
     }
   };
 
-  const loadProfile = async (userId: string) => {
+  const loadProfile = async (userId: string, opts?: { force?: boolean }) => {
+    const now = Date.now();
+    if (!opts?.force) {
+      if (profileLoadInflight) return profileLoadInflight;
+      if (now - lastProfileLoadFinishedAt < PROFILE_LOAD_MIN_GAP_MS) return;
+    }
+
+    const run = (async () => {
     try {
       setProfileLoadFailed(false);
 
@@ -298,9 +486,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           id: profileData.tenant_id,
           name: rec2?.tenant_name || profileData.tenant_id,
           slug: rec2?.tenant_slug || profileData.tenant_id,
-          subscription_status: rec2?.subscription_status || 'active',
-          subscription_plan: null,
-          subscription_expires_at: null,
+          subscription_status: rec2?.subscription_status || 'trial',
+          subscription_plan: rec2?.subscription_plan || 'trial',
+          subscription_expires_at: rec2?.subscription_expires_at || null,
           max_branches: null,
           notes: null,
           deployment_mode: 'local',
@@ -320,8 +508,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setProfile(profileData);
         setTenant(fakeTenant);
 
-        const roleData: Role | null = rec2?.role_permissions
-          ? { id: '', tenant_id: profileData.tenant_id, name: profileData.role, permissions: rec2.role_permissions, created_at: '' }
+        const rp2 = parseStoredRolePermissions(rec2?.role_permissions);
+        const roleData: Role | null = rp2
+          ? { id: '', tenant_id: profileData.tenant_id, name: profileData.role, permissions: rp2 as Role['permissions'], created_at: '' }
           : null;
         setPermissions(buildPermissionsFromRole(profileData, roleData));
 
@@ -337,6 +526,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         };
         setBranches([fakeBranch]);
         setActiveBranchState(fakeBranch);
+        persistAuthSessionSnap({
+          userId,
+          profile: profileData,
+          tenant: fakeTenant,
+          branches: [fakeBranch],
+          activeBranchId: fakeBranch.id,
+          impersonationTenantId: null,
+          permissions: buildPermissionsFromRole(profileData, roleData),
+        });
         return;
       }
 
@@ -347,7 +545,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
         if (!rec) { setProfileLoadFailed(true); return; }
 
-        const profileData: Profile = {
+        const baseProfile: Profile = {
           id: rec.profile_id || userId,
           tenant_id: rec.tenant_id,
           email: rec.email,
@@ -357,54 +555,208 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           avatar_url: null,
           branch_id: rec.branch_id || null,
           is_super_admin: rec.is_super_admin || false,
-          onboarding_completed: rec.onboarding_completed ?? null,
+          onboarding_completed: sqlTruth(rec.onboarding_completed) ? true : false,
           allowed_ips: rec.allowed_ips || null,
           created_at: new Date().toISOString(),
         };
 
+        // VDS/SQL: bulut yolundaki Oturum Aç burada da uygulanmalı (yoksa ayka tenant kalır)
+        const imp = await resolveAdminImpersonation(
+          userId,
+          baseProfile.is_super_admin === true,
+        );
+        setImpersonationTenantId(imp.targetTenantId);
+
+        let profileData: Profile = baseProfile;
+        if (imp.targetTenantId) {
+          if (imp.asProfile) {
+            profileData = { ...imp.asProfile, is_super_admin: false };
+          } else {
+            profileData = {
+              ...baseProfile,
+              tenant_id: imp.targetTenantId,
+              role: 'owner',
+              is_super_admin: false,
+              branch_id: null,
+            };
+          }
+        }
+
+        const effectiveTenantId = profileData.tenant_id;
+
+        let tenantOnboarding =
+          sqlTruth(rec?.tenant_onboarding) || sqlTruth(rec?.onboarding_completed);
+        let deploymentMode =
+          String(rec?.deployment_mode || (isVdsSelfHost() ? 'online' : 'offline')).toLowerCase();
+        if (!['online', 'offline', 'hybrid'].includes(deploymentMode)) {
+          deploymentMode = isVdsSelfHost() ? 'online' : 'offline';
+        }
+        let tenantAddress = rec?.tenant_address || null;
+        let tenantPhone = rec?.tenant_phone || null;
+        let tenantName = rec?.tenant_name || effectiveTenantId;
+        let subStatus = rec?.subscription_status || 'trial';
+        let subPlan = rec?.subscription_plan || 'trial';
+        let subExpires = rec?.subscription_expires_at || null;
+        let tenantDisabledModules: string[] | null = Array.isArray(rec?.disabled_modules)
+          ? (rec.disabled_modules as string[])
+          : null;
+        let tenantSlug = rec?.tenant_slug || effectiveTenantId;
+
+        // Canlı DB'den tenant oku — impersonation hedefi veya kendi tenant
+        try {
+          const { data: trow } = await supabase
+            .from('tenants')
+            .select(
+              'id, name, slug, onboarding_completed, deployment_mode, address, phone, subscription_status, subscription_plan, subscription_expires_at, disabled_modules',
+            )
+            .eq('id', effectiveTenantId)
+            .maybeSingle();
+          if (trow) {
+            tenantOnboarding = sqlTruth((trow as any).onboarding_completed);
+            if ((trow as any).deployment_mode) {
+              deploymentMode = String((trow as any).deployment_mode).toLowerCase();
+            }
+            tenantAddress = (trow as any).address ?? tenantAddress;
+            tenantPhone = (trow as any).phone ?? tenantPhone;
+            tenantName = (trow as any).name || tenantName;
+            tenantSlug = (trow as any).slug || tenantSlug;
+            subStatus = (trow as any).subscription_status || subStatus;
+            subPlan = (trow as any).subscription_plan || subPlan;
+            subExpires = (trow as any).subscription_expires_at ?? subExpires;
+            if (Array.isArray((trow as any).disabled_modules)) {
+              tenantDisabledModules = (trow as any).disabled_modules as string[];
+            }
+            // Impersonation sırasında admin oturum kaydını kalıcı bozma
+            if (!imp.targetTenantId) {
+              patchSqlSessionRecord({
+                tenant_onboarding: tenantOnboarding,
+                onboarding_completed: tenantOnboarding,
+                deployment_mode: deploymentMode,
+                tenant_name: tenantName,
+                tenant_address: tenantAddress,
+                tenant_phone: tenantPhone,
+                subscription_status: subStatus,
+                subscription_plan: subPlan,
+                subscription_expires_at: subExpires,
+                disabled_modules: tenantDisabledModules,
+              });
+            }
+          }
+        } catch {
+          /* oturum alanlarıyla devam */
+        }
+
+        if (isHybridMode()) deploymentMode = 'hybrid';
+
         const fakeTenant: Tenant = {
-          id: profileData.tenant_id,
-          name: rec?.tenant_name || profileData.tenant_id,
-          slug: rec?.tenant_slug || profileData.tenant_id,
-          subscription_status: rec?.subscription_status || 'active',
-          subscription_plan: null,
-          subscription_expires_at: null,
+          id: effectiveTenantId,
+          name: tenantName,
+          slug: tenantSlug,
+          subscription_status: subStatus,
+          subscription_plan: subPlan,
+          subscription_expires_at: subExpires,
           max_branches: null,
           notes: null,
-          deployment_mode: 'sqlserver',
-          onboarding_completed: rec?.tenant_onboarding === true ? true : (rec?.onboarding_completed === true ? true : false),
+          deployment_mode: deploymentMode,
+          onboarding_completed: tenantOnboarding,
           created_at: new Date().toISOString(),
           logo_url: null,
-          address: null,
-          phone: null,
-          email: null,
+          address: tenantAddress,
+          phone: tenantPhone,
+          email: profileData.email || rec?.email || null,
           printer_settings: null,
           require_cancel_reason: rec?.require_cancel_reason ?? false,
           lock_pin: rec?.lock_pin || null,
           ip_lock_enabled: null,
-          disabled_modules: null,
+          disabled_modules: tenantDisabledModules,
         };
+
+        const rp = parseStoredRolePermissions(rec?.role_permissions);
+        let roleData: Role | null = imp.asRole;
+        if (!roleData && !imp.targetTenantId) {
+          roleData = rp
+            ? { id: '', tenant_id: effectiveTenantId, name: profileData.role, permissions: rp as Role['permissions'], created_at: '' }
+            : null;
+        }
+        const sqlPerms = buildPermissionsFromRole(profileData, roleData);
 
         setProfile(profileData);
         setTenant(fakeTenant);
+        setPermissions(sqlPerms);
 
-        const roleData: Role | null = rec?.role_permissions
-          ? { id: '', tenant_id: profileData.tenant_id, name: profileData.role, permissions: rec.role_permissions, created_at: '' }
-          : null;
-        setPermissions(buildPermissionsFromRole(profileData, roleData));
+        // Şubeleri hedef tenant'tan çek
+        let branchRows: Branch[] = [];
+        const api = (window as any).electronAPI;
+        if (api?.sqlGetBranches) {
+          const brRes = await api.sqlGetBranches({
+            tenantId: effectiveTenantId,
+            userId: profileData.id,
+            userRole: profileData.role,
+          });
+          branchRows = (brRes?.data || []) as Branch[];
+        }
+        if (branchRows.length === 0) {
+          try {
+            let bq = supabase
+              .from('branches')
+              .select('*')
+              .eq('tenant_id', effectiveTenantId)
+              .eq('is_active', true);
+            if (
+              !imp.targetTenantId &&
+              profileData.role !== 'owner' &&
+              profileData.role !== 'admin' &&
+              profileData.branch_id
+            ) {
+              bq = bq.eq('id', profileData.branch_id);
+            }
+            const { data: brows } = await bq.order('is_main', { ascending: false });
+            branchRows = (brows || []) as unknown as Branch[];
+          } catch {
+            branchRows = [];
+          }
+        }
+
+        if (branchRows.length > 0) {
+          setBranches(branchRows);
+          const preferred =
+            branchRows.find((b) => b.id === profileData.branch_id) ||
+            branchRows.find((b) => b.is_main) ||
+            branchRows[0];
+          setActiveBranchState(preferred);
+          persistAuthSessionSnap({
+            userId,
+            profile: profileData,
+            tenant: fakeTenant,
+            branches: branchRows,
+            activeBranchId: preferred.id,
+            impersonationTenantId: imp.targetTenantId,
+            permissions: sqlPerms,
+          });
+          return;
+        }
 
         const fakeBranch: Branch = {
-          id: rec.branch_id || profileData.tenant_id,
-          tenant_id: profileData.tenant_id,
+          id: profileData.branch_id || effectiveTenantId,
+          tenant_id: effectiveTenantId,
           name: rec.branch_name || 'Ana Şube',
           address: '',
           phone: '',
           is_active: true,
-          is_main: rec.branch_is_main ?? true,
+          is_main: true,
           created_at: new Date().toISOString(),
         };
         setBranches([fakeBranch]);
         setActiveBranchState(fakeBranch);
+        persistAuthSessionSnap({
+          userId,
+          profile: profileData,
+          tenant: fakeTenant,
+          branches: [fakeBranch],
+          activeBranchId: fakeBranch.id,
+          impersonationTenantId: imp.targetTenantId,
+          permissions: sqlPerms,
+        });
         return;
       }
 
@@ -442,90 +794,97 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         return;
       }
       const isSuperAdmin = (prof as any).is_super_admin === true;
-      let impersonationTarget: string | null = null;
-
-      if (isSuperAdmin) {
-        try {
-          const { data: impRow, error: impErr } = await supabase
-            .from('admin_tenant_impersonation' as any)
-            .select('target_tenant_id')
-            .eq('user_id', userId)
-            .maybeSingle();
-          if (!impErr && impRow && (impRow as { target_tenant_id?: string }).target_tenant_id) {
-            impersonationTarget = String((impRow as { target_tenant_id: string }).target_tenant_id);
-          }
-        } catch {
-          /* migration henüz yok / ağ */
-        }
-        if (!impersonationTarget) {
-          try {
-            const ls = localStorage.getItem('shefpos_admin_tenant_impersonation');
-            const uuidRe =
-              /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-            if (ls && uuidRe.test(ls)) {
-              impersonationTarget = ls;
-              const nowIso = new Date().toISOString();
-              void supabase.from('admin_tenant_impersonation' as any).upsert(
-                { user_id: userId, target_tenant_id: ls, updated_at: nowIso },
-                { onConflict: 'user_id' },
-              );
-            }
-          } catch {
-            /* storage */
-          }
-        }
-        setImpersonationTenantId(impersonationTarget);
-        if (impersonationTarget) {
-          try {
-            localStorage.setItem('shefpos_admin_tenant_impersonation', impersonationTarget);
-          } catch {
-            /* private mode */
-          }
-        } else {
-          try {
-            localStorage.removeItem('shefpos_admin_tenant_impersonation');
-          } catch {
-            /* */
-          }
-        }
-      } else {
-        setImpersonationTenantId(null);
-        try {
-          localStorage.removeItem('shefpos_admin_tenant_impersonation');
-        } catch {
-          /* */
-        }
-      }
+      const imp = await resolveAdminImpersonation(userId, isSuperAdmin);
+      const impersonationTarget = imp.targetTenantId;
+      setImpersonationTenantId(impersonationTarget);
 
       const effectiveTenantId =
         isSuperAdmin && impersonationTarget ? impersonationTarget : prof.tenant_id;
-      const effectiveProfile = {
+
+      let effectiveProfile = {
         ...(prof as any),
         tenant_id: effectiveTenantId,
       } as unknown as ProfileWithRole;
+      let effectiveRole = prof.roles ?? null;
+
+      if (isSuperAdmin && impersonationTarget) {
+        if (imp.asProfile) {
+          effectiveProfile = {
+            ...(imp.asProfile as any),
+            tenant_id: impersonationTarget,
+            is_super_admin: false,
+          } as unknown as ProfileWithRole;
+          effectiveRole = (imp.asRole as unknown as ProfileWithRole['roles']) ?? null;
+        } else {
+          effectiveProfile = {
+            ...(effectiveProfile as any),
+            role: 'owner',
+            is_super_admin: false,
+          } as unknown as ProfileWithRole;
+          effectiveRole = null;
+        }
+      }
 
       setProfile(effectiveProfile as unknown as Profile);
 
-      const { data: tenantData } = await supabase
-        .from('tenants')
-        .select('*')
-        .eq('id', effectiveTenantId)
-        .maybeSingle();
+      const perms = buildPermissionsFromRole(
+        effectiveProfile as unknown as Profile,
+        effectiveRole,
+      );
+      setPermissions(perms);
 
-      setTenant(tenantData as unknown as Tenant);
-      setPermissions(buildPermissionsFromRole(effectiveProfile as unknown as Profile, prof.roles ?? null));
-      await loadBranches(effectiveTenantId, effectiveProfile as unknown as Profile);
+      const [{ data: tenantData }, { active: activeBranch, list: branchList }] = await Promise.all([
+        supabase.from('tenants').select('*').eq('id', effectiveTenantId).maybeSingle(),
+        loadBranches(effectiveTenantId, effectiveProfile as unknown as Profile),
+      ]);
+
+      const tenantRow = tenantData as unknown as Tenant;
+      setTenant(tenantRow);
+      setBranches(branchList);
+      setActiveBranchState(activeBranch);
+      if (activeBranch?.id) {
+        try {
+          localStorage.setItem('shefpos_active_branch', activeBranch.id);
+        } catch {
+          /* ignore */
+        }
+      }
+      persistAuthSessionSnap({
+        userId,
+        profile: effectiveProfile as unknown as Profile,
+        tenant: tenantRow,
+        branches: branchList,
+        activeBranchId: activeBranch?.id ?? null,
+        impersonationTenantId: impersonationTarget,
+        permissions: perms,
+      });
     } catch {
       setProfileLoadFailed(true);
+    } finally {
+      lastProfileLoadFinishedAt = Date.now();
+      profileLoadInflight = null;
     }
+    })();
+
+    profileLoadInflight = run;
+    return run;
   };
+
+  useEffect(() => {
+    if (!boot.snap) return;
+    hideBootSplash();
+    const tid = boot.snap.tenant.id;
+    const bid = boot.activeBranch?.id;
+    if (bid) warmPosCachesIfWeb(tid, bid);
+    // loadProfile: applySession/getSession zaten cagirir — cift profil yuklemesi yapma
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     // En son baglanmis user.id — ayni user icin profile/tenant/branches yeniden
     // yuklemeyi engellemek icin ref. Token refresh sirasinda app'in "yenileniyor"
     // hissi vermesini onler (UX kritik).
-    let lastLoadedUserId: string | null = null;
+    let lastLoadedUserId: string | null = boot.snap?.userId ?? boot.user?.id ?? null;
 
     const applySession = async (session: Session | null, opts?: { force?: boolean }) => {
       if (cancelled) return;
@@ -535,17 +894,45 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           // Reference comparison'i yutmak icin: user state'i sadece id degisirse setle
           setUser((prev) => (prev?.id === session.user.id ? prev : session.user));
           if (loading && !cancelled) setLoading(false);
+          hideBootSplash();
+          // Electron güncelleme: oturum aynı ama şube snap'i boş — profil/şubeleri yeniden yükle.
+          if (!activeBranchRef.current?.id) {
+            void loadProfile(session.user.id);
+          }
           return;
         }
+        const cached = !opts?.force ? readAuthSessionSnap(session.user.id) : null;
         lastLoadedUserId = session.user.id;
         setUser(session.user);
+        if (cached) {
+          setProfile(cached.profile);
+          setTenant(cached.tenant);
+          setBranches(cached.branches);
+          const active =
+            (cached.activeBranchId
+              ? cached.branches.find((b) => b.id === cached.activeBranchId)
+              : null) ||
+            cached.branches.find((b) => b.is_main) ||
+            cached.branches[0] ||
+            null;
+          setActiveBranchState(active);
+          setPermissions(cached.permissions);
+          setImpersonationTenantId(cached.impersonationTenantId);
+          setProfileLoadFailed(false);
+          if (!cancelled) setLoading(false);
+          hideBootSplash();
+          void loadProfile(session.user.id);
+          return;
+        }
         await loadProfile(session.user.id);
       } else {
         if (lastLoadedUserId === null) {
           if (loading && !cancelled) setLoading(false);
+          hideBootSplash();
           return;
         }
         lastLoadedUserId = null;
+        clearAuthSessionSnap();
         setUser(null);
         setProfile(null);
         setTenant(null);
@@ -555,6 +942,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setProfileLoadFailed(false);
       }
       if (!cancelled) setLoading(false);
+      hideBootSplash();
     };
 
     // Safety net: getSession() bazı Electron / offline senaryolarında çok uzun
@@ -566,19 +954,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (!cancelled) {
         setLoading((prev) => (prev ? false : prev));
       }
-    }, 8000);
+    }, 2000);
 
     void (async () => {
       try {
-        for (let attempt = 0; attempt < 3 && !cancelled; attempt++) {
-          try {
-            const { data: { session } } = await supabase.auth.getSession();
-            await applySession(session);
-            break;
-          } catch {
-            if (cancelled) return;
-            await new Promise((r) => setTimeout(r, 350 * (attempt + 1)));
+        try {
+          const { data: { session } } = await supabase.auth.getSession();
+          await applySession(session);
+        } catch (err) {
+          if (isRefreshTokenNotFoundError(err)) {
+            purgeSupabaseAuthLocalStorage();
+            try {
+              await supabase.auth.signOut({ scope: 'local' });
+            } catch {
+              /* ignore */
+            }
+            if (!cancelled) await applySession(null);
+            return;
           }
+          if (cancelled) return;
+          await new Promise((r) => setTimeout(r, 60));
+          if (cancelled) return;
+          const { data: { session } } = await supabase.auth.getSession();
+          await applySession(session);
         }
       } finally {
         window.clearTimeout(safetyTimer);
@@ -598,8 +996,38 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (event === 'SIGNED_OUT') {
         void (async () => {
           if (cancelled) return;
-          await new Promise((r) => setTimeout(r, 200));
+          // SQL/yerel modda GoTrue refresh yok; yerel oturumu dogrudan oku.
+          if (isSqlServerMode() || isLocalMode()) {
+            try {
+              const { data: { session: localSession } } = await supabase.auth.getSession();
+              if (cancelled) return;
+              if (localSession?.user) {
+                await applySession(localSession, { force: false });
+              } else {
+                await applySession(null);
+              }
+            } catch {
+              if (!cancelled) await applySession(null);
+            }
+            return;
+          }
+          if (consumeInvalidRefreshHandled()) {
+            await applySession(null);
+            return;
+          }
+          if (!readStoredSupabaseRefreshToken()) {
+            await applySession(null);
+            return;
+          }
+          // GoTrue bazen gecici SIGNED_OUT yayinlar (uyku, ag, yarim refresh).
+          await new Promise((r) => setTimeout(r, 350));
           try {
+            const { data: refreshed } = await supabase.auth.refreshSession();
+            if (cancelled) return;
+            if (refreshed.session?.user) {
+              await applySession(refreshed.session, { force: false });
+              return;
+            }
             const { data: { session: recovered } } = await supabase.auth.getSession();
             if (cancelled) return;
             if (recovered?.user) {
@@ -607,7 +1035,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             } else {
               await applySession(null);
             }
-          } catch {
+          } catch (err) {
+            if (isRefreshTokenNotFoundError(err)) {
+              purgeSupabaseAuthLocalStorage();
+              try {
+                await supabase.auth.signOut({ scope: 'local' });
+              } catch {
+                /* ignore */
+              }
+            }
             if (!cancelled) await applySession(null);
           }
         })();
@@ -618,16 +1054,36 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       void applySession(session, { force });
     });
 
+    const onPageShow = (ev: PageTransitionEvent) => {
+      if (!ev.persisted) return;
+      void (async () => {
+        try {
+          const { data: { session } } = await supabase.auth.getSession();
+          if (session?.user) {
+            await applySession(session, { force: false });
+          }
+        } catch {
+          /* ignore */
+        }
+      })();
+    };
+    window.addEventListener('pageshow', onPageShow);
+
     return () => {
       cancelled = true;
       window.clearTimeout(safetyTimer);
       subscription.unsubscribe();
+      window.removeEventListener('pageshow', onPageShow);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const signIn = async (email: string, password: string) => {
-    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    const authApi =
+      isElectron && isElectronCloudMode()
+        ? getRealSupabaseClient().auth
+        : supabase.auth;
+    const { data, error } = await authApi.signInWithPassword({ email, password });
     if (error) {
       const status = (error as { status?: number }).status;
       const m = String(error.message || '');
@@ -643,6 +1099,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         };
       }
       return { error };
+    }
+
+    // SQL/yerel: profil yukleme applySession/loadProfile ile yapilir; bulut kontrolleri atlanir.
+    if (isSqlServerMode() || isLocalMode()) {
+      return { error: null };
     }
 
     if (data.user) {
@@ -688,6 +1149,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     contactEmail?: string,
     phone?: string,
   ) => {
+    // VDS: Proxy/localDb karışmasın — doğrudan sqlDb (HTTP /vds-api/register)
+    if (import.meta.env.VITE_VDS_SELFHOST === 'true') {
+      const { data, error } = await sqlDb.auth.signUp({
+        email,
+        password,
+        options: {
+          data: {
+            full_name: fullName,
+            tenant_name: tenantName,
+            contact_email: contactEmail || null,
+            phone: phone || null,
+          },
+        },
+      });
+      if (error) return { error };
+      if (!data?.user) return { error: new Error('Kullanıcı oluşturulamadı') };
+      return { error: null };
+    }
+
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
@@ -712,8 +1192,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const signOut = async () => {
+    const uid = user?.id ?? null;
+    await stopTenantPresenceTracking(uid);
     try {
-      const uid = user?.id;
       if (uid) {
         try {
           await supabase.from('admin_tenant_impersonation' as any).delete().eq('user_id', uid);
@@ -721,11 +1202,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           /* tablo yok / RLS */
         }
       }
-      await supabase.auth.signOut();
+      // Yalnızca bu cihaz/tarayıcı — diğer kasa/tablet oturumları açık kalır.
+      await supabase.auth.signOut({ scope: 'local' });
     } catch (e) {
       console.error('Logout error:', e);
     }
     localStorage.removeItem('shefpos_sql_session');
+    clearAuthSessionSnap();
     localStorage.removeItem('shefpos_active_branch');
     // Beni hatırla ile saklanan telefon/e-posta/kullanıcı adı kalsın (Electron + web giriş ekranı).
     // Kayıtlı şifre güvenlik için çıkışta silinir; tekrar girişte yazılması gerekir.
@@ -753,16 +1236,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     try {
       localStorage.removeItem('shefpos_admin_tenant_impersonation');
+      localStorage.removeItem('shefpos_admin_impersonation_as');
     } catch {
       /* */
     }
     setImpersonationTenantId(null);
-    await loadProfile(user.id);
+    // Lisans paneline dön — admin profili yeniden yüklensin
+    window.location.assign(AYKA_ADMIN_PATH);
   };
 
-  const refreshProfile = async () => {
+  const refreshProfile = async (opts?: { force?: boolean }) => {
     if (user) {
-      await loadProfile(user.id);
+      await loadProfile(user.id, opts?.force ? { force: true } : undefined);
     }
   };
 
@@ -778,31 +1263,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     setPrintAgentTenantId(tenant?.id ?? null);
+    syncTenantCurrencyCode((tenant as any)?.currency_code);
   }, [tenant]);
 
-  // Restoran adı / ünvan: kullanıcı Ayarlar → Yazıcılar → "Restoran Bilgileri"
-  // bölümünden henüz değer girmediyse paket / adisyon / kasa fişlerinde
-  // başlığa hardcoded "ŞefPOS" yazılıyordu. Müşteri kendi işletme adıyla bassın
-  // diye tenant adı geldiği anda boş alanları tek seferlik tenant.name ile
-  // doldurup kalıcı kaydederiz. Kullanıcı sonra istediğinde Ayarlar'dan
-  // ünvan / adres / telefon'u istediği gibi değiştirebilir.
+  // Ayarlar → Hesap Bilgileri (tenant name/phone/address) paket ve adisyon fişlerinde
+  // görünsün diye yazıcı ayarlarındaki restoran bilgileri tenant ile senkron tutulur.
   useEffect(() => {
     if (!tenant?.id) return;
     try {
       const current = loadPrintSettings();
       const patch: Partial<typeof current> = {};
-      if (!current.restaurantName && tenant.name) {
-        (patch as any).restaurantName = tenant.name;
+      const tenantName = (tenant.name || '').trim();
+      const tenantPhone = ((tenant as any).phone || '').trim();
+      const tenantAddress = ((tenant as any).address || '').trim();
+      if (tenantName && current.restaurantName !== tenantName) {
+        patch.restaurantName = tenantName;
+      } else if (!current.restaurantName && tenantName) {
+        patch.restaurantName = tenantName;
       }
-      // Phone/address sadece henüz hiç değer yoksa otomatik doldurulur — kullanıcı
-      // ayarlardan sildiyse tekrar yazmayız (boş bırakmak istemiş olabilir).
-      const tenantPhone = (tenant as any).phone || '';
-      const tenantAddress = (tenant as any).address || '';
-      if (!current.restaurantPhone && tenantPhone) {
-        (patch as any).restaurantPhone = tenantPhone;
+      if (current.restaurantPhone !== tenantPhone) {
+        patch.restaurantPhone = tenantPhone;
       }
-      if (!current.restaurantAddress && tenantAddress) {
-        (patch as any).restaurantAddress = tenantAddress;
+      if (current.restaurantAddress !== tenantAddress) {
+        patch.restaurantAddress = tenantAddress;
       }
       if (Object.keys(patch).length > 0) {
         savePrintSettings({ ...current, ...patch });
@@ -810,11 +1293,33 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } catch {
       /* localStorage erişim hatasında sessiz */
     }
-  }, [tenant?.id, tenant?.name]);
+  }, [tenant?.id, tenant?.name, (tenant as any)?.phone, (tenant as any)?.address]);
 
   // Electron Print Agent: main süreç `currentUserJwt` olmadan print_jobs
   // çekemez (RLS). İlk frame'de session henüz yoksa + token yenilenince
   // mutlaka `register-printers` tekrarlanmalı — aksi halde kasada fiş düşmez.
+  useEffect(() => {
+    if (!isElectron() || !isSqlServerMode() || !tenant?.id) return;
+    const api = (window as any).electronAPI;
+    if (api?.sqlApplySchemaPatches) {
+      void api
+        .sqlApplySchemaPatches(null)
+        .then((result: { success?: boolean; error?: string; errors?: string[] }) => {
+          if (!result?.success) {
+            console.error('[ŞefPOS] SQL patch:', result?.error || result?.errors?.[0]);
+            window.alert(
+              'SQL tabloları otomatik güncellenemedi.\n\nAyarlar → SQL Server → «Eksik tabloları güncelle» butonuna basın, sonra uygulamayı yeniden başlatın.',
+            );
+          } else if (result?.errors?.length) {
+            console.warn('[ŞefPOS] SQL patch uyarıları:', result.errors);
+          }
+        })
+        .catch((err: unknown) => {
+          console.error('[ŞefPOS] SQL patch hata:', err);
+        });
+    }
+  }, [tenant?.id]);
+
   useEffect(() => {
     if (!isElectron()) return;
     if (!tenant?.id) return;
@@ -838,8 +1343,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         } catch {
           /* local/sql mod */
         }
-        if (jwt) {
-          await pushAgent(jwt);
+        if (jwt || isSqlServerMode()) {
+          await pushAgent(jwt || 'sqlserver-local');
           return;
         }
         await new Promise((r) => setTimeout(r, 600));
@@ -874,7 +1379,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       .then((res) => {
         if (cancelled) return;
         if (res) {
-          console.info('[ŞefPOS] yazıcı ayarları buluttan yüklendi', {
+          posDebugLog('[ŞefPOS] yazıcı ayarları buluttan yüklendi', {
             tenant: tenant.id,
             branch: activeBranch?.id ?? null,
           });
@@ -894,6 +1399,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (!user || isLocalMode() || isSqlServerMode()) return;
     let cancelled = false;
     let timer: ReturnType<typeof setInterval> | null = null;
+    let missingProfileStreak = 0;
 
     const checkActive = async () => {
       if (cancelled) return;
@@ -905,10 +1411,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           .maybeSingle();
         // Network/PostgREST hatasinda KESINLIKLE cikis yaptırma — geçici hata olabilir.
         if (error) return;
-        // data === null → satır silinmiş demektir (kullanici silinmiş).
-        if (data === null || (data as any)?.is_active === false) {
+        if ((data as any)?.is_active === false) {
           await forceSignOutForBlockedProfile();
+          return;
         }
+        // Profil satiri yok: tek seferlik bos cevap olabilir; iki ardışık kontrolde cik.
+        if (data === null) {
+          missingProfileStreak += 1;
+          if (missingProfileStreak >= 2) {
+            await forceSignOutForBlockedProfile();
+          }
+          return;
+        }
+        missingProfileStreak = 0;
       } catch {
         /* network hatası: sessizce geç, oturumu koru */
       }
@@ -947,33 +1462,142 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     };
   }, [user?.id]);
 
-  // Bulut: uzun süre açık kasada token yenileme sekmesi uyku/arka planda gecikince
-  // oturum düşmesin diye görünürken periyodik refresh + sekmeye dönüşte bir kez.
+  // Garson: Realtime birincil; 8 sn poll kaldırıldı (ölçek). Yedek: ~90 sn, yalnız görünür sekme.
+  useEffect(() => {
+    if (!user?.id || !profile?.tenant_id || profile.role !== 'waiter') return;
+    if (isLocalMode() || isSqlServerMode()) return;
+    let cancelled = false;
+    let bindingCh: ReturnType<typeof supabase.channel> | null = null;
+
+    const ensureBindingChannel = (waiterId: string) => {
+      if (bindingCh) return;
+      bindingCh = supabase
+        .channel(`auth-waiter-binding-${user.id}-${waiterId}`)
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public', table: 'device_bindings', filter: `waiter_id=eq.${waiterId}` },
+          () => { void checkWaiterAccess(); },
+        )
+        .subscribe();
+    };
+
+    const checkWaiterAccess = async () => {
+      if (cancelled) return;
+      try {
+        const { data: profRow } = await supabase
+          .from('profiles')
+          .select('is_active')
+          .eq('id', user.id)
+          .maybeSingle();
+        if (profRow === null || (profRow as { is_active?: boolean })?.is_active === false) {
+          persistWaiterLogoutReason('Hesap pasif', 'Garson hesabınız pasif duruma alındı. Erişim sonlandırıldı.');
+          await forceSignOutForBlockedProfile();
+          return;
+        }
+
+        const access = await verifyWaiterAccessByAuthUser(user.id, profile.tenant_id);
+        if (cancelled) return;
+        if (access.allowed) {
+          ensureBindingChannel(access.waiterId);
+        } else {
+          persistWaiterLogoutReason(access.title, access.message);
+          await forceSignOutForBlockedProfile();
+        }
+      } catch {
+        /* geçici ağ hatası: oturumu koru */
+      }
+    };
+
+    void checkWaiterAccess();
+
+    const stopPoll = startAdaptivePoller({
+      baseMs: 90_000,
+      idleMs: 120_000,
+      hiddenMs: 0,
+      run: checkWaiterAccess,
+      immediate: false,
+    });
+
+    const ch = supabase
+      .channel(`auth-waiter-guard-${user.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'waiters', filter: `auth_user_id=eq.${user.id}` },
+        () => { void checkWaiterAccess(); },
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'profiles', filter: `id=eq.${user.id}` },
+        () => { void checkWaiterAccess(); },
+      )
+      .subscribe();
+
+    return () => {
+      cancelled = true;
+      stopPoll();
+      try {
+        supabase.removeChannel(ch);
+      } catch {
+        /* ignore */
+      }
+      if (bindingCh) {
+        try {
+          supabase.removeChannel(bindingCh);
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+  }, [user?.id, profile?.tenant_id, profile?.role]);
+
+  // Bulut: uzun süre açık kasada JWT süresi dolmadan yenile (uyku/arka plan sonrası düşmesin).
   useEffect(() => {
     if (!user?.id || isLocalMode() || isSqlServerMode()) return;
     let cancelled = false;
-    const bump = () => {
+    const REFRESH_WHEN_LEFT_MS = 30 * 60 * 1000;
+    const TICK_MS = 5 * 60 * 1000;
+
+    const bump = async () => {
       if (cancelled || document.visibilityState !== 'visible') return;
-      void supabase.auth.refreshSession().catch(() => {});
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        if (!session) return;
+        const expMs = session.expires_at ? session.expires_at * 1000 : 0;
+        const left = expMs ? expMs - Date.now() : 0;
+        if (left > REFRESH_WHEN_LEFT_MS) return;
+        const { error } = await supabase.auth.refreshSession();
+        if (error) {
+          await new Promise((r) => setTimeout(r, 2500));
+          if (!cancelled) await supabase.auth.refreshSession().catch(() => {});
+        }
+      } catch {
+        /* ag kesintisi: oturumu koru */
+      }
     };
+
     const onVis = () => {
-      if (document.visibilityState === 'visible') bump();
+      if (document.visibilityState === 'visible') void bump();
     };
+    const onFocus = () => void bump();
     document.addEventListener('visibilitychange', onVis);
-    window.addEventListener('focus', bump);
-    const iv = window.setInterval(bump, 20 * 60 * 1000);
-    if (document.visibilityState === 'visible') bump();
+    window.addEventListener('focus', onFocus);
+    const iv = window.setInterval(() => void bump(), TICK_MS);
+    if (document.visibilityState === 'visible') void bump();
     return () => {
       cancelled = true;
       window.clearInterval(iv);
       document.removeEventListener('visibilitychange', onVis);
-      window.removeEventListener('focus', bump);
+      window.removeEventListener('focus', onFocus);
     };
   }, [user?.id]);
 
   const setActiveBranch = (branch: Branch) => {
     setActiveBranchState(branch);
     localStorage.setItem('shefpos_active_branch', branch.id);
+    const tid = tenant?.id;
+    if (tid && !isLocalMode() && !isSqlServerMode()) {
+      warmPosCachesIfWeb(tid, branch.id);
+    }
   };
 
   const isOwnerOrAdmin = profile?.role === 'owner' || profile?.role === 'admin' || !!profile?.is_super_admin;
@@ -1010,25 +1634,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     const fetchIt = async () => {
-      try {
-        const { data, error } = await (supabase as any).rpc('get_current_business_date', {
-          p_branch_id: activeBranch.id,
-        });
-        if (cancelled || error || !data) return;
-        const row = Array.isArray(data) ? data[0] : data;
-        if (row?.business_date) {
-          setServerBusinessDate(String(row.business_date));
-        }
-        if (typeof row?.hours_open === 'number') {
-          setServerHoursOpen(Number(row.hours_open));
-        } else if (typeof row?.hours_open === 'string') {
-          const n = Number(row.hours_open);
-          setServerHoursOpen(Number.isFinite(n) ? n : null);
-        } else {
-          setServerHoursOpen(null);
-        }
-      } catch {
-        // sessizce
+      const row = await fetchCurrentBusinessDate(activeBranch.id);
+      if (cancelled || !row) return;
+      if (row.business_date) setServerBusinessDate(String(row.business_date));
+      if (typeof row.hours_open === 'number') {
+        setServerHoursOpen(Number(row.hours_open));
+      } else if (row.hours_open != null && row.hours_open !== '') {
+        const n = Number(row.hours_open);
+        setServerHoursOpen(Number.isFinite(n) ? n : null);
+      } else {
+        setServerHoursOpen(null);
       }
     };
     fetchIt();
@@ -1038,14 +1653,33 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const currentBusinessDate: string = (() => {
     if (businessDayMode === 'manual' && serverBusinessDate) return serverBusinessDate;
-    // cutoff client-side hesabi (geri uyum)
-    const now = new Date();
-    const x = new Date(now);
-    if (x.getHours() < businessDayStartHour) x.setDate(x.getDate() - 1);
-    const pad = (n: number) => String(n).padStart(2, '0');
-    return `${x.getFullYear()}-${pad(x.getMonth() + 1)}-${pad(x.getDate())}`;
+    return computeClientBusinessDate(businessDayStartHour);
   })();
   const businessDayHoursOpen = businessDayMode === 'manual' ? serverHoursOpen : null;
+
+  // Restoran POS: çevrimiçi nabız (~60 sn). Kurucu super_admin POS'ta ping gönderir;
+  // yalnızca lisans paneli URL'sinde (/ayka-yonetim45) ping kapalı.
+  useEffect(() => {
+    if (!user?.id || !tenant?.id || !profile || isSqlServerMode() || isLocalMode()) {
+      void stopTenantPresenceTracking();
+      return;
+    }
+    const onLicensePanel =
+      typeof window !== 'undefined' && isAykaAdminPath(window.location.pathname);
+    if (profile.is_super_admin && onLicensePanel && !impersonationTenantId) {
+      void stopTenantPresenceTracking(user.id);
+      return;
+    }
+    startTenantPresenceTracking({
+      tenantId: tenant.id,
+      userId: user.id,
+      fullName: profile.full_name || undefined,
+      role: profile.role || undefined,
+    });
+    return () => {
+      void stopTenantPresenceTracking();
+    };
+  }, [user?.id, tenant?.id, profile?.id, profile?.is_super_admin, impersonationTenantId]);
 
   return (
     <AuthContext.Provider value={{

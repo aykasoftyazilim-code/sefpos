@@ -19,6 +19,7 @@
 //   poll-active | poll-unapproved | poll-cancelled
 //   verify | verify-scheduled
 //   prepare | handover | deliver | cancel
+//   store-status-sync | restaurant-status-get
 //   restaurant-status-open | restaurant-status-close
 //   product-status-set | option-product-set
 //   restaurant-busy
@@ -32,6 +33,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 import { extractGetirCourier, resolveFromNumeric, resolveFromPlatformEnum, clampGetirStatusUntilPosAck } from "../_shared/getirOrderStatus.ts";
+import { buildGetirCustomerNotesForDb } from "../_shared/dhOrderReceipt.ts";
 
 const corsHeaders: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
@@ -81,6 +83,63 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 function badRequest(msg: string): Response {
   return jsonResponse({ ok: false, error: msg }, 400);
+}
+
+/** POS cevabı: yalnızca `posStatus` alanı (100=açık, 200=pasif). */
+function parsePosOpenFlag(data: any): boolean | null {
+  if (!data || typeof data !== "object") return null;
+  const raw = data.posStatus ?? data.data?.posStatus;
+  if (raw == null) return null;
+  const n = Number(raw);
+  if (n === 100) return true;
+  if (n === 200) return false;
+  return null;
+}
+
+/**
+ * Restoran müşteri uygulaması açık/kapalı — `status: 200` HTTP/enum ile karıştırılmaz
+ * (aksi halde açık API cevabı yanlışlıkla kapalı yazılıyordu).
+ */
+function parseRestaurantOpenFlag(data: any): boolean | null {
+  if (!data || typeof data !== "object") return null;
+  const candidates = [
+    data.restaurantOpen,
+    data.isOpen,
+    data.isRestaurantOpen,
+    data.restaurantStatus,
+    data.storeStatus,
+    data.isRestaurantAvailable,
+    data.data?.restaurantOpen,
+    data.data?.isOpen,
+    data.data?.restaurantStatus,
+    data.data?.storeStatus,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "boolean") return c;
+    if (typeof c === "string") {
+      const s = c.toLowerCase();
+      if (s === "open" || s === "opened" || s === "active" || s === "available") return true;
+      if (s === "close" || s === "closed" || s === "inactive" || s === "unavailable") return false;
+    }
+    if (c === 100 || c === "100") return true;
+    if (c === 200 || c === "200") return false;
+  }
+  return null;
+}
+
+function messageImpliesRestaurantClosed(raw: string): boolean {
+  const m = raw.toLowerCase();
+  return (
+    m.includes("restaurant is closed") ||
+    m.includes("restaurant closed") ||
+    m.includes("store is closed") ||
+    m.includes("kapalı") ||
+    m.includes("kapali") ||
+    m.includes("restoran kapalı") ||
+    m.includes("restoran kapali") ||
+    m.includes("not open") ||
+    m.includes("is not active")
+  );
 }
 
 function serverError(msg: string, extra?: Record<string, unknown>): Response {
@@ -291,6 +350,15 @@ const PREV_ACTION: Record<string, string | null> = {
   deliver: "handover",
 };
 
+/** handover/deliver için eksik adımları sırayla dener (prepare → handover → deliver). */
+function getGetirActionChain(action: string): string[] {
+  if (action === "handover") return ["prepare", "handover"];
+  if (action === "deliver") return ["prepare", "handover", "deliver"];
+  return [action];
+}
+
+const GETIR_CHAIN_STEP_DELAY_MS = 450;
+
 function isInvalidStatusError(data: any): boolean {
   const msg = String(data?.message || data?.error || "").toLowerCase();
   return (
@@ -319,114 +387,148 @@ async function tryGetirActionWithRecovery(
   orderId: string,
   payload: any,
 ): Promise<{ ok: boolean; status: number; data: any; meta?: Record<string, any> }> {
-  const path = `/food-orders/${encodeURIComponent(orderId)}/${action}`;
-  const res = await callGetir(admin, platform, "POST", path, payload || {});
-  if (res.ok) {
-    return { ok: true, status: 200, data: res.data };
-  }
+  const steps = getGetirActionChain(action);
+  const chainExecuted: string[] = [];
+  let lastData: any = null;
 
-  if (!isInvalidStatusError(res.data)) {
-    return { ok: false, status: res.status, data: res.data };
-  }
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i]!;
+    const path = `/food-orders/${encodeURIComponent(orderId)}/${step}`;
+    const stepPayload = step === action ? (payload || {}) : {};
+    const res = await callGetir(admin, platform, "POST", path, stepPayload);
 
-  // ---- Auto-recovery: inquiry ile gerçek state'i öğren ----
-  const inq = await callGetir(
-    admin,
-    platform,
-    "GET",
-    `/food-orders/${encodeURIComponent(orderId)}`,
-  );
-  if (!inq.ok) {
+    if (res.ok) {
+      const embedded = extractOrderFromGetirActionResponse(res.data);
+      if (embedded) {
+        await upsertGetirOrder(admin, platform, embedded, { skipAckClamp: true });
+      }
+      lastData = res.data;
+      if (step !== action) {
+        chainExecuted.push(step);
+        await new Promise((r) => setTimeout(r, GETIR_CHAIN_STEP_DELAY_MS));
+        continue;
+      }
+      return {
+        ok: true,
+        status: 200,
+        data: lastData,
+        meta: chainExecuted.length
+          ? { chained: chainExecuted.join(","), fullChain: steps.join("→") }
+          : undefined,
+      };
+    }
+
+    if (!isInvalidStatusError(res.data)) {
+      return { ok: false, status: res.status, data: res.data };
+    }
+
+    const inq = await callGetir(
+      admin,
+      platform,
+      "GET",
+      `/food-orders/${encodeURIComponent(orderId)}`,
+    );
+    if (!inq.ok) {
+      return {
+        ok: false,
+        status: res.status,
+        data: res.data,
+        meta: { recoveryFailed: true, reason: "inquiry-failed", inquiryStatus: inq.status, step },
+      };
+    }
+    const ord = (inq.data as any)?.data || inq.data;
+    if (!ord || typeof ord !== "object") {
+      return {
+        ok: false,
+        status: res.status,
+        data: res.data,
+        meta: { recoveryFailed: true, reason: "empty-inquiry", step },
+      };
+    }
+
+    const rawCode = (ord as any).status;
+    const realCode = typeof rawCode === "number" ? rawCode : Number(rawCode);
+    await upsertGetirOrder(admin, platform, ord, { skipAckClamp: true });
+
+    if (Number.isFinite(realCode) && realCode >= 900 && realCode < 1500) {
+      const nowIso = new Date().toISOString();
+      await admin
+        .from("online_orders")
+        .update({ status: "cancelled", cancelled_at: nowIso })
+        .eq("platform_id", platform.id)
+        .eq("platform_order_id", orderId)
+        .is("cancelled_at", null);
+      return {
+        ok: true,
+        status: 200,
+        data: { recovered: true, cancelled: true, getirStatusCode: realCode },
+        meta: { cancelled: true, realCode },
+      };
+    }
+
+    const targetCode = ACTION_COMPLETED[step];
+    if (Number.isFinite(realCode) && typeof targetCode === "number" && realCode >= targetCode) {
+      if (step !== action) {
+        chainExecuted.push(`${step}(skip)`);
+        await new Promise((r) => setTimeout(r, 200));
+        continue;
+      }
+      return {
+        ok: true,
+        status: 200,
+        data: { recovered: true, alreadyDone: true, getirStatusCode: realCode },
+        meta: { alreadyDone: true, realCode, chained: chainExecuted.join(",") || undefined },
+      };
+    }
+
+    if (step === action) {
+      const prev = PREV_ACTION[action];
+      if (prev && !steps.includes(prev)) {
+        const prevPath = `/food-orders/${encodeURIComponent(orderId)}/${prev}`;
+        const prevRes = await callGetir(admin, platform, "POST", prevPath, {});
+        if (prevRes.ok) {
+          const prevEmbedded = extractOrderFromGetirActionResponse(prevRes.data);
+          if (prevEmbedded) {
+            await upsertGetirOrder(admin, platform, prevEmbedded, { skipAckClamp: true });
+          }
+          await new Promise((r) => setTimeout(r, GETIR_CHAIN_STEP_DELAY_MS));
+          const retry = await callGetir(admin, platform, "POST", path, stepPayload);
+          if (retry.ok) {
+            const retryEmb = extractOrderFromGetirActionResponse(retry.data);
+            if (retryEmb) {
+              await upsertGetirOrder(admin, platform, retryEmb, { skipAckClamp: true });
+            }
+            return {
+              ok: true,
+              status: 200,
+              data: retry.data,
+              meta: { chained: prev, realCodeBefore: realCode },
+            };
+          }
+          return {
+            ok: false,
+            status: retry.status,
+            data: retry.data,
+            meta: { chained: prev, retryFailed: true, realCodeBefore: realCode },
+          };
+        }
+      }
+    }
+
     return {
       ok: false,
       status: res.status,
       data: res.data,
-      meta: { recoveryFailed: true, reason: "inquiry-failed", inquiryStatus: inq.status },
-    };
-  }
-  const ord = (inq.data as any)?.data || inq.data;
-  if (!ord || typeof ord !== "object") {
-    return { ok: false, status: res.status, data: res.data, meta: { recoveryFailed: true, reason: "empty-inquiry" } };
-  }
-
-  const rawCode = (ord as any).status;
-  const realCode = typeof rawCode === "number" ? rawCode : Number(rawCode);
-
-  await upsertGetirOrder(admin, platform, ord, { skipAckClamp: true });
-
-  // 1) Getir tarafında iptal edilmiş → DB de iptal et, ok dön
-  if (Number.isFinite(realCode) && realCode >= 900 && realCode < 1500) {
-    const nowIso = new Date().toISOString();
-    await admin
-      .from("online_orders")
-      .update({ status: "cancelled", cancelled_at: nowIso })
-      .eq("platform_id", platform.id)
-      .eq("platform_order_id", orderId)
-      .is("cancelled_at", null);
-    return {
-      ok: true,
-      status: 200,
-      data: { recovered: true, cancelled: true, getirStatusCode: realCode },
-      meta: { cancelled: true, realCode },
+      meta: {
+        realCode,
+        behind: true,
+        failedStep: step,
+        chainAttempted: chainExecuted.join(",") || undefined,
+      },
     };
   }
 
-  // 2) Hedef aksiyon zaten yapılmış (Getir ileride) → DB sync edildi, success
-  const targetCode = ACTION_COMPLETED[action];
-  if (Number.isFinite(realCode) && typeof targetCode === "number" && realCode >= targetCode) {
-    return {
-      ok: true,
-      status: 200,
-      data: { recovered: true, alreadyDone: true, getirStatusCode: realCode },
-      meta: { alreadyDone: true, realCode },
-    };
-  }
-
-  // 3) 1 adım geride → önceki aksiyonu otomatik çağır, sonra hedef aksiyonu tekrar dene
-  const prev = PREV_ACTION[action];
-  if (prev) {
-    const prevPath = `/food-orders/${encodeURIComponent(orderId)}/${prev}`;
-    const prevRes = await callGetir(admin, platform, "POST", prevPath, {});
-    if (prevRes.ok) {
-      const prevEmbedded = extractOrderFromGetirActionResponse(prevRes.data);
-      if (prevEmbedded) {
-        await upsertGetirOrder(admin, platform, prevEmbedded, { skipAckClamp: true });
-      }
-      // Getir state'in oturması için kısa bekleme
-      await new Promise((r) => setTimeout(r, 400));
-      // Hedef aksiyonu tekrar dene
-      const retry = await callGetir(admin, platform, "POST", path, payload || {});
-      if (retry.ok) {
-        return {
-          ok: true,
-          status: 200,
-          data: retry.data,
-          meta: { chained: prev, realCodeBefore: realCode },
-        };
-      }
-      // Retry da invalid status verdi → recovery limitini aştık
-      return {
-        ok: false,
-        status: retry.status,
-        data: retry.data,
-        meta: { chained: prev, retryFailed: true, realCodeBefore: realCode },
-      };
-    }
-    return {
-      ok: false,
-      status: prevRes.status,
-      data: prevRes.data,
-      meta: { chainAttempted: prev, chainFailed: true, realCode },
-    };
-  }
-
-  // 4) Recover edilemez → orijinal hatayı dön (frontend bilgilendirir)
-  return {
-    ok: false,
-    status: res.status,
-    data: res.data,
-    meta: { realCode, behind: true },
-  };
+  return { ok: false, status: 400, data: { message: "empty action chain" } };
 }
 
 function isMissingObjectError(err: any): boolean {
@@ -510,6 +612,7 @@ async function upsertGetirOrder(
   ) || "Getir Musteri";
   // Gelen telefon zaten maskeli olabilir (0850...). Hem maskeli hem tam yedek hicbir zaman gelmez.
   const maskedPhone = String(customer.maskedPhoneNumber || customer.phoneNumber || customer.phone || "");
+  const phoneCode = String(customer.phoneCode || order.phoneCode || "");
   const verificationCode = String(order.confirmationId || order.verificationCode || "");
 
   const addressObj = order.address || customer.address || {};
@@ -587,7 +690,12 @@ async function upsertGetirOrder(
     customer_name: customerName,
     customer_phone: maskedPhone || null,
     customer_address: address || null,
-    customer_notes: order.note || order.clientNote || null,
+    customer_notes:
+      buildGetirCustomerNotesForDb(order as Record<string, unknown>) ||
+      order.note ||
+      order.clientNote ||
+      (typeof order.clientRequest === "string" ? order.clientRequest : null) ||
+      null,
     subtotal,
     delivery_fee: deliveryFee,
     discount_amount: totalDiscount,
@@ -601,7 +709,11 @@ async function upsertGetirOrder(
     getir_scheduled_at: order.scheduledDate ? new Date(order.scheduledDate).toISOString() : null,
     getir_delivery_type: Number(order.deliveryType ?? 0) || null,
     getir_verification_code: verificationCode || null,
-    getir_masked_phone: maskedPhone || null,
+    getir_masked_phone: maskedPhone
+      ? phoneCode
+        ? `${maskedPhone} / ${phoneCode.replace(/\D/g, "").padStart(6, "0").slice(-6)}`
+        : maskedPhone
+      : null,
     getir_supplier_support_rate: supplierSupportRate || null,
     getir_total_discount: totalDiscount || null,
     getir_total_discounted_price: discounted || null,
@@ -806,12 +918,59 @@ Deno.serve(async (req) => {
         try { data = raw ? JSON.parse(raw) : {}; } catch { data = { raw }; }
         if (resp.ok) {
           const posStatus = Number(data?.posStatus ?? data?.data?.posStatus ?? 200);
-          await admin
-            .from("online_order_platforms")
-            .update({ getir_pos_status: posStatus })
-            .eq("id", platform.id);
+          const patch: Record<string, unknown> = { getir_pos_status: posStatus };
+          const fromRestaurant = parseRestaurantOpenFlag(data);
+          const fromPos = parsePosOpenFlag(data);
+          if (fromRestaurant !== null) {
+            patch.getir_restaurant_open = fromRestaurant;
+          } else if (fromPos !== null) {
+            patch.getir_restaurant_open = fromPos;
+          }
+          await admin.from("online_order_platforms").update(patch).eq("id", platform.id);
+          data = { ...data, posStatus, restaurantOpen: patch.getir_restaurant_open ?? null };
         }
         return jsonResponse({ ok: resp.ok, status: resp.status, data });
+      }
+
+      case "store-status-sync":
+      case "restaurant-status-get": {
+        let posStatus = 200;
+        let restaurantOpen: boolean | null = null;
+
+        const posResp = await fetch(`${baseUrl}/restaurants/pos-status`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            appSecretKey: creds.appSecretKey,
+            restaurantSecretKey: creds.restaurantSecretKey,
+          }),
+        });
+        const posRaw = await posResp.text();
+        let posData: any = {};
+        try { posData = posRaw ? JSON.parse(posRaw) : {}; } catch { posData = { raw: posRaw }; }
+        if (posResp.ok) {
+          posStatus = Number(posData?.posStatus ?? posData?.data?.posStatus ?? 200);
+          const fromPos = parsePosOpenFlag(posData);
+          if (fromPos !== null) restaurantOpen = fromPos;
+        }
+
+        const tr = await ensureToken(admin, platform as PlatformRow, false);
+        if (!("error" in tr)) {
+          const stRes = await callGetir(admin, platform as PlatformRow, "GET", "/restaurants/status");
+          if (stRes.ok) {
+            const fromStatus = parseRestaurantOpenFlag(stRes.data);
+            if (fromStatus !== null) restaurantOpen = fromStatus;
+          }
+        }
+
+        const patch: Record<string, unknown> = { getir_pos_status: posStatus };
+        if (restaurantOpen !== null) patch.getir_restaurant_open = restaurantOpen;
+        await admin.from("online_order_platforms").update(patch).eq("id", platform.id);
+
+        return jsonResponse({
+          ok: true,
+          data: { posStatus, restaurantOpen, posOk: posResp.ok },
+        });
       }
 
       case "pos-status-set": {
@@ -829,10 +988,30 @@ Deno.serve(async (req) => {
         let data: any = {};
         try { data = raw ? JSON.parse(raw) : {}; } catch { data = { raw }; }
         if (resp.ok) {
-          await admin
-            .from("online_order_platforms")
-            .update({ getir_pos_status: target, is_active: target === 100 })
-            .eq("id", platform.id);
+          const patch: Record<string, unknown> = {
+            getir_pos_status: target,
+            is_active: target === 100,
+          };
+          // POS AÇ = sipariş hattı; müşteri uygulamasında görünürlük ayrı — POS açılınca restoranı da aç.
+          if (target === 100) {
+            const openRes = await callGetir(
+              admin,
+              platform as PlatformRow,
+              "PUT",
+              "/restaurants/status/open",
+            );
+            if (openRes.ok) {
+              patch.getir_restaurant_open = true;
+              data = { ...data, restaurantOpened: true };
+            } else {
+              data = {
+                ...data,
+                restaurantOpened: false,
+                restaurantOpenError: openRes.data,
+              };
+            }
+          }
+          await admin.from("online_order_platforms").update(patch).eq("id", platform.id);
         }
         return jsonResponse({ ok: resp.ok, status: resp.status, data });
       }
@@ -862,7 +1041,23 @@ Deno.serve(async (req) => {
               ? "/food-orders/periodic/unapproved"
               : "/food-orders/periodic/cancelled";
         const res = await callGetir(admin, platform as PlatformRow, "POST", path, body.payload);
-        if (!res.ok) return jsonResponse({ ok: false, status: res.status, data: res.data }, res.status);
+        if (!res.ok) {
+          const errText = JSON.stringify(res.data ?? res.raw ?? "");
+          if (messageImpliesRestaurantClosed(errText)) {
+            await admin
+              .from("online_order_platforms")
+              .update({ getir_restaurant_open: false })
+              .eq("id", platform.id);
+            return jsonResponse({
+              ok: false,
+              status: res.status,
+              data: res.data,
+              restaurantOpen: false,
+              storeClosed: true,
+            }, res.status);
+          }
+          return jsonResponse({ ok: false, status: res.status, data: res.data }, res.status);
+        }
         const list: any[] = Array.isArray(res.data) ? res.data : (res.data?.data || res.data?.orders || []);
         let saved = 0;
         let newCount = 0;
@@ -1146,12 +1341,46 @@ Deno.serve(async (req) => {
       // ---- RESTAURANT STATUS / BUSY --------------------------------------
       case "restaurant-status-open": {
         const res = await callGetir(admin, platform as PlatformRow, "PUT", "/restaurants/status/open");
-        return jsonResponse({ ok: res.ok, status: res.status, data: res.data });
+        let posOk = false;
+        let posData: any = null;
+        if (res.ok) {
+          const posResp = await fetch(`${baseUrl}/restaurants/pos-status`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              posStatus: 100,
+              appSecretKey: creds.appSecretKey,
+              restaurantSecretKey: creds.restaurantSecretKey,
+            }),
+          });
+          const posRaw = await posResp.text();
+          try { posData = posRaw ? JSON.parse(posRaw) : {}; } catch { posData = { raw: posRaw }; }
+          posOk = posResp.ok;
+          await admin
+            .from("online_order_platforms")
+            .update({
+              getir_restaurant_open: true,
+              getir_pos_status: posOk ? 100 : 200,
+              is_active: true,
+            })
+            .eq("id", platform.id);
+        }
+        return jsonResponse({
+          ok: res.ok,
+          status: res.status,
+          data: { ...res.data, restaurantOpened: res.ok, posOpened: posOk, pos: posData },
+        });
       }
       case "restaurant-status-close": {
         const tof = body.timeOffAmount === 30 ? 30 : body.timeOffAmount === 45 ? 45 : 15;
         const res = await callGetir(admin, platform as PlatformRow, "PUT", "/restaurants/status/close", { timeOffAmount: tof });
-        return jsonResponse({ ok: res.ok, status: res.status, data: res.data });
+        if (res.ok) {
+          await admin
+            .from("online_order_platforms")
+            .update({ getir_restaurant_open: false })
+            .eq("id", platform.id);
+        }
+        return jsonResponse({ ok: res.ok, status: res.status, data: res.data, timeOffAmount: tof });
       }
       case "restaurant-busy": {
         const payload: Record<string, any> = { isBusy: !!body.isBusy };

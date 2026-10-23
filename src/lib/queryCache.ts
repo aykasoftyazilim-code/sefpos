@@ -1,4 +1,5 @@
 import { supabase } from './supabase';
+import { isSqlServerMode } from './sqlDb';
 
 interface CacheEntry<T> {
   data: T[];
@@ -22,7 +23,13 @@ const CACHE_TTL = {
 const STALE_MULTIPLIER = 6;
 
 /** Şema/kolon değişince artırın; eski boş menü önbelleğini düşürür */
-const MENU_CACHE_SCHEMA_VER = 'v3';
+const MENU_CACHE_SCHEMA_VER = 'v4';
+
+const MENU_CACHE_APP_VER_KEY = 'sefpos:menu_cache_app_ver';
+
+function isUsableMenuData(products: any[] | undefined, categories: any[] | undefined): boolean {
+  return (products?.length ?? 0) > 0 || (categories?.length ?? 0) > 0;
+}
 
 /** IndexedDB store ismi → CacheEntry. Tarayıcı yenilemesinden sonra cache yaşamaya devam eder. */
 const IDB_STORE = 'queryCache';
@@ -152,7 +159,10 @@ class QueryCache {
       catCache && !this.isExpired(catCache, CACHE_TTL.CATEGORIES) &&
       varCache && !this.isExpired(varCache, CACHE_TTL.PRODUCT_VARIANTS);
 
-    if (allFresh) {
+    if (
+      allFresh &&
+      isUsableMenuData(prodCache?.data, catCache?.data)
+    ) {
       return {
         products: prodCache!.data,
         categories: catCache!.data,
@@ -164,7 +174,8 @@ class QueryCache {
       !forceRefresh &&
       this.isFreshLike(prodCache, CACHE_TTL.PRODUCTS, STALE_MULTIPLIER) &&
       this.isFreshLike(catCache, CACHE_TTL.CATEGORIES, STALE_MULTIPLIER) &&
-      this.isFreshLike(varCache, CACHE_TTL.PRODUCT_VARIANTS, STALE_MULTIPLIER);
+      this.isFreshLike(varCache, CACHE_TTL.PRODUCT_VARIANTS, STALE_MULTIPLIER) &&
+      isUsableMenuData(prodCache?.data, catCache?.data);
 
     if (allStaleUsable) {
       void this.fetchAndStoreMenu(tenantId).catch(() => { /* arka plan */ });
@@ -183,12 +194,17 @@ class QueryCache {
     const existing = this.pendingRequests.get(dedup);
     if (existing) return existing;
 
+    const productCols = isSqlServerMode()
+      ? 'id, name, price, cost, category_id, is_active, image_url, barcode, printer_name, unit, stock_quantity, tax_rate, scale_enabled'
+      : 'id, name, price, cost, category_id, is_active, image_url, barcode, printer_name, unit, stock_quantity, tax_rate, scale_enabled';
+    let productQ = supabase.from('products').select(productCols).eq('tenant_id', tenantId);
+    if (isSqlServerMode()) {
+      productQ = productQ.eq('is_active', 1);
+    } else {
+      productQ = productQ.or('is_active.eq.true,is_active.is.null');
+    }
     const promise = Promise.all([
-      supabase
-        .from('products')
-        .select('id, name, price, cost, category_id, is_active, image_url, barcode, printer_name, unit, stock_quantity, tax_rate, scale_enabled')
-        .eq('tenant_id', tenantId)
-        .or('is_active.eq.true,is_active.is.null'),
+      productQ,
       supabase
         .from('categories')
         .select('id, name, color, tenant_id, sort_order')
@@ -196,7 +212,7 @@ class QueryCache {
         .order('sort_order'),
       supabase
         .from('product_variants')
-        .select('*')
+        .select('id, tenant_id, product_id, name, price_modifier, sort_order, is_active')
         .eq('tenant_id', tenantId)
         .eq('is_active', true)
         .order('sort_order'),
@@ -248,7 +264,8 @@ class QueryCache {
     if (
       this.isFreshLike(prodCache, CACHE_TTL.PRODUCTS, STALE_MULTIPLIER) &&
       this.isFreshLike(catCache, CACHE_TTL.CATEGORIES, STALE_MULTIPLIER) &&
-      this.isFreshLike(varCache, CACHE_TTL.PRODUCT_VARIANTS, STALE_MULTIPLIER)
+      this.isFreshLike(varCache, CACHE_TTL.PRODUCT_VARIANTS, STALE_MULTIPLIER) &&
+      isUsableMenuData(prodCache?.data, catCache?.data)
     ) {
       return {
         products: prodCache!.data,
@@ -257,6 +274,27 @@ class QueryCache {
       };
     }
     return null;
+  }
+
+  /** Uygulama sürümü değişince (Electron güncelleme) eski menü IDB kayıtlarını düşürür. */
+  bustMenuCacheIfAppVersionChanged(appVersion: string, tenantId: string): boolean {
+    if (!tenantId || !appVersion) return false;
+    try {
+      const prev = localStorage.getItem(MENU_CACHE_APP_VER_KEY);
+      if (prev === appVersion) return false;
+      localStorage.setItem(MENU_CACHE_APP_VER_KEY, appVersion);
+    } catch {
+      return false;
+    }
+    this.invalidateMenuForTenant(tenantId);
+    this.hydrated = false;
+    return true;
+  }
+
+  invalidateMenuForTenant(tenantId: string) {
+    for (const type of ['products', 'categories', 'product_variants'] as const) {
+      this.invalidate(type, tenantId);
+    }
   }
 
   async getTableGroups(tenantId: string, branchId: string, forceRefresh = false) {
@@ -299,6 +337,14 @@ class QueryCache {
       if (key.includes(tenantId)) {
         this.cache.delete(key);
       }
+    }
+  }
+
+  /** Uzun oturum: bellekteki eski menü/masa önbelleğini budar (IndexedDB dokunulmaz). */
+  pruneStaleInMemory(maxAgeMs = 2 * 60 * 60 * 1000): void {
+    const cutoff = Date.now() - maxAgeMs;
+    for (const [key, entry] of this.cache) {
+      if (entry.timestamp < cutoff) this.cache.delete(key);
     }
   }
 }

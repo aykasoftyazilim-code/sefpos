@@ -1,6 +1,18 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { supabase } from '../lib/supabase';
-import { Bike, Bell, BellOff, Package, MapPin, Phone, Clock, CheckCircle2, ChevronRight, ChevronLeft, LogOut, AlertCircle, Navigation } from 'lucide-react';
+import {
+  Bike, Bell, BellOff, Package, MapPin, Phone, Clock, CheckCircle2, ChevronRight, ChevronLeft,
+  LogOut, AlertCircle, Navigation, Download, X,
+} from 'lucide-react';
+import {
+  primeCourierAudio,
+  playCourierAssignmentAlert,
+  requestCourierNotificationPermission,
+  isIosStandaloneHint,
+  COURIER_OPEN_ORDER_EVENT,
+} from '../lib/courierAlerts';
+import { applyCourierPwaMeta, startCourierTracking } from '../lib/courierTracking';
+import { startAdaptivePoller } from '../lib/pollSchedule';
 
 interface CourierData {
   id: string;
@@ -83,6 +95,8 @@ function CourierLogin({ onLogin, onExit }: { onLogin: (courier: CourierData) => 
     }
 
     await supabase.from('couriers').update({ status: 'available' }).eq('id', data.id);
+    primeCourierAudio();
+    void requestCourierNotificationPermission();
     onLogin(data as CourierData);
     setLoading(false);
   };
@@ -157,8 +171,11 @@ function CourierLogin({ onLogin, onExit }: { onLogin: (courier: CourierData) => 
           </button>
         </form>
 
-        <p className="text-center text-xs text-slate-400 mt-6">
+        <p className="text-center text-xs text-slate-400 mt-4">
           PIN kodunuzu restoran yöneticinizden alın
+        </p>
+        <p className="text-center text-[11px] text-blue-600 font-semibold mt-3 leading-relaxed">
+          Girişten sonra bildirim ve ses izni verin. Chrome’da «Ana ekrana ekle» ile uygulama gibi kullanın.
         </p>
       </div>
     </div>
@@ -172,10 +189,13 @@ function CourierDashboard({ courier, onLogout }: { courier: CourierData; onLogou
   const [tab, setTab] = useState<'active' | 'completed' | 'notifications'>('active');
   const [soundEnabled, setSoundEnabled] = useState(true);
   const [locationStatus, setLocationStatus] = useState<'idle' | 'tracking' | 'denied'>('idle');
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const prevNotifCount = useRef(0);
-  const locationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const prevUnreadRef = useRef(0);
+  const activeOrderIdRef = useRef<string | null>(null);
+  const hasDeliveryRef = useRef(false);
+  const [bgHint, setBgHint] = useState(false);
+  const [detailOrderId, setDetailOrderId] = useState<string | null>(null);
+  const [installPrompt, setInstallPrompt] = useState<any>(null);
+  const [showIosHint, setShowIosHint] = useState(isIosStandaloneHint());
 
   const loadOrders = async () => {
     const { data } = await supabase
@@ -189,6 +209,40 @@ function CourierDashboard({ courier, onLogout }: { courier: CourierData; onLogou
     setLoading(false);
   };
 
+  const activeOrderForTracking = orders.find(
+    (o) => o.delivery_status === 'on_the_way' || o.delivery_status === 'ready' || o.delivery_status === 'preparing',
+  );
+
+  useEffect(() => {
+    activeOrderIdRef.current = activeOrderForTracking?.id ?? null;
+    hasDeliveryRef.current = orders.some(
+      (o) => o.delivery_status === 'on_the_way' || o.delivery_status === 'ready',
+    );
+  }, [activeOrderForTracking?.id, orders]);
+
+  useEffect(() => {
+    const onInstall = (e: Event) => {
+      e.preventDefault();
+      setInstallPrompt(e);
+    };
+    window.addEventListener('beforeinstallprompt', onInstall);
+    return () => window.removeEventListener('beforeinstallprompt', onInstall);
+  }, []);
+
+  const openOrderDetail = useCallback((orderId: string) => {
+    if (!orderId) return;
+    setDetailOrderId(orderId);
+    setTab('active');
+    void loadOrders();
+  }, []);
+
+  const alertNewAssignment = (title: string, message: string, orderId?: string | null) => {
+    if (orderId) openOrderDetail(orderId);
+    if (soundEnabled) {
+      playCourierAssignmentAlert(title, message, orderId);
+    }
+  };
+
   const loadNotifications = async () => {
     const { data } = await supabase
       .from('courier_notifications')
@@ -197,70 +251,114 @@ function CourierDashboard({ courier, onLogout }: { courier: CourierData; onLogou
       .order('created_at', { ascending: false })
       .limit(30);
     if (data) {
-      if (prevNotifCount.current > 0 && data.length > prevNotifCount.current && soundEnabled) {
-        try {
-          if (!audioRef.current) {
-            audioRef.current = new Audio('/notification.mp3');
-          }
-          audioRef.current.currentTime = 0;
-          audioRef.current.play().catch(() => {});
-        } catch {}
+      const unread = data.filter((n: CourierNotification) => !n.is_read);
+      if (prevUnreadRef.current > 0 && unread.length > prevUnreadRef.current) {
+        const latest = unread[0];
+        alertNewAssignment(latest.title, latest.message);
+        setTab('notifications');
       }
-      prevNotifCount.current = data.length;
+      prevUnreadRef.current = unread.length;
       setNotifications(data as CourierNotification[]);
     }
   };
 
-  const updateLocation = () => {
-    if (!navigator.geolocation) return;
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        setLocationStatus('tracking');
-        await supabase.from('couriers').update({
-          latitude: pos.coords.latitude,
-          longitude: pos.coords.longitude,
-          location_updated_at: new Date().toISOString(),
-        }).eq('id', courier.id);
-      },
-      () => {
-        setLocationStatus('denied');
-      },
-      { enableHighAccuracy: true, timeout: 10000 }
-    );
-  };
-
-  const startLocationTracking = () => {
-    updateLocation();
-    locationIntervalRef.current = setInterval(updateLocation, 30000);
-  };
-
   useEffect(() => {
+    primeCourierAudio();
+    void requestCourierNotificationPermission();
     loadOrders();
     loadNotifications();
-    startLocationTracking();
-    pollIntervalRef.current = setInterval(loadOrders, 10000);
+    applyCourierPwaMeta();
+
+    const stopTracking = startCourierTracking(courier.id, courier.tenant_id, {
+      onStatus: setLocationStatus,
+      getActiveOrderId: () => activeOrderIdRef.current,
+      hasActiveDelivery: () => hasDeliveryRef.current,
+    });
+
+    const onVisBg = () => setBgHint(document.visibilityState === 'hidden');
+    document.addEventListener('visibilitychange', onVisBg);
+    onVisBg();
+
+    const stopOrdersPoll = startAdaptivePoller({
+      baseMs: 12_000,
+      idleMs: 25_000,
+      hiddenMs: 0,
+      run: loadOrders,
+      immediate: false,
+    });
+    const stopNotifPoll = startAdaptivePoller({
+      baseMs: 8_000,
+      idleMs: 20_000,
+      hiddenMs: 0,
+      run: loadNotifications,
+      immediate: false,
+    });
+
+    try {
+      const pending = sessionStorage.getItem('sefpos_courier_open_order');
+      if (pending) {
+        sessionStorage.removeItem('sefpos_courier_open_order');
+        openOrderDetail(pending);
+      }
+    } catch {
+      /* noop */
+    }
+
+    const onOpenOrder = (e: Event) => {
+      const id = (e as CustomEvent<{ orderId?: string }>).detail?.orderId;
+      if (id) openOrderDetail(id);
+    };
+    window.addEventListener(COURIER_OPEN_ORDER_EVENT, onOpenOrder);
+
+    const onBip = (e: Event) => {
+      const d = (e as CustomEvent).detail;
+      if (d?.title) alertNewAssignment(d.title, d.message || '', d.orderId);
+    };
+    window.addEventListener('sefpos:courier-alert', onBip);
 
     const ch = supabase
       .channel(`courier-${courier.id}`)
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'orders' }, (payload) => {
-        if (payload.new && payload.new.courier_id === courier.id) {
+        const n = payload.new as Record<string, unknown> | undefined;
+        const o = payload.old as Record<string, unknown> | undefined;
+        if (n?.courier_id === courier.id) {
+          if (o?.courier_id !== courier.id) {
+            const oid = String(n.id || '');
+            alertNewAssignment(
+              'Yeni paket',
+              `${n.order_number || 'Sipariş'} size atandı`,
+              oid,
+            );
+          }
           loadOrders();
         }
       })
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'courier_notifications', filter: `courier_id=eq.${courier.id}` }, (payload) => {
-        loadNotifications();
-        if (payload.new && payload.new.is_read === false) {
-          setTab('notifications');
+        const row = payload.new as CourierNotification;
+        if (row && !row.is_read) {
+          if (row.type === 'order_assigned' && row.order_id) {
+            alertNewAssignment(row.title, row.message, row.order_id);
+          } else {
+            alertNewAssignment(row.title, row.message, row.order_id);
+            setTab('notifications');
+          }
         }
+        void loadNotifications();
       })
       .subscribe();
 
     return () => {
+      window.removeEventListener('sefpos:courier-alert', onBip);
+      window.removeEventListener(COURIER_OPEN_ORDER_EVENT, onOpenOrder);
+      document.removeEventListener('visibilitychange', onVisBg);
+      stopTracking();
       supabase.removeChannel(ch);
-      if (locationIntervalRef.current) clearInterval(locationIntervalRef.current);
-      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+      stopOrdersPoll();
+      stopNotifPoll();
     };
-  }, [courier.id]);
+  }, [courier.id, courier.tenant_id, soundEnabled, openOrderDetail]);
+
+  const detailOrder = detailOrderId ? orders.find((o) => o.id === detailOrderId) : null;
 
   const markPickedUp = async (orderId: string, orderNumber: string) => {
     await supabase.from('orders').update({
@@ -293,6 +391,7 @@ function CourierDashboard({ courier, onLogout }: { courier: CourierData; onLogou
     await supabase.from('couriers').update({ status: 'available' }).eq('id', courier.id);
 
     await supabase.from('courier_notifications').insert({
+      tenant_id: courier.tenant_id,
       courier_id: courier.id,
       order_id: orderId,
       title: 'Teslimat Tamamlandı',
@@ -356,7 +455,13 @@ function CourierDashboard({ courier, onLogout }: { courier: CourierData; onLogou
           <div className="flex items-center gap-2">
             {locationStatus === 'denied' && (
               <button
-                onClick={startLocationTracking}
+                onClick={() => {
+                  navigator.geolocation.getCurrentPosition(
+                    () => setLocationStatus('tracking'),
+                    () => setLocationStatus('denied'),
+                    { enableHighAccuracy: true, maximumAge: 0 },
+                  );
+                }}
                 title="Konumu etkinleştir"
                 className="p-2 rounded-xl bg-red-400/30 hover:bg-red-400/50 transition"
               >
@@ -399,6 +504,38 @@ function CourierDashboard({ courier, onLogout }: { courier: CourierData; onLogou
           ))}
         </div>
       </div>
+
+      {bgHint && (
+        <div className="bg-blue-900 text-blue-100 px-4 py-2 text-center text-[11px] font-semibold max-w-lg mx-auto w-full">
+          Arka planda konum: uygulamayı kapatmayın. Ana ekrandan «Kurye» ile açın; mümkünse ekranı açık tutun (teslimat sırasında).
+        </div>
+      )}
+
+      {(showIosHint || installPrompt) && (
+        <div className="bg-amber-50 border-b border-amber-200 px-4 py-3 max-w-lg mx-auto w-full">
+          {showIosHint && (
+            <p className="text-xs text-amber-900 font-semibold leading-relaxed mb-2">
+              iPhone: Safari paylaş menüsünden <strong>Ana Ekrana Ekle</strong> seçin; bildirim ve ses böyle düzgün çalışır.
+            </p>
+          )}
+          {installPrompt && (
+            <button
+              type="button"
+              onClick={async () => {
+                await installPrompt.prompt();
+                setInstallPrompt(null);
+              }}
+              className="w-full flex items-center justify-center gap-2 py-2.5 bg-blue-600 text-white rounded-xl font-black text-sm"
+            >
+              <Download className="w-4 h-4" />
+              Ana ekrana ekle (uygulama gibi)
+            </button>
+          )}
+          <button type="button" onClick={() => { setShowIosHint(false); setInstallPrompt(null); }} className="w-full text-center text-[10px] text-slate-500 mt-2">
+            Kapat
+          </button>
+        </div>
+      )}
 
       <div className="flex-1 overflow-y-auto p-4 max-w-lg mx-auto w-full">
         {loading ? (
@@ -574,7 +711,11 @@ function CourierDashboard({ courier, onLogout }: { courier: CourierData; onLogou
               notifications.map(notif => (
                 <div
                   key={notif.id}
-                  onClick={() => markRead(notif.id)}
+                  onClick={() => {
+                    void markRead(notif.id);
+                    if (notif.order_id) openOrderDetail(notif.order_id);
+                    else setTab('notifications');
+                  }}
                   className={`bg-white rounded-2xl shadow-sm border-2 p-4 cursor-pointer transition active:scale-[0.98] ${notif.is_read ? 'border-slate-100 opacity-70' : 'border-blue-300'}`}
                 >
                   <div className="flex items-start gap-3">
@@ -600,6 +741,84 @@ function CourierDashboard({ courier, onLogout }: { courier: CourierData; onLogou
           </div>
         )}
       </div>
+
+      {detailOrder && (
+        <div className="fixed inset-0 z-[300] bg-slate-900/60 flex items-end sm:items-center justify-center p-0 sm:p-4">
+          <div className="bg-white w-full max-w-lg max-h-[92vh] overflow-y-auto rounded-t-3xl sm:rounded-3xl shadow-2xl">
+            <div className="sticky top-0 bg-gradient-to-r from-blue-600 to-blue-800 text-white px-4 py-4 flex items-center justify-between z-10">
+              <div>
+                <p className="text-xs text-blue-200 font-bold uppercase">Paket detayı</p>
+                <p className="font-black text-xl">{detailOrder.order_number}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDetailOrderId(null)}
+                className="p-2 rounded-xl bg-white/20 hover:bg-white/30"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-4 space-y-3">
+              {detailOrder.customer_name && (
+                <p className="font-bold text-lg text-slate-800">{detailOrder.customer_name}</p>
+              )}
+              {detailOrder.customer_phone && (
+                <a href={`tel:${detailOrder.customer_phone}`} className="flex items-center gap-2 text-blue-600 font-bold">
+                  <Phone className="w-5 h-5" />
+                  {detailOrder.customer_phone}
+                </a>
+              )}
+              {detailOrder.delivery_address && (
+                <div className="bg-orange-50 border-2 border-orange-300 rounded-2xl p-4">
+                  <p className="text-[10px] font-black text-orange-600 uppercase mb-1">Teslimat adresi</p>
+                  <p className="text-base font-bold text-slate-800 leading-snug">{detailOrder.delivery_address}</p>
+                  <a
+                    href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(detailOrder.delivery_address)}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mt-3 inline-flex items-center gap-2 px-4 py-2.5 bg-orange-500 text-white rounded-xl font-black text-sm"
+                  >
+                    <Navigation className="w-4 h-4" />
+                    Navigasyona git
+                  </a>
+                </div>
+              )}
+              {detailOrder.delivery_note && (
+                <p className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-xl p-3">
+                  Not: {detailOrder.delivery_note}
+                </p>
+              )}
+              <p className="text-2xl font-black text-slate-800">{detailOrder.total_amount.toFixed(2)} ₺</p>
+              {(detailOrder.delivery_status === 'pending' ||
+                detailOrder.delivery_status === 'preparing' ||
+                detailOrder.delivery_status === 'ready') && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    void markPickedUp(detailOrder.id, detailOrder.order_number);
+                    setDetailOrderId(null);
+                  }}
+                  className="w-full py-3.5 bg-orange-500 text-white rounded-xl font-black"
+                >
+                  Paketi Aldım
+                </button>
+              )}
+              {detailOrder.delivery_status === 'on_the_way' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    void markDelivered(detailOrder.id, detailOrder.order_number);
+                    setDetailOrderId(null);
+                  }}
+                  className="w-full py-3.5 bg-green-500 text-white rounded-xl font-black"
+                >
+                  Teslim Ettim
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -611,6 +830,25 @@ export function CourierApp({ onExit }: { onExit?: () => void }) {
     const saved = localStorage.getItem(COURIER_SESSION_KEY);
     return saved ? JSON.parse(saved) : null;
   });
+
+  useEffect(() => {
+    const link = document.querySelector('link[rel="manifest"]') as HTMLLinkElement | null;
+    const prev = link?.href;
+    if (link) link.href = './manifest-courier.json';
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', '#2563eb');
+    applyCourierPwaMeta();
+
+    const onInstall = (e: Event) => {
+      e.preventDefault();
+      (window as any).__courierPwaPrompt = e;
+    };
+    window.addEventListener('beforeinstallprompt', onInstall);
+
+    return () => {
+      if (link && prev) link.href = prev;
+      window.removeEventListener('beforeinstallprompt', onInstall);
+    };
+  }, []);
 
   const handleLogin = (c: CourierData) => {
     localStorage.setItem(COURIER_SESSION_KEY, JSON.stringify(c));

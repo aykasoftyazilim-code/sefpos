@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { CheckCircle2, Download, Sparkles, X, RefreshCcw, AlertTriangle } from 'lucide-react';
+import {
+  fetchPlatformReleasePolicy,
+  isMandatoryUpdateRequired,
+  type PlatformReleasePolicy,
+} from '../lib/releasePolicy';
 
 /**
  * Electron'da uygulamayı "gerçek bir masaüstü uygulaması" gibi hissettiren
@@ -31,10 +36,13 @@ type ProgressPayload = {
 
 type UpdateState =
   | { kind: 'idle' }
+  | { kind: 'checking' }
   | { kind: 'available'; version: string }
   | { kind: 'progress'; percent: number; version: string }
   | { kind: 'ready'; version: string; releaseNotes: string; releaseName: string }
   | { kind: 'error'; message: string };
+
+const RELEASE_PAGE_URL = 'https://www.sefpos.com.tr/download/setup';
 
 const RELEASE_NOTES_SEEN_KEY = 'sefpos_release_notes_seen_version';
 const PENDING_RELEASE_NOTES_KEY = 'sefpos_pending_release_notes';
@@ -65,6 +73,17 @@ export function ElectronDesktopShell() {
 
   // İlk açılışta gösterilecek "Yenilikler" modali (kurulumdan sonra ilk run).
   const [whatsNew, setWhatsNew] = useState<null | { version: string; notes: string }>(null);
+
+  const [currentVersion, setCurrentVersion] = useState('');
+  const [releasePolicy, setReleasePolicy] = useState<PlatformReleasePolicy | null>(null);
+  const mandatoryRequired =
+    !!currentVersion &&
+    !!releasePolicy &&
+    isMandatoryUpdateRequired(currentVersion, releasePolicy);
+  const mandatoryRef = useRef(mandatoryRequired);
+  useEffect(() => {
+    mandatoryRef.current = mandatoryRequired;
+  }, [mandatoryRequired]);
 
   // Kullanıcı oturumu açık mı? (Auth ekranı görünürken false sayılır.)
   const userLoggedIn = !!user;
@@ -147,7 +166,39 @@ export function ElectronDesktopShell() {
     };
   }, [isElectron]);
 
-  // Auto-update event aboneliği.
+  // Oturum açılınca güncelleme kontrolü (kasada login sonrası yeni sürümü erken yakala).
+  useEffect(() => {
+    if (!isElectron || !user?.id) return;
+    const api = (window as any).electronAPI;
+    void api?.checkForUpdates?.().catch(() => {});
+  }, [isElectron, user?.id]);
+
+  // Lisans panelinden zorunlu güncelleme politikası (periyodik yenile).
+  useEffect(() => {
+    if (!isElectron) return;
+    let cancelled = false;
+    const refresh = async () => {
+      const api = (window as any).electronAPI;
+      try {
+        const ver = String((await api?.getAppVersion?.()) || '');
+        const policy = await fetchPlatformReleasePolicy();
+        if (!cancelled) {
+          setCurrentVersion(ver);
+          setReleasePolicy(policy);
+        }
+      } catch {
+        /* */
+      }
+    };
+    void refresh();
+    const iv = setInterval(() => void refresh(), 5 * 60 * 1000);
+    return () => {
+      cancelled = true;
+      clearInterval(iv);
+    };
+  }, [isElectron]);
+
+  // Auto-update event aboneliği (zorunlu güncelleme kontrolü de burada — olay kaçırılmasın).
   useEffect(() => {
     if (!isElectron) return;
     const api = (window as any).electronAPI;
@@ -165,14 +216,14 @@ export function ElectronDesktopShell() {
         localStorage.setItem(PENDING_RELEASE_NOTES_KEY, releaseNotes);
       } catch {}
 
-      if (userLoggedInRef.current) {
+      if (userLoggedInRef.current && !mandatoryRef.current) {
         setConfirmReady({ version, releaseNotes, releaseName });
       } else {
         setTimeout(() => {
           try {
             api.installUpdate?.();
           } catch {}
-        }, 1200);
+        }, mandatoryRef.current ? 600 : 1200);
       }
     };
 
@@ -195,6 +246,14 @@ export function ElectronDesktopShell() {
       setToastDismissed(false);
       setUpdateState({ kind: 'error', message: String(info?.message || 'unknown') });
     });
+    api.onUpdateNotAvailable?.(() => {
+      if (!mandatoryRef.current) return;
+      setUpdateState({
+        kind: 'error',
+        message:
+          'Otomatik güncelleme şu an başlatılamadı. İnternet bağlantınızı kontrol edin veya aşağıdan kurulum dosyasını indirin.',
+      });
+    });
 
     void (async () => {
       try {
@@ -213,6 +272,22 @@ export function ElectronDesktopShell() {
       } catch {
         /* yoksay */
       }
+      if (mandatoryRef.current) {
+        setUpdateState((prev) =>
+          prev.kind === 'ready' || prev.kind === 'progress' ? prev : { kind: 'checking' },
+        );
+        try {
+          const res = await api.checkForUpdates?.();
+          if (res?.error) {
+            setUpdateState({ kind: 'error', message: String(res.error) });
+          }
+        } catch {
+          setUpdateState({
+            kind: 'error',
+            message: 'Güncelleme kontrol edilemedi. İnternet bağlantınızı kontrol edin.',
+          });
+        }
+      }
     })();
 
     return () => {
@@ -220,7 +295,7 @@ export function ElectronDesktopShell() {
         api.removeUpdateListeners?.();
       } catch (_) {}
     };
-  }, [isElectron]);
+  }, [isElectron, mandatoryRequired]);
 
   const dismissWhatsNew = () => {
     if (!whatsNew) return;
@@ -245,19 +320,96 @@ export function ElectronDesktopShell() {
   };
 
   const installLater = async () => {
+    if (mandatoryRequired) return;
     const api = (window as any).electronAPI;
     try {
       await api.clearUpdaterDownloadedPending?.();
     } catch (_) {}
-    // Kullanıcı "Sonra" dedi → modali kapat, toast'ta hatırlatma kalsın.
-    // electron-updater varsayılan olarak autoInstallOnAppQuit=true, kullanıcı
-    // uygulamayı kapatınca güncelleme otomatik kurulur.
     setConfirmReady(null);
   };
 
   return (
     <>
-      {confirmReady && (
+      {mandatoryRequired && (
+        <div
+          className="fixed inset-0 z-[2147483646] flex items-center justify-center p-4"
+          style={{ background: 'rgba(15, 23, 42, 0.72)', backdropFilter: 'blur(6px)' }}
+        >
+          <div className="bg-white rounded-2xl shadow-2xl border border-orange-200 w-full max-w-md overflow-hidden">
+            <div className="bg-gradient-to-br from-amber-500 to-orange-600 text-white p-5">
+              <div className="flex items-center gap-3">
+                <AlertTriangle className="w-8 h-8 shrink-0" strokeWidth={2.2} />
+                <div>
+                  <div className="text-lg font-extrabold">Zorunlu güncelleme</div>
+                  <div className="text-xs text-white/90">
+                    Mevcut sürüm {currentVersion || '—'} · Gerekli en az{' '}
+                    {releasePolicy?.min_required_version || '—'}
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="p-5 space-y-3 text-sm text-slate-700">
+              <p>
+                {releasePolicy?.message?.trim() ||
+                  'Bu sürüm artık desteklenmiyor. Devam etmek için güncellemeyi indirip kurmanız gerekiyor.'}
+              </p>
+              {(updateState.kind === 'checking' ||
+                updateState.kind === 'available' ||
+                updateState.kind === 'progress') && (
+                <p className="text-xs text-slate-500">
+                  {updateState.kind === 'checking'
+                    ? 'Güncelleme aranıyor…'
+                    : 'Güncelleme indiriliyor (~120 MB), lütfen bekleyin…'}
+                </p>
+              )}
+              {updateState.kind === 'progress' && (
+                <div className="h-2 w-full rounded-full bg-slate-100 overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-amber-400 to-orange-500 transition-all"
+                    style={{ width: `${updateState.percent}%` }}
+                  />
+                </div>
+              )}
+              {updateState.kind === 'ready' && (
+                <button
+                  type="button"
+                  onClick={installNow}
+                  className="w-full py-3 rounded-xl text-sm font-extrabold bg-gradient-to-r from-amber-500 to-orange-600 text-white shadow"
+                >
+                  Şimdi yükle ve yeniden başlat
+                </button>
+              )}
+              {updateState.kind === 'error' && (
+                <div className="space-y-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const api = (window as any).electronAPI;
+                      setUpdateState({ kind: 'checking' });
+                      void api?.checkForUpdates?.();
+                    }}
+                    className="w-full py-3 rounded-xl text-sm font-bold bg-slate-100 text-slate-800 hover:bg-slate-200 flex items-center justify-center gap-2"
+                  >
+                    <RefreshCcw className="w-4 h-4" /> Tekrar dene
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const api = (window as any).electronAPI;
+                      void api?.openExternalUrl?.(RELEASE_PAGE_URL);
+                    }}
+                    className="w-full py-3 rounded-xl text-sm font-bold bg-gradient-to-r from-amber-500 to-orange-600 text-white shadow"
+                  >
+                    Kurulum dosyasını indir
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmReady && !mandatoryRequired && (
         <div
           className="fixed inset-0 z-[2147483645] flex items-center justify-center p-4"
           style={{ background: 'rgba(15, 23, 42, 0.55)', backdropFilter: 'blur(4px)' }}
@@ -354,7 +506,7 @@ export function ElectronDesktopShell() {
 
       {!toastDismissed && updateState.kind !== 'idle' && (
         <div
-          className="fixed z-[60] right-3 md:right-5 bottom-12 md:bottom-14 max-w-[320px] rounded-xl border border-orange-300 bg-white/95 backdrop-blur shadow-2xl overflow-hidden"
+          className="fixed z-[99990] right-3 md:right-5 bottom-12 md:bottom-14 max-w-[320px] rounded-xl border border-orange-300 bg-white/95 backdrop-blur shadow-2xl overflow-hidden"
           style={{ fontFamily: 'inherit' }}
         >
           <div className="flex items-start gap-2 p-3">
@@ -415,17 +567,19 @@ export function ElectronDesktopShell() {
                     >
                       Şimdi yeniden başlat
                     </button>
-                    <button
-                      onClick={async () => {
-                        setToastDismissed(true);
-                        try {
-                          await (window as any).electronAPI?.clearUpdaterDownloadedPending?.();
-                        } catch (_) {}
-                      }}
-                      className="px-2 py-1.5 rounded-lg text-xs font-medium text-slate-500 hover:bg-slate-100"
-                    >
-                      Sonra
-                    </button>
+                    {!mandatoryRequired && (
+                      <button
+                        onClick={async () => {
+                          setToastDismissed(true);
+                          try {
+                            await (window as any).electronAPI?.clearUpdaterDownloadedPending?.();
+                          } catch (_) {}
+                        }}
+                        className="px-2 py-1.5 rounded-lg text-xs font-medium text-slate-500 hover:bg-slate-100"
+                      >
+                        Sonra
+                      </button>
+                    )}
                   </div>
                 </>
               )}

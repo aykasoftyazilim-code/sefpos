@@ -1,5 +1,6 @@
-import { supabase } from './supabase';
+import { getLoginLookupSupabase } from './supabase';
 import { phoneToAuthEmail } from './phoneAuthEmail';
+import { isVdsSelfHost } from './sqlDb';
 
 export type LoginIdentifierKind = 'email' | 'phone' | 'username';
 
@@ -40,6 +41,21 @@ export async function resolveLoginIdentifier(input: string): Promise<LoginIdenti
   const trimmed = input.trim();
   if (!trimmed) return { ok: false, reason: 'invalid', message: 'Kullanıcı bilgisi girin' };
 
+  if (isVdsSelfHost()) {
+    try {
+      const res = await fetch('/vds-api/resolve-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ input: trimmed }),
+        credentials: 'same-origin',
+      });
+      const json = (await res.json()) as LoginIdentifierResolve;
+      return json;
+    } catch {
+      return { ok: false, reason: 'invalid', message: 'Giriş sunucusuna ulaşılamadı' };
+    }
+  }
+
   // 1) E-posta
   if (trimmed.includes('@')) {
     if (!isPlausibleEmail(trimmed)) {
@@ -51,7 +67,7 @@ export async function resolveLoginIdentifier(input: string): Promise<LoginIdenti
   // 2) Telefon
   const phone = normalizePhone(trimmed);
   if (phone) {
-    const { data, error } = await supabase
+    const { data, error } = await getLoginLookupSupabase()
       .from('profiles')
       .select('email')
       .eq('phone', phone)
@@ -75,7 +91,7 @@ export async function resolveLoginIdentifier(input: string): Promise<LoginIdenti
 
   // Once gercek `username` kolonunu dene
   {
-    const { data, error } = await supabase
+    const { data, error } = await getLoginLookupSupabase()
       .from('profiles')
       .select('email')
       .eq('username', u)
@@ -91,7 +107,7 @@ export async function resolveLoginIdentifier(input: string): Promise<LoginIdenti
 
   // Geri uyumluluk: eski kayitlarda username bos olabilir; email pattern fallback
   {
-    const { data, error } = await supabase
+    const { data, error } = await getLoginLookupSupabase()
       .from('profiles')
       .select('email')
       .ilike('email', `${u}@%.shefpos.local`)

@@ -2,9 +2,11 @@ import { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { Plus, CreditCard as Edit2, Trash2, Search, Printer, Ban, Save, X, Download, Barcode, Upload, CheckCircle, AlertCircle, FileSpreadsheet, ArrowDownCircle, ArrowRightLeft, History, ChevronDown, MoreVertical, ClipboardList } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
-import { loadPrintSettings, savePrintSettings } from '../lib/printService';
+import { loadPrintSettings, savePrintSettings, assignCategoryToKitchenPrinter } from '../lib/printService';
 import { queryCache } from '../lib/queryCache';
+import { displayMetaText } from '../lib/displayText';
 import * as XLSX from 'xlsx';
+import { useCurrency } from '../lib/currency';
 
 /** Bu tenant’ta `branch_product_stocks` yok (404) — React StrictMode çift mount’ta tekrar GET atılmaz. */
 const tenantIdsWithoutBranchProductStocksTable = new Set<string>();
@@ -96,7 +98,7 @@ interface Category {
 
 interface Product {
   id: string;
-  category_id: string;
+  category_id: string | null;
   name: string;
   price: number;
   cost: number;
@@ -171,17 +173,22 @@ interface StockMovementRow {
   created_at: string;
 }
 
-export function Products() {
+export function Products({ isActive = true }: { isActive?: boolean }) {
   const { tenant, activeBranch, branches } = useAuth();
+  const { format: fmtMoney, formatInt: fmtInt, formatPrice: fmtPrice, symbol: currencySymbol } = useCurrency();
   const [categories, setCategories] = useState<Category[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
   const [search, setSearch] = useState('');
   const [showAddProduct, setShowAddProduct] = useState(false);
+  const [addProductSaving, setAddProductSaving] = useState(false);
+  const productReloadTimerRef = useRef<number | null>(null);
   const [showStockEntry, setShowStockEntry] = useState(false);
   const [showStockTransfer, setShowStockTransfer] = useState(false);
   const [showReceipt, setShowReceipt] = useState(false);
   const [showStockMovements, setShowStockMovements] = useState(false);
   const [showAddCategory, setShowAddCategory] = useState(false);
+  const [showQuickCategoryInProduct, setShowQuickCategoryInProduct] = useState(false);
+  const [addingCategory, setAddingCategory] = useState(false);
   const [productAdvancedOpen, setProductAdvancedOpen] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [editingProduct, setEditingProduct] = useState<string | null>(null);
@@ -291,7 +298,14 @@ export function Products() {
       });
       setCategoryPrinterMap(map);
       setDisabledCategoryIds(ps.disabledCategoryIds || []);
-      const configured = ps.printers.filter(p => p.printerName).map(p => ({ name: p.printerName, label: p.label || p.printerName }));
+      const configured = ps.printers
+        .filter(
+          (p) =>
+            p.printerName &&
+            p.enabled &&
+            (p.type === 'kitchen' || p.type === 'bar' || p.type === 'custom'),
+        )
+        .map((p) => ({ name: p.printerName, label: p.label || p.printerName }));
       setAvailablePrinters(configured);
 
       if ((window as any).electronAPI?.getPrinters) {
@@ -324,25 +338,16 @@ export function Products() {
   }, []);
 
   useEffect(() => {
+    if (!tenant) return;
     loadCategories();
     loadProducts();
-
-    if (!tenant) return;
-
-    const menuChannel = supabase
-      .channel(`products-menu-${tenant.id}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'categories', filter: `tenant_id=eq.${tenant.id}` }, () => {
-        loadCategories(true);
-      })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'products', filter: `tenant_id=eq.${tenant.id}` }, () => {
-        loadProducts(true);
-      })
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(menuChannel);
-    };
   }, [tenant]);
+
+  // Sekme/ekran tekrar açıldığında (ör. Hızlı Satış'tan yeni ürün) cache yenilensin
+  useEffect(() => {
+    if (!tenant || !isActive) return;
+    void loadProducts(true);
+  }, [isActive, tenant?.id]);
 
   useEffect(() => {
     loadBranchStocks();
@@ -383,6 +388,38 @@ export function Products() {
     const sortedProducts = ([...(prefetchedProducts || [])] as Product[]).sort((a, b) => a.name.localeCompare(b.name, 'tr'));
     setProducts(sortedProducts);
   };
+
+  const scheduleProductsRefresh = useCallback((forceRefresh = true, delayMs = 350) => {
+    if (!tenant) return;
+    if (productReloadTimerRef.current) window.clearTimeout(productReloadTimerRef.current);
+    productReloadTimerRef.current = window.setTimeout(() => {
+      productReloadTimerRef.current = null;
+      void loadProducts(forceRefresh);
+    }, delayMs);
+  }, [tenant?.id]);
+
+  useEffect(() => () => {
+    if (productReloadTimerRef.current) window.clearTimeout(productReloadTimerRef.current);
+  }, []);
+
+  // Realtime yalnızca ürünler ekranı açıkken — gün içinde biriken kanal yükünü keser
+  useEffect(() => {
+    if (!tenant || !isActive) return;
+
+    const menuChannel = supabase
+      .channel(`products-menu-${tenant.id}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'categories', filter: `tenant_id=eq.${tenant.id}` }, () => {
+        loadCategories(true);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'products', filter: `tenant_id=eq.${tenant.id}` }, () => {
+        scheduleProductsRefresh(true);
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(menuChannel);
+    };
+  }, [tenant, isActive, scheduleProductsRefresh]);
 
   const loadBranchStocks = async () => {
     if (!tenant || !activeBranch) {
@@ -689,34 +726,63 @@ export function Products() {
     setImportDone(true);
   };
 
-  const handleAddCategory = async () => {
-    if (!tenant || !newCategory.name) return;
+  const handleAddCategory = async (opts?: { assignToProduct?: boolean }) => {
+    const name = newCategory.name.trim();
+    if (!tenant || !name || addingCategory) return;
 
-    // Optimistic update
-    const tempId = crypto.randomUUID();
+    setAddingCategory(true);
+    const catId = crypto.randomUUID();
+    const sortOrder = categories.length;
     const optimisticCategory: Category = {
-      id: tempId,
-      name: newCategory.name,
+      id: catId,
+      name,
       color: newCategory.color,
-      sort_order: categories.length,
+      sort_order: sortOrder,
+      vat_rate: newCategory.vat_rate,
+      hugin_department_id: newCategory.hugin_department_id,
     };
     setCategories(prev => [...prev, optimisticCategory]);
 
-    const { error } = await supabase.from('categories').insert({
+    const catPayload: Record<string, unknown> = {
+      id: catId,
       tenant_id: tenant.id,
-      name: newCategory.name,
+      name,
       color: newCategory.color,
-      sort_order: categories.length,
-      vat_rate: newCategory.vat_rate,
-      hugin_department_id: newCategory.hugin_department_id,
-    });
+      sort_order: sortOrder,
+    };
+    if (newCategory.vat_rate != null) catPayload.vat_rate = newCategory.vat_rate;
+    if (newCategory.hugin_department_id != null) {
+      catPayload.hugin_department_id = newCategory.hugin_department_id;
+    }
+
+    const { data, error } = await supabase.from('categories').insert(catPayload).select().single();
 
     if (error) {
-      setCategories(prev => prev.filter(c => c.id !== tempId));
+      setCategories(prev => prev.filter(c => c.id !== catId));
+      alert('Kategori eklenemedi: ' + (error.message || String(error)));
+      setAddingCategory(false);
+      return;
+    }
+
+    const saved = (data || optimisticCategory) as Category;
+    setCategories(prev => prev.map(c => (c.id === catId ? { ...c, ...saved, id: saved.id || catId } : c)));
+    queryCache.invalidate('categories', tenant.id);
+    queryCache.invalidate('products', tenant.id);
+    void loadCategories(true);
+
+    if (opts?.assignToProduct) {
+      setNewProduct(prev => ({
+        ...prev,
+        category_id: saved.id || catId,
+        ...(saved.vat_rate != null ? { tax_rate: String(saved.vat_rate) } : {}),
+      }));
+      setShowQuickCategoryInProduct(false);
+    } else {
+      setShowAddCategory(false);
     }
 
     setNewCategory({ name: '', color: '#F97316', vat_rate: null, hugin_department_id: null });
-    setShowAddCategory(false);
+    setAddingCategory(false);
   };
 
   const handleAddVariant = () => {
@@ -748,61 +814,97 @@ export function Products() {
   };
 
   const handleAddProduct = async () => {
-    if (!tenant || !newProduct.name || !newProduct.category_id) return;
-
-    const { data: productData, error: productError } = await supabase
-      .from('products')
-      .insert({
-        tenant_id: tenant.id,
-        category_id: newProduct.category_id,
-        name: newProduct.name,
-        price: parseFloat(newProduct.price) || 0,
-        cost: parseFloat(newProduct.cost) || 0,
-        stock_quantity: parseFloat(newProduct.stock_quantity) || 0,
-        unit: newProduct.unit,
-        tax_rate: parseFloat(newProduct.tax_rate) || 20,
-        image_url: newProduct.image_url || null,
-        barcode: newProduct.barcode.trim() || null,
-        printer_name: newProduct.printer_name.trim() || null,
-        scale_enabled: newProduct.scale_enabled || false,
-        is_active: true,
-      })
-      .select()
-      .single();
-
-    if (productError) return;
-
-    if (productData && newProduct.variants.length > 0) {
-      await supabase.from('product_variants').insert(
-        newProduct.variants.map(v => ({
-          tenant_id: tenant.id,
-          product_id: productData.id,
-          name: v.name,
-          price_modifier: v.price_modifier,
-        }))
-      );
+    if (!tenant) return;
+    const name = newProduct.name.trim();
+    if (!name) {
+      alert('Ürün adı zorunlu');
+      return;
     }
+    if (addProductSaving) return;
 
-    await loadProducts(true);
-    setNewProduct({
-      name: '',
-      category_id: '',
-      price: '',
-      cost: '',
-      stock_quantity: '',
-      unit: 'adet',
-      tax_rate: '20',
-      image_url: '',
-      barcode: '',
-      plu_code: '',
-      scale_prefix: '27',
-      printer_name: '',
-      scale_enabled: false,
-      variants: [],
-    });
-    setVariantName('');
-    setVariantPrice('');
-    setShowAddProduct(false);
+    const categoryId = newProduct.category_id.trim() || null;
+    setAddProductSaving(true);
+
+    try {
+      const { data: productData, error: productError } = await supabase
+        .from('products')
+        .insert({
+          tenant_id: tenant.id,
+          category_id: categoryId,
+          name,
+          price: parseFloat(newProduct.price) || 0,
+          cost: parseFloat(newProduct.cost) || 0,
+          stock_quantity: parseFloat(newProduct.stock_quantity) || 0,
+          unit: newProduct.unit,
+          tax_rate: parseFloat(newProduct.tax_rate) || 20,
+          image_url: newProduct.image_url.trim() || null,
+          barcode: newProduct.barcode.trim() || null,
+          printer_name: newProduct.printer_name.trim() || null,
+          scale_enabled: newProduct.scale_enabled || false,
+          is_active: true,
+          is_available: true,
+        })
+        .select('id, name, price, cost, category_id, stock_quantity, unit, tax_rate, is_active, image_url, barcode, printer_name, scale_enabled')
+        .single();
+
+      if (productError || !productData) {
+        const msg = String((productError as any)?.message || productError || 'bilinmeyen hata');
+        if (/row-level security|permission|policy/i.test(msg)) {
+          alert('Ürün eklenemedi: yetkiniz yok. Yalnızca işletme sahibi veya yönetici ekleyebilir.');
+        } else {
+          alert('Ürün eklenemedi: ' + msg);
+        }
+        return;
+      }
+
+      if (newProduct.variants.length > 0) {
+        const { error: variantError } = await supabase.from('product_variants').insert(
+          newProduct.variants.map(v => ({
+            tenant_id: tenant.id,
+            product_id: productData.id,
+            name: v.name,
+            price_modifier: v.price_modifier,
+          }))
+        );
+        if (variantError) {
+          alert('Ürün eklendi ancak porsiyonlar kaydedilemedi: ' + (variantError.message || String(variantError)));
+        }
+      }
+
+      const saved = productData as Product;
+      setProducts((prev) => [...prev, saved].sort((a, b) => a.name.localeCompare(b.name, 'tr')));
+      if (!categoryId) setSelectedCategory('__none__');
+
+      queryCache.invalidate('products', tenant.id);
+      queryCache.invalidate('categories', tenant.id);
+      queryCache.invalidate('product_variants', tenant.id);
+      scheduleProductsRefresh(true, 800);
+
+      setNewProduct({
+        name: '',
+        category_id: '',
+        price: '',
+        cost: '',
+        stock_quantity: '',
+        unit: 'adet',
+        tax_rate: '20',
+        image_url: '',
+        barcode: '',
+        plu_code: '',
+        scale_prefix: '27',
+        printer_name: '',
+        scale_enabled: false,
+        variants: [],
+      });
+      setVariantName('');
+      setVariantPrice('');
+      setShowQuickCategoryInProduct(false);
+      setShowAddProduct(false);
+    } catch (e: any) {
+      alert('Ürün eklenemedi: ' + (e?.message || String(e)));
+    } finally {
+      setAddProductSaving(false);
+    }
   };
 
   const handleStockEntry = async () => {
@@ -1010,7 +1112,7 @@ export function Products() {
     await supabase
       .from('products')
       .update({
-        category_id: editForm.category_id,
+        category_id: editForm.category_id?.trim() ? editForm.category_id : null,
         name: editForm.name,
         price: editForm.price,
         cost: editForm.cost,
@@ -1079,50 +1181,39 @@ export function Products() {
   };
 
   const saveCategoryPrinter = (categoryId: string, printerName: string) => {
-    const newMap = { ...categoryPrinterMap };
-    if (printerName) {
-      newMap[categoryId] = printerName;
+    let ps = loadPrintSettings();
+    if (!printerName) {
+      ps = assignCategoryToKitchenPrinter(ps, categoryId, -1);
     } else {
-      delete newMap[categoryId];
-    }
-    setCategoryPrinterMap(newMap);
-
-    const ps = loadPrintSettings();
-    // Önce kategori ID'sini TÜM yazıcılardan temizle (deterministik:
-    // bir kategori en fazla bir yazıcıda eşleşsin).
-    const cleanedPrinters = ps.printers.map(p => ({
-      ...p,
-      categoryIds: p.categoryIds.filter(cid => cid !== categoryId),
-    }));
-
-    let updatedPrinters = cleanedPrinters;
-    if (printerName) {
-      const targetIdx = cleanedPrinters.findIndex(p => p.printerName === printerName);
-      if (targetIdx >= 0) {
-        // Yazıcı zaten config'de — kategoriyi ekle ve enabled olduğundan emin ol.
-        updatedPrinters = cleanedPrinters.map((p, i) =>
-          i === targetIdx
-            ? { ...p, enabled: true, categoryIds: [...p.categoryIds, categoryId] }
-            : p,
-        );
-      } else {
-        // Yazıcı henüz Ayarlar > Yazıcılar'da kayıtlı değil. Otomatik olarak
-        // kitchen tipli yeni bir satır ekle ki esleme gerçekten çalışsın
-        // (aksi halde printKitchenReceipts catch-all veya defaultKitchenPrinter'a düşer).
-        const found = availablePrinters.find(p => p.name === printerName);
-        updatedPrinters = [
-          ...cleanedPrinters,
-          {
-            printerName,
-            label: found?.label || printerName,
-            type: 'kitchen' as const,
-            categoryIds: [categoryId],
-            enabled: true,
-          },
-        ];
+      let targetIdx = ps.printers.findIndex((p) => p.printerName === printerName);
+      if (targetIdx < 0) {
+        const found = availablePrinters.find((p) => p.name === printerName);
+        ps = {
+          ...ps,
+          printers: [
+            ...ps.printers,
+            {
+              printerName,
+              label: found?.label || printerName,
+              type: 'kitchen' as const,
+              categoryIds: [],
+              enabled: true,
+            },
+          ],
+        };
+        targetIdx = ps.printers.length - 1;
       }
+      ps = assignCategoryToKitchenPrinter(ps, categoryId, targetIdx);
     }
-    savePrintSettings({ ...ps, printers: updatedPrinters });
+    savePrintSettings(ps);
+
+    const map: Record<string, string> = {};
+    ps.printers.forEach((p) => {
+      p.categoryIds.forEach((cid) => {
+        if (!map[cid]) map[cid] = p.printerName;
+      });
+    });
+    setCategoryPrinterMap(map);
     setShowCategoryPrinter(null);
   };
 
@@ -1137,11 +1228,19 @@ export function Products() {
 
   const searchLower = useMemo(() => search.toLowerCase(), [search]);
   const filteredProducts = useMemo(() =>
-    products.filter(p =>
-      (selectedCategory === 'all' || p.category_id === selectedCategory) &&
-      (searchLower === '' || p.name.toLowerCase().includes(searchLower))
-    ),
+    products.filter(p => {
+      const matchesSearch = searchLower === '' || p.name.toLowerCase().includes(searchLower);
+      if (!matchesSearch) return false;
+      if (searchLower !== '') return true;
+      return selectedCategory === 'all'
+        || (selectedCategory === '__none__' && !p.category_id)
+        || p.category_id === selectedCategory;
+    }),
     [products, selectedCategory, searchLower]
+  );
+  const uncategorizedCount = useMemo(
+    () => products.filter((p) => !p.category_id).length,
+    [products],
   );
 
   const goToProductStockCount = useCallback(() => {
@@ -1281,6 +1380,18 @@ export function Products() {
           >
             Tümü
           </button>
+          {uncategorizedCount > 0 && (
+            <button
+              onClick={() => setSelectedCategory('__none__')}
+              className={`flex-shrink-0 px-4 py-2 md:px-6 md:py-3 rounded-lg md:rounded-xl font-medium whitespace-nowrap transition-all text-sm md:text-base ${
+                selectedCategory === '__none__'
+                  ? 'bg-gradient-to-r from-slate-600 to-slate-700 text-white shadow-lg'
+                  : 'bg-white text-slate-600 hover:shadow-md'
+              }`}
+            >
+              Kategorisiz ({uncategorizedCount})
+            </button>
+          )}
           {categories.map(cat => (
             <div key={cat.id} className="flex-shrink-0 group relative">
               {editingCategory === cat.id && editCategoryForm ? (
@@ -1425,7 +1536,7 @@ export function Products() {
                                   onClick={() => saveCategoryPrinter(cat.id, '')}
                                   className={`w-full text-left px-2 py-1.5 rounded-lg text-xs transition flex items-center gap-1.5 ${!categoryPrinterMap[cat.id] ? 'bg-orange-50 text-orange-700 font-bold' : 'hover:bg-slate-50 text-slate-600'}`}
                                 >
-                                  <Printer size={10} /> Tüm yazıcılara gönder
+                                  <Printer size={10} /> Yazıcı yok (basılmaz)
                                 </button>
                                 {availablePrinters.map(p => (
                                   <button
@@ -1468,10 +1579,11 @@ export function Products() {
                     />
                     <div className="grid grid-cols-2 gap-3">
                       <select
-                        value={editForm.category_id}
+                        value={editForm.category_id || ''}
                         onChange={(e) => setEditForm({ ...editForm, category_id: e.target.value })}
                         className="px-3 py-2 border-2 border-slate-200 rounded-lg focus:border-blue-500 focus:outline-none"
                       >
+                        <option value="">Kategorisiz</option>
                         {categories.map(cat => (
                           <option key={cat.id} value={cat.id}>{cat.name}</option>
                         ))}
@@ -1626,7 +1738,7 @@ export function Products() {
                         <div className="flex flex-wrap gap-2">
                           {editForm.variants.map((v: ProductVariant, i: number) => (
                             <div key={i} className="inline-flex items-center gap-2 bg-slate-100 px-3 py-1 rounded-lg text-sm">
-                              <span>{v.name}: {v.price_modifier > 0 ? '+' : ''}{v.price_modifier}₺</span>
+                              <span>{v.name}: {v.price_modifier > 0 ? '+' : ''}{fmtMoney(v.price_modifier)}</span>
                               <button
                                 onClick={() => setEditForm({
                                   ...editForm,
@@ -1670,7 +1782,7 @@ export function Products() {
                             className="inline-block px-2 py-0.5 rounded text-xs font-medium text-white mt-1"
                             style={{ backgroundColor: category?.color }}
                           >
-                            {category?.name}
+                            {displayMetaText(category?.name) || 'Kategorisiz'}
                           </span>
                         </div>
                         <div className="flex gap-1 ml-2">
@@ -1698,7 +1810,7 @@ export function Products() {
                       <div className="grid grid-cols-3 gap-2 text-xs">
                         <div className="bg-green-50 p-2 rounded">
                           <div className="text-slate-500">Fiyat</div>
-                          <div className="font-bold text-green-600">{product.price.toFixed(0)} ₺</div>
+                          <div className="font-bold text-green-600">{fmtPrice(product.price)}</div>
                         </div>
                         <div className="bg-slate-50 p-2 rounded">
                           <div className="text-slate-500">Stok</div>
@@ -1730,7 +1842,7 @@ export function Products() {
                               className="inline-block px-2 py-0.5 rounded text-xs font-medium text-white"
                               style={{ backgroundColor: category?.color }}
                             >
-                              {category?.name}
+                              {displayMetaText(category?.name) || 'Kategorisiz'}
                             </span>
                             {product.barcode && (
                               <span className="inline-block px-2 py-0.5 rounded text-xs font-mono bg-slate-100 text-slate-600">
@@ -1750,11 +1862,11 @@ export function Products() {
                         </div>
                         <div className="text-center">
                           <div className="text-xs text-slate-500">Fiyat</div>
-                          <div className="font-bold text-green-600 text-base">{safeMoney(product.price).toFixed(2)} ₺</div>
+                          <div className="font-bold text-green-600 text-base">{fmtMoney(safeMoney(product.price))}</div>
                         </div>
                         <div className="text-center">
                           <div className="text-xs text-slate-500">Maliyet</div>
-                          <div className="font-medium text-slate-700 text-base">{safeMoney(product.cost).toFixed(2)} ₺</div>
+                          <div className="font-medium text-slate-700 text-base">{fmtMoney(safeMoney(product.cost))}</div>
                         </div>
                         <div className="text-center">
                           <div className="text-xs text-slate-500">Stok</div>
@@ -1908,7 +2020,10 @@ export function Products() {
             <div className="flex items-center justify-between px-5 sm:px-7 py-3 sm:py-4 border-b border-slate-200 shrink-0">
               <h2 className="text-lg sm:text-2xl font-bold">Yeni Ürün</h2>
               <button
-                onClick={() => setShowAddProduct(false)}
+                onClick={() => {
+                  setShowAddProduct(false);
+                  setShowQuickCategoryInProduct(false);
+                }}
                 className="p-2 rounded-lg hover:bg-slate-100 text-slate-500"
                 aria-label="Kapat"
               >
@@ -1924,34 +2039,107 @@ export function Products() {
                   onChange={(e) => setNewProduct({ ...newProduct, name: e.target.value })}
                   className="md:col-span-2 w-full px-3 py-2.5 border-2 border-slate-200 rounded-xl focus:border-blue-500 focus:outline-none text-base"
                 />
-                <select
-                  value={newProduct.category_id}
-                  onChange={(e) => {
-                    const catId = e.target.value;
-                    const cat = categories.find(c => c.id === catId);
-                    const updates: Partial<typeof newProduct> = { category_id: catId };
-                    if (cat && cat.vat_rate != null) {
-                      updates.tax_rate = String(cat.vat_rate);
-                    }
-                    setNewProduct(prev => ({ ...prev, ...updates }));
-                  }}
-                  className="md:col-span-2 w-full px-3 py-2.5 border-2 border-slate-200 rounded-xl focus:border-blue-500 focus:outline-none text-base"
-                >
-                  <option value="">Kategori Seçin</option>
-                  {categories.map(cat => (
-                    <option key={cat.id} value={cat.id}>{cat.name}{cat.vat_rate != null ? ` (KDV %${cat.vat_rate})` : ''}</option>
-                  ))}
-                </select>
+                <div className="md:col-span-2 space-y-2">
+                  <div className="flex gap-2">
+                    <select
+                      value={newProduct.category_id}
+                      onChange={(e) => {
+                        const catId = e.target.value;
+                        const cat = categories.find(c => c.id === catId);
+                        const updates: Partial<typeof newProduct> = { category_id: catId };
+                        if (cat && cat.vat_rate != null) {
+                          updates.tax_rate = String(cat.vat_rate);
+                        }
+                        setNewProduct(prev => ({ ...prev, ...updates }));
+                      }}
+                      className="flex-1 min-w-0 w-full px-3 py-2.5 border-2 border-slate-200 rounded-xl focus:border-blue-500 focus:outline-none text-base"
+                    >
+                      <option value="">Kategorisiz (isteğe bağlı)</option>
+                      {categories.map(cat => (
+                        <option key={cat.id} value={cat.id}>{cat.name}{cat.vat_rate != null ? ` (KDV %${cat.vat_rate})` : ''}</option>
+                      ))}
+                    </select>
+                    <button
+                      type="button"
+                      onClick={() => setShowQuickCategoryInProduct(v => !v)}
+                      className={`shrink-0 px-3 py-2.5 rounded-xl border-2 font-semibold text-sm transition-all flex items-center gap-1 ${
+                        showQuickCategoryInProduct
+                          ? 'bg-blue-600 border-blue-600 text-white'
+                          : 'bg-white border-slate-200 text-slate-700 hover:border-blue-400 hover:text-blue-700'
+                      }`}
+                      title="Yeni kategori ekle"
+                      aria-label="Yeni kategori ekle"
+                    >
+                      <Plus size={18} />
+                      <span className="hidden sm:inline">Kategori</span>
+                    </button>
+                  </div>
+                  {showQuickCategoryInProduct && (
+                    <div className="rounded-xl border-2 border-blue-100 bg-slate-50 p-3 space-y-2.5">
+                      <p className="text-xs font-semibold text-slate-600">Yeni kategori (ürün ekranından)</p>
+                      <input
+                        type="text"
+                        placeholder="Kategori adı"
+                        value={newCategory.name}
+                        onChange={(e) => setNewCategory({ ...newCategory, name: e.target.value })}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            void handleAddCategory({ assignToProduct: true });
+                          }
+                        }}
+                        className="w-full px-3 py-2.5 border-2 border-slate-200 rounded-xl focus:border-blue-500 focus:outline-none text-base bg-white"
+                        autoFocus
+                      />
+                      <div className="flex flex-wrap gap-1.5">
+                        {['#F97316', '#EF4444', '#F59E0B', '#10B981', '#3B82F6', '#8B5CF6', '#EC4899', '#64748B'].map(color => (
+                          <button
+                            key={color}
+                            type="button"
+                            onClick={() => setNewCategory({ ...newCategory, color })}
+                            className="w-7 h-7 rounded-md border-2 transition-transform"
+                            style={{
+                              backgroundColor: color,
+                              borderColor: newCategory.color === color ? '#0f172a' : 'transparent',
+                              transform: newCategory.color === color ? 'scale(1.1)' : 'scale(1)',
+                            }}
+                            aria-label={`Renk ${color}`}
+                          />
+                        ))}
+                      </div>
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowQuickCategoryInProduct(false);
+                            setNewCategory({ name: '', color: '#F97316', vat_rate: null, hugin_department_id: null });
+                          }}
+                          className="flex-1 px-3 py-2 rounded-xl bg-slate-200 text-slate-700 text-sm font-semibold hover:bg-slate-300"
+                        >
+                          İptal
+                        </button>
+                        <button
+                          type="button"
+                          disabled={addingCategory || !newCategory.name.trim()}
+                          onClick={() => void handleAddCategory({ assignToProduct: true })}
+                          className="flex-1 px-3 py-2 rounded-xl bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                        >
+                          {addingCategory ? 'Ekleniyor…' : 'Ekle ve seç'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
                 <input
                   type="number"
-                  placeholder="Fiyat (₺)"
+                  placeholder={`Fiyat (${currencySymbol})`}
                   value={newProduct.price}
                   onChange={(e) => setNewProduct({ ...newProduct, price: e.target.value })}
                   className="px-3 py-2.5 border-2 border-slate-200 rounded-xl focus:border-blue-500 focus:outline-none text-base"
                 />
                 <input
                   type="number"
-                  placeholder="Maliyet (₺)"
+                  placeholder={`Maliyet (${currencySymbol})`}
                   value={newProduct.cost}
                   onChange={(e) => setNewProduct({ ...newProduct, cost: e.target.value })}
                   className="px-3 py-2.5 border-2 border-slate-200 rounded-xl focus:border-blue-500 focus:outline-none text-base"
@@ -2095,7 +2283,7 @@ export function Products() {
                   <div className="border-2 border-slate-200 rounded-xl p-3">
                     <h3 className="font-semibold text-sm text-slate-700 mb-2">Porsiyon Seçenekleri</h3>
                     {newProduct.price && (
-                      <p className="text-xs text-slate-500 mb-2">Ana fiyat: <span className="font-semibold text-slate-700">{parseFloat(newProduct.price).toFixed(2)} ₺</span></p>
+                      <p className="text-xs text-slate-500 mb-2">Ana fiyat: <span className="font-semibold text-slate-700">{fmtMoney(parseFloat(newProduct.price) || 0)}</span></p>
                     )}
                     <div className="flex gap-2 mb-2">
                       <button
@@ -2135,7 +2323,7 @@ export function Products() {
                         <input
                           type="number"
                           step="0.01"
-                          placeholder="Fark (₺)"
+                          placeholder={`Fark (${currencySymbol})`}
                           value={variantPrice}
                           onChange={(e) => setVariantPrice(e.target.value)}
                           className="w-24 px-2 py-2 border-2 border-slate-200 rounded-lg focus:border-blue-500 focus:outline-none text-sm"
@@ -2170,8 +2358,8 @@ export function Products() {
                               <span className="font-medium text-slate-700 text-sm">{variant.name}</span>
                               <div className="flex items-center gap-2">
                                 <div className="text-right">
-                                  <div className="text-[10px] text-slate-500">{variant.price_modifier > 0 ? '+' : ''}{variant.price_modifier.toFixed(2)} ₺ fark</div>
-                                  <div className="text-green-600 font-bold text-xs">{finalPrice.toFixed(2)} ₺</div>
+                                  <div className="text-[10px] text-slate-500">{variant.price_modifier > 0 ? '+' : ''}{fmtMoney(variant.price_modifier)} fark</div>
+                                  <div className="text-green-600 font-bold text-xs">{fmtMoney(finalPrice)}</div>
                                 </div>
                                 <button
                                   onClick={() => handleRemoveVariant(index)}
@@ -2192,16 +2380,23 @@ export function Products() {
 
             <div className="px-5 sm:px-7 py-3 border-t border-slate-200 bg-white shrink-0 flex flex-col-reverse sm:flex-row gap-2 sm:gap-3">
               <button
-                onClick={() => setShowAddProduct(false)}
-                className="flex-1 px-6 py-3 bg-slate-200 text-slate-700 rounded-xl hover:bg-slate-300 transition-all"
+                type="button"
+                disabled={addProductSaving}
+                onClick={() => {
+                  setShowAddProduct(false);
+                  setShowQuickCategoryInProduct(false);
+                }}
+                className="flex-1 px-6 py-3 bg-slate-200 text-slate-700 rounded-xl hover:bg-slate-300 transition-all disabled:opacity-50"
               >
                 İptal
               </button>
               <button
-                onClick={handleAddProduct}
-                className="flex-1 px-6 py-3 bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-xl hover:shadow-lg transition-all"
+                type="button"
+                disabled={addProductSaving || !newProduct.name.trim()}
+                onClick={() => void handleAddProduct()}
+                className="flex-1 px-6 py-3 bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-xl hover:shadow-lg transition-all disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                Ekle
+                {addProductSaving ? 'Kaydediliyor…' : 'Ekle'}
               </button>
             </div>
           </div>
@@ -2769,8 +2964,8 @@ export function Products() {
                         <div className="flex-1 min-w-0">
                           <div className="font-medium text-slate-800 truncate">{row.name}</div>
                           <div className="text-xs text-slate-500 mt-0.5">
-                            {row.price.toFixed(2)} ₺
-                            {row.cost > 0 && ` · Maliyet: ${row.cost.toFixed(2)} ₺`}
+                            {fmtMoney(row.price)}
+                            {row.cost > 0 && ` · Maliyet: ${fmtMoney(row.cost)}`}
                             {row.unit && ` · ${row.unit}`}
                             {row.barcode && ` · ${row.barcode}`}
                           </div>

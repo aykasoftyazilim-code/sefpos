@@ -8,6 +8,7 @@
 //   const res = await callGetir({ platformId, action: 'pos-status-set', status: 100 });
 
 import { supabase } from './supabase';
+import { isSqlServerMode, isVdsSelfHost } from './sqlDb';
 import {
   GETIR_NUMERIC_STATUS_MAP,
   INTERNAL_UNKNOWN_STATUS,
@@ -30,6 +31,8 @@ export interface GetirActionPayload {
     | 'handover'
     | 'deliver'
     | 'cancel'
+    | 'store-status-sync'
+    | 'restaurant-status-get'
     | 'restaurant-status-open'
     | 'restaurant-status-close'
     | 'restaurant-busy'
@@ -56,6 +59,9 @@ export interface GetirActionResult {
   data?: unknown;
   fetched?: number;
   saved?: number;
+  newCount?: number;
+  storeClosed?: boolean;
+  restaurantOpen?: boolean;
   expiresAt?: string;
   isFirstTime?: boolean;
   /**
@@ -81,6 +87,21 @@ export interface GetirActionResult {
 
 /** Ayni anda birden fazla getir-api istegi 429 uretir; sirayla gonder. */
 let getirApiChain: Promise<unknown> = Promise.resolve();
+
+/** Edge 429 sonrasi tum Getir cagrilarini gecici durdurur (burst onleme). */
+let getirCooldownUntil = 0;
+
+export function isGetirRateLimited(): boolean {
+  return Date.now() < getirCooldownUntil;
+}
+
+export function getGetirRateLimitedRemainingMs(): number {
+  return Math.max(0, getirCooldownUntil - Date.now());
+}
+
+export function markGetirRateLimited(cooldownMs = 90_000): void {
+  getirCooldownUntil = Math.max(getirCooldownUntil, Date.now() + cooldownMs);
+}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -120,6 +141,64 @@ async function ensureFreshSession(): Promise<{ access_token: string } | null> {
  */
 export async function callGetir(payload: GetirActionPayload): Promise<GetirActionResult> {
   const run = async (): Promise<GetirActionResult> => {
+    if (isVdsSelfHost() || isSqlServerMode()) {
+      const api = (window as any).electronAPI;
+      if (api?.sqlGetirCall) {
+        try {
+          const res = await api.sqlGetirCall(payload);
+          return {
+            ok: !!res?.ok,
+            status: res?.status,
+            error: res?.error,
+            data: res?.data,
+            fetched: res?.fetched,
+            saved: res?.saved,
+            newCount: res?.newCount,
+            storeClosed: res?.storeClosed,
+            restaurantOpen: res?.restaurantOpen,
+          };
+        } catch (e: any) {
+          return { ok: false, error: e?.message || 'SQL Getir hatasi' };
+        }
+      }
+      if (isVdsSelfHost()) {
+        try {
+          const { data: sess } = await supabase.auth.getSession();
+          const token = sess?.session?.access_token;
+          const resp = await fetch('/vds-api/fn/getir-api', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+            body: JSON.stringify(payload),
+            credentials: 'same-origin',
+          });
+          const data = await resp.json().catch(() => ({}));
+          return {
+            ok: !!data?.ok,
+            status: data?.status ?? resp.status,
+            error: data?.error,
+            data: data?.data,
+            fetched: data?.fetched,
+            saved: data?.saved,
+            newCount: data?.newCount,
+          };
+        } catch (e: any) {
+          return { ok: false, error: e?.message || 'VDS Getir hatasi' };
+        }
+      }
+      return { ok: false, error: 'SQL Getir koprusu bulunamadi (Electron gerekli)' };
+    }
+
+    if (isGetirRateLimited()) {
+      const sec = Math.ceil(getGetirRateLimitedRemainingMs() / 1000);
+      return {
+        ok: false,
+        status: 429,
+        error: `Getir senkronu gecici durdu (${sec} sn). Cok sik istek atildi.`,
+      };
+    }
     try {
       let session = await ensureFreshSession();
       if (!session) return { ok: false, error: 'Oturum bulunamadi' };
@@ -132,11 +211,11 @@ export async function callGetir(payload: GetirActionPayload): Promise<GetirActio
         'apikey': (import.meta.env.VITE_SUPABASE_ANON_KEY as string) || '',
       });
 
-      const maxAttempts = 5;
+      const maxAttempts = 3;
       let triedRefreshOn401 = false;
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         if (attempt > 0) {
-          const backoff = Math.min(12_000, 900 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 400);
+          const backoff = Math.min(20_000, 2_000 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 500);
           await sleep(backoff);
         }
 
@@ -156,8 +235,9 @@ export async function callGetir(payload: GetirActionPayload): Promise<GetirActio
           return { ok: false, status: resp.status, error: raw || `HTTP ${resp.status}` };
         }
 
-        if (resp.status === 429 && attempt < maxAttempts - 1) {
-          continue;
+        if (resp.status === 429) {
+          markGetirRateLimited(90_000);
+          if (attempt < maxAttempts - 1) continue;
         }
 
         // 401 → bir kez session zorla refresh + tekrar dene (stale JWT senaryosu)
@@ -210,6 +290,7 @@ export async function callGetir(payload: GetirActionPayload): Promise<GetirActio
         }
         return { ok: resp.ok, status: resp.status, data, error: resp.ok ? undefined : `HTTP ${resp.status}` };
       }
+      markGetirRateLimited(90_000);
       return { ok: false, status: 429, error: 'Getir sunucusu meşgul (429). Bir süre sonra tekrar deneyin.' };
     } catch (err: any) {
       return { ok: false, error: err?.message || 'getir-api beklenmedik hata' };
@@ -436,6 +517,64 @@ export function getGetirUiPhase(order: {
   }
   if (order.status === 'arrived') return 'arrived_info';
   return 'verify';
+}
+
+/**
+ * Getir müşteri uygulamasında restoranı aç/kapat (Getir paneline gerek yok).
+ * Açarken isteğe bağlı POS entegrasyonunu da açar (sipariş alımı için).
+ */
+/** Getir'den POS + restoran açık/kapalı durumunu çekip DB'yi günceller. */
+export async function syncGetirStoreStatusFromApi(platformId: string): Promise<{
+  ok: boolean;
+  posStatus?: number;
+  restaurantOpen?: boolean | null;
+  error?: string;
+}> {
+  const res = await callGetir({ platformId, action: 'store-status-sync' });
+  if (!res.ok) {
+    return { ok: false, error: res.error || 'store-status-sync başarısız' };
+  }
+  const root =
+    res.data && typeof res.data === 'object' ? (res.data as Record<string, unknown>) : {};
+  const posRaw = root.posStatus;
+  const posStatus = posRaw != null ? Number(posRaw) : undefined;
+  const openRaw = root.restaurantOpen;
+  const restaurantOpen =
+    typeof openRaw === 'boolean' ? openRaw : openRaw == null ? null : Boolean(openRaw);
+  return {
+    ok: true,
+    posStatus: Number.isFinite(posStatus) ? posStatus : undefined,
+    restaurantOpen,
+  };
+}
+
+/** @deprecated syncGetirStoreStatusFromApi kullanın */
+export const syncGetirPosStatusFromApi = syncGetirStoreStatusFromApi;
+
+export async function syncGetirRestaurantOpen(
+  platformId: string,
+  open: boolean,
+  opts?: { timeOffAmount?: 15 | 30 | 45; openPosToo?: boolean },
+): Promise<GetirActionResult> {
+  const action = open ? 'restaurant-status-open' : 'restaurant-status-close';
+  const res = await callGetir({
+    platformId,
+    action,
+    ...(open ? {} : { timeOffAmount: opts?.timeOffAmount ?? 15 }),
+  });
+  if (!res.ok) return res;
+
+  if (open && opts?.openPosToo !== false) {
+    const pos = await callGetir({ platformId, action: 'pos-status-set', status: 100 });
+    if (!pos.ok) {
+      return {
+        ok: true,
+        data: res.data,
+        error: `Restoran Getir'de açıldı ancak POS açılamadı: ${pos.error || 'bilinmeyen hata'}`,
+      };
+    }
+  }
+  return res;
 }
 
 /** Random 32 karakterli x-api-key uretici. */

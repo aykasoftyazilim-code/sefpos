@@ -12,15 +12,20 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;600;700;800;900&display=swap" rel="stylesheet" />
-    <link rel="dns-prefetch" href="https://xdfnozfuuzctubijbnds.supabase.co" />
-    <link rel="preconnect" href="https://xdfnozfuuzctubijbnds.supabase.co" crossorigin />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
     <meta name="theme-color" content="#f97316" />
     <link rel="manifest" href="./manifest.json" />
-    <title>Sefpos - Restoran Yonetim Sistemi</title>
-    <meta property="og:image" content="https://bolt.new/static/og_default.png" />
+    <title>ŞefPOS — Restoran POS, Online Sipariş & Paket Servis</title>
+    <meta name="description" content="ŞefPOS: masa, paket servis, Caller ID, Getir, Yemeksepeti, Trendyol, Migros entegrasyonları ve kurye yönetimi. Türkiye'nin modern restoran POS çözümü." />
+    <meta property="og:title" content="ŞefPOS — Restoran Yönetim Sistemi" />
+    <meta property="og:description" content="Tüm online platformlar tek panelde. Ücretsiz deneyin." />
+    <meta property="og:image" content="https://www.sefpos.com.tr/logo256.png" />
+    <meta property="og:url" content="https://www.sefpos.com.tr/" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:image" content="https://bolt.new/static/og_default.png" />
+    <meta name="twitter:image" content="https://www.sefpos.com.tr/logo256.png" />
+    <link rel="sitemap" type="application/xml" title="Sitemap" href="https://www.sefpos.com.tr/sitemap.xml" />
+    <!-- CSS main.tsx'ten değil: Vite HMR'da index.css değişince tüm bileşen grafiği yenilenmesin -->
+    <link rel="stylesheet" href="/src/index.css" />
   </head>
   <body style="margin:0;background-color:#ffffff;">
     <!-- Inline boot splash: React/Tailwind yuklenene kadar bos beyaz ekran yerine
@@ -37,11 +42,16 @@
         background: #ffffff;
         color: #0f172a;
         font-family: 'Inter', 'Segoe UI', Arial, sans-serif;
-        transition: opacity .35s ease;
+        transition: opacity .12s ease;
       }
       #root:not(:empty) ~ #boot-splash {
         opacity: 0;
         pointer-events: none;
+      }
+      #boot-splash[data-force-hide="1"] {
+        display: none !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
       }
       #boot-splash .wrap {
         display: flex;
@@ -50,14 +60,63 @@
         gap: 16px;
         text-align: center;
       }
+      #boot-splash .logo-wrap {
+        position: relative;
+        width: 120px;
+        height: 120px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
       #boot-splash .logo {
+        position: relative;
+        z-index: 2;
         width: 120px;
         height: 120px;
         border-radius: 50%;
         object-fit: contain;
         background: #ffffff;
-        box-shadow: 0 12px 32px rgba(15, 23, 42, .08);
+        box-shadow: 0 12px 32px rgba(15, 23, 42, .1);
         padding: 6px;
+        animation: sefpos-splash-logo-breathe 2.4s ease-in-out infinite;
+      }
+      #boot-splash .sefpos-splash-glow {
+        position: absolute;
+        inset: -12%;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(249, 115, 22, 0.28) 0%, rgba(249, 115, 22, 0) 68%);
+        animation: sefpos-splash-glow-pulse 2.4s ease-in-out infinite;
+        pointer-events: none;
+      }
+      #boot-splash .sefpos-splash-orbit {
+        position: absolute;
+        inset: -6px;
+        border-radius: 50%;
+        border: 1px dashed rgba(249, 115, 22, 0.22);
+        animation: sefpos-splash-orbit-spin 5s linear infinite;
+        pointer-events: none;
+      }
+      #boot-splash .sefpos-splash-orbit-dot {
+        position: absolute;
+        top: -3px;
+        left: 50%;
+        width: 7px;
+        height: 7px;
+        margin-left: -3.5px;
+        border-radius: 50%;
+        background: #f97316;
+        box-shadow: 0 0 10px rgba(249, 115, 22, 0.55);
+      }
+      @keyframes sefpos-splash-logo-breathe {
+        0%, 100% { transform: scale(1); }
+        50% { transform: scale(1.06); }
+      }
+      @keyframes sefpos-splash-glow-pulse {
+        0%, 100% { opacity: 0.35; transform: scale(0.92); }
+        50% { opacity: 0.65; transform: scale(1.08); }
+      }
+      @keyframes sefpos-splash-orbit-spin {
+        to { transform: rotate(360deg); }
       }
       #boot-splash .name {
         font-size: 22px;
@@ -77,18 +136,30 @@
         border-radius: 50%;
         border: 3px solid rgba(15, 23, 42, .08);
         border-top-color: #f97316;
-        animation: bs-spin .8s linear infinite;
+        animation: sefpos-splash-spin 0.75s linear infinite;
       }
-      @keyframes bs-spin {
+      @keyframes sefpos-splash-spin {
         to { transform: rotate(360deg); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #boot-splash .logo,
+        #boot-splash .sefpos-splash-glow,
+        #boot-splash .sefpos-splash-orbit,
+        #boot-splash .ring {
+          animation: none !important;
+        }
       }
     </style>
     <div id="root"></div>
     <div id="boot-splash" aria-hidden="true">
       <div class="wrap">
-        <img src="./logo.png?v=2" alt="SefPOS" class="logo" onerror="this.style.display='none'" />
-        <div class="name">SefPOS</div>
-        <div class="tag">Sistem hazirlaniyor...</div>
+        <div class="logo-wrap">
+          <div class="sefpos-splash-glow" aria-hidden="true"></div>
+          <div class="sefpos-splash-orbit" aria-hidden="true"><span class="sefpos-splash-orbit-dot"></span></div>
+          <img src="./logo.png?v=2" alt="ŞefPOS" class="logo" onerror="this.style.display='none'" />
+        </div>
+        <div class="name">ŞefPOS</div>
+        <div class="tag">Yükleniyor…</div>
         <div class="ring"></div>
       </div>
     </div>

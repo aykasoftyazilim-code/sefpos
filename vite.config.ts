@@ -1,10 +1,14 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { IncomingMessage } from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { defineConfig, loadEnv } from 'vite';
 import type { Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
+import {
+  buildContentSecurityPolicyMetaContent,
+  buildWebContentSecurityPolicyHeader,
+} from './electron/csp.cjs';
 
 const __root = dirname(fileURLToPath(import.meta.url));
 
@@ -203,15 +207,18 @@ const DEFAULT_PRIMARY_SUPABASE_ANON_KEY = '';
 
 // https://vitejs.dev/config/
 export default defineConfig(({ mode, command }) => {
+  const isVdsSelfHost = process.env.VITE_VDS_SELFHOST === 'true';
   const env = loadEnv(mode, __root, 'VITE_');
-  const viteUrlFromEnv =
-    (env.VITE_SUPABASE_URL || '').trim().replace(/\/$/, '') ||
-    readViteSupabaseUrlFromEnvFiles(mode) ||
-    (process.env.VITE_SUPABASE_URL || '').trim().replace(/\/$/, '');
-  const viteAnonFromEnv =
-    (env.VITE_SUPABASE_ANON_KEY || '').trim() ||
-    readViteSupabaseAnonFromEnvFiles(mode) ||
-    (process.env.VITE_SUPABASE_ANON_KEY || '').trim();
+  const viteUrlFromEnv = isVdsSelfHost
+    ? ''
+    : (env.VITE_SUPABASE_URL || '').trim().replace(/\/$/, '') ||
+      readViteSupabaseUrlFromEnvFiles(mode) ||
+      (process.env.VITE_SUPABASE_URL || '').trim().replace(/\/$/, '');
+  const viteAnonFromEnv = isVdsSelfHost
+    ? ''
+    : (env.VITE_SUPABASE_ANON_KEY || '').trim() ||
+      readViteSupabaseAnonFromEnvFiles(mode) ||
+      (process.env.VITE_SUPABASE_ANON_KEY || '').trim();
 
   const { url: jsonUrl, anon: jsonAnon, devPortJsonOverridesEnv } = readSefposDevPortJson();
   const isDevServe = command === 'serve';
@@ -237,17 +244,24 @@ export default defineConfig(({ mode, command }) => {
         (effectiveNoEnvUrl === DEFAULT_PRIMARY_SUPABASE_URL ? DEFAULT_PRIMARY_SUPABASE_ANON_KEY : '')
       : '';
 
-  const viteSupabaseUrl = forceDevSupabaseFromPortJson
-    ? jsonUrl
-    : resolveDevSupabaseUrl(mode) || (isDevServe ? DEFAULT_PRIMARY_SUPABASE_URL : '');
+  const viteSupabaseUrl = isVdsSelfHost
+    ? ''
+    : forceDevSupabaseFromPortJson
+      ? jsonUrl
+      : resolveDevSupabaseUrl(mode) || (isDevServe ? DEFAULT_PRIMARY_SUPABASE_URL : '');
 
   const define: Record<string, string> = {
-    __SEFPOS_DEV_SUPABASE_URL__: JSON.stringify(devFallbackSupabaseUrl),
-    __SEFPOS_DEV_SUPABASE_ANON_KEY__: JSON.stringify(devFallbackSupabaseAnon),
+    __SEFPOS_DEV_SUPABASE_URL__: JSON.stringify(isVdsSelfHost ? '' : devFallbackSupabaseUrl),
+    __SEFPOS_DEV_SUPABASE_ANON_KEY__: JSON.stringify(isVdsSelfHost ? '' : devFallbackSupabaseAnon),
     /** import.meta.env define’ı güvenilir değil; src/lib/supabase.ts doğrudan bunu okur. */
-    __SEFPOS_DEV_PORT_OVERRIDE_URL__: JSON.stringify(forceDevSupabaseFromPortJson ? jsonUrl : ''),
-    __SEFPOS_DEV_PORT_OVERRIDE_ANON__: JSON.stringify(forceDevSupabaseFromPortJson ? anonForJsonUrl : ''),
+    __SEFPOS_DEV_PORT_OVERRIDE_URL__: JSON.stringify(isVdsSelfHost ? '' : forceDevSupabaseFromPortJson ? jsonUrl : ''),
+    __SEFPOS_DEV_PORT_OVERRIDE_ANON__: JSON.stringify(isVdsSelfHost ? '' : forceDevSupabaseFromPortJson ? anonForJsonUrl : ''),
   };
+  if (isVdsSelfHost) {
+    define['import.meta.env.VITE_VDS_SELFHOST'] = JSON.stringify('true');
+    define['import.meta.env.VITE_SUPABASE_URL'] = JSON.stringify('');
+    define['import.meta.env.VITE_SUPABASE_ANON_KEY'] = JSON.stringify('');
+  }
 
   if (forceDevSupabaseFromPortJson) {
     console.info('[ŞefPOS] Yerel dev: devPortJsonOverridesEnv — .env / localStorage yerine →', jsonUrl);
@@ -261,10 +275,21 @@ export default defineConfig(({ mode, command }) => {
     } catch {
       console.warn('[ŞefPOS] Geçersiz Supabase URL; Edge proxy kapalı:', viteSupabaseUrl);
     }
-  } else {
+  } else if (!isVdsSelfHost) {
     console.warn(
       '[ŞefPOS] VITE_SUPABASE_URL bulunamadı; yerel /__supabase-functions proxy devre dışı. .env veya sefpos-dev-port.json → supabaseDevUrl ekleyin.',
     );
+  }
+
+  if (isVdsSelfHost) {
+    plugins.push({
+      name: 'sefpos-vds-strip-supabase-html',
+      transformIndexHtml(html: string) {
+        return html
+          .replace(/\s*<link rel="dns-prefetch" href="https:\/\/xdfnozfuuzctubijbnds\.supabase\.co" \/>/g, '')
+          .replace(/\s*<link rel="preconnect" href="https:\/\/xdfnozfuuzctubijbnds\.supabase\.co"[^>]*>/g, '');
+      },
+    });
   }
 
   // Cloudflare Pages: kök URL (/). Electron file:// yüklemesi CF_PAGES olmadan ./ kalır.
@@ -284,24 +309,139 @@ export default defineConfig(({ mode, command }) => {
     });
   }
 
+  if (command === 'build') {
+    const cspMeta = buildContentSecurityPolicyMetaContent();
+    plugins.push({
+      name: 'sefpos-electron-csp-meta',
+      transformIndexHtml(html: string) {
+        const tag = `<meta http-equiv="Content-Security-Policy" content="${cspMeta.replace(/"/g, '&quot;')}" />`;
+        if (html.includes('http-equiv="Content-Security-Policy"')) {
+          return html.replace(/<meta http-equiv="Content-Security-Policy"[^>]*\/?>/, tag);
+        }
+        return html.replace('<meta charset="UTF-8" />', `<meta charset="UTF-8" />\n    ${tag}`);
+      },
+    });
+    plugins.push({
+      name: 'sefpos-web-csp-headers',
+      closeBundle() {
+        const policy = buildWebContentSecurityPolicyHeader();
+        writeFileSync(
+          join(__root, 'dist', '_headers'),
+          `/*\n  Content-Security-Policy: ${policy}\n  X-Frame-Options: DENY\n`,
+          'utf8',
+        );
+      },
+    });
+  }
+
+  /** index.css HMR: yalnızca stil modülü + kısa debounce (Windows'ta art arda 10+ güncelleme kasması). */
+  let cssHmrDebounce: ReturnType<typeof setTimeout> | null = null;
+  plugins.push({
+    name: 'sefpos-css-hmr-scope',
+    apply: 'serve',
+    handleHotUpdate(ctx) {
+      const file = ctx.file.replace(/\\/g, '/');
+      if (!file.endsWith('/src/index.css')) return;
+      const scoped = ctx.modules.filter((m) => m.url?.includes('index.css'));
+      return new Promise((resolve) => {
+        if (cssHmrDebounce) clearTimeout(cssHmrDebounce);
+        cssHmrDebounce = setTimeout(() => {
+          cssHmrDebounce = null;
+          resolve(scoped);
+        }, 280);
+      });
+    },
+  });
+
+  /** Büyük POS bileşenlerinde HMR fırtınasını debounce et (OrderPanel / TableGrid kasması). */
+  const HEAVY_HMR_SUFFIXES = [
+    '/src/components/OrderPanel.tsx',
+    '/src/components/TableGrid.tsx',
+    '/src/App.tsx',
+    '/src/components/TerminalMode.tsx',
+  ];
+  let heavyHmrDebounce: ReturnType<typeof setTimeout> | null = null;
+  plugins.push({
+    name: 'sefpos-heavy-tsx-hmr-debounce',
+    apply: 'serve',
+    handleHotUpdate(ctx) {
+      const file = ctx.file.replace(/\\/g, '/');
+      if (!HEAVY_HMR_SUFFIXES.some((s) => file.endsWith(s))) return;
+      return new Promise((resolve) => {
+        if (heavyHmrDebounce) clearTimeout(heavyHmrDebounce);
+        heavyHmrDebounce = setTimeout(() => {
+          heavyHmrDebounce = null;
+          resolve(ctx.modules);
+        }, 380);
+      });
+    },
+  });
+
   return {
     define,
     plugins,
     base: useRootAssetBase ? '/' : './',
     server: {
+      host: '127.0.0.1',
       port: SEFPOS_DEV_PORT,
       strictPort: true,
+      hmr: {
+        overlay: true,
+      },
+      watch: {
+        // dist/build, release paketleri ve büyük ikili dosyalar watcher'ı tetikleyip
+        // sonsuz HMR döngüsü + kasma yapabiliyor (özellikle Windows).
+        ignored: [
+          '**/dist/**',
+          '**/release*/**',
+          '**/release - Kopya/**',
+          '**/.git/**',
+          '**/node_modules/**',
+          '**/.cursor/**',
+          '**/terminals/**',
+          '**/win-unpacked/**',
+          '**/*.exe',
+          '**/*.blockmap',
+          '**/temp-*/**',
+          '**/agent-transcripts/**',
+          '**/*.cjs',
+        ],
+      },
     },
     optimizeDeps: {
-      exclude: ['lucide-react'],
+      /** exclude edilirse dev'de 1500+ ayrı ikon .js isteği (Network kasması). */
+      include: [
+        'lucide-react',
+        'xlsx',
+        'zustand',
+        '@supabase/supabase-js',
+        'react',
+        'react-dom',
+        'react/jsx-runtime',
+        'react/jsx-dev-runtime',
+        'html2canvas',
+        'jspdf',
+      ],
     },
     build: {
       rollupOptions: {
         output: {
-          manualChunks: {
-            supabase: ['@supabase/supabase-js'],
-            lucide: ['lucide-react'],
-            'react-vendor': ['react', 'react-dom'],
+          manualChunks(id) {
+            if (!id.includes('node_modules')) {
+              if (id.includes('/components/landing/')) return 'landing';
+              if (id.includes('/components/reports/')) return 'reports';
+              if (id.includes('/components/Settings')) return 'settings';
+              if (id.includes('/components/Products')) return 'products';
+              if (id.includes('/components/AdminPanel')) return 'admin';
+              return undefined;
+            }
+            if (id.includes('lucide-react')) return 'lucide';
+            if (id.includes('@supabase')) return 'supabase';
+            if (id.includes('xlsx')) return 'xlsx';
+            if (id.includes('html2canvas')) return 'html2canvas';
+            if (id.includes('jspdf')) return 'pdf';
+            if (id.includes('react-dom') || id.includes('/react/')) return 'react-vendor';
+            return undefined;
           },
         },
       },

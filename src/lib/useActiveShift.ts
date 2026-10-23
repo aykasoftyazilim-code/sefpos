@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { supabase } from './supabase';
+import { startAdaptivePoller } from './pollSchedule';
 
 export interface ActiveShift {
   id: string;
@@ -111,21 +112,26 @@ export function useActiveShift({ branchId, tenantId, userId, enabled = true, cut
     }
     refresh();
 
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleRefresh = () => {
+      if (refreshTimer) clearTimeout(refreshTimer);
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        refresh();
+      }, 8_000);
+    };
+
     const channel = supabase
       .channel(`shift-watch-${tenantId}-${branchId || 'all'}-${userId || 'all'}`)
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'shifts', filter: `tenant_id=eq.${tenantId}` },
-        () => {
-          refresh();
-        },
+        scheduleRefresh,
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'daily_closures', filter: `tenant_id=eq.${tenantId}` },
-        () => {
-          refresh();
-        },
+        scheduleRefresh,
       )
       .subscribe();
 
@@ -133,9 +139,15 @@ export function useActiveShift({ branchId, tenantId, userId, enabled = true, cut
       if (document.visibilityState === 'visible') refresh();
     };
     document.addEventListener('visibilitychange', onVis);
-    const id = window.setInterval(() => {
-      if (document.visibilityState === 'visible') refresh();
-    }, 60_000);
+    const stopPoll = startAdaptivePoller({
+      baseMs: 180_000,
+      idleMs: 300_000,
+      hiddenMs: 0,
+      run: () => {
+        if (document.visibilityState === 'visible') return refresh();
+      },
+      immediate: false,
+    });
 
     return () => {
       try {
@@ -144,7 +156,8 @@ export function useActiveShift({ branchId, tenantId, userId, enabled = true, cut
         // ignore
       }
       document.removeEventListener('visibilitychange', onVis);
-      window.clearInterval(id);
+      stopPoll();
+      if (refreshTimer) clearTimeout(refreshTimer);
     };
   }, [enabled, tenantId, branchId, userId, refresh]);
 

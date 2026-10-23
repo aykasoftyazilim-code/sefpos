@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
 import { supabase } from '../lib/supabase';
-import { createClient } from '@supabase/supabase-js';
 import { useAuth } from '../contexts/AuthContext';
 import { Database } from '../lib/supabase';
-import { X, Plus, Trash2, Settings as SettingsIcon, Building2, ToggleLeft, ToggleRight, Printer, AlertCircle, MapPin, Phone, Save, CreditCard as Edit2, User, Store, CheckCircle, Wifi, WifiOff, Globe, RefreshCw, Lock, ShieldCheck, Eye, EyeOff, Package, CheckSquare, Square, Database as DatabaseIcon, Receipt, Pencil, Scale, Loader, QrCode, PhoneIncoming, FlaskConical, Clock, Download, Sparkles, ChevronDown, ChevronUp, HelpCircle, Info, Percent } from 'lucide-react';
+import { X, Plus, Trash2, Settings as SettingsIcon, Building2, ToggleLeft, ToggleRight, Printer, AlertCircle, MapPin, Phone, Save, CreditCard as Edit2, User, Store, CheckCircle, Wifi, WifiOff, Globe, RefreshCw, Lock, ShieldCheck, Eye, EyeOff, Package, CheckSquare, Square, Database as DatabaseIcon, Receipt, Pencil, Scale, Loader, QrCode, PhoneIncoming, FlaskConical, Clock, Download, Sparkles, ChevronDown, ChevronUp, HelpCircle, Info, Percent, Puzzle, Gift, Menu } from 'lucide-react';
+import { isModuleEnabled } from '../lib/modules';
+import { LoyaltySettingsPanel } from './loyalty/LoyaltySettingsPanel';
+import IntegrationsSettings from './IntegrationsSettings';
 import {
   isCallerIdAvailable,
   startCallerId,
@@ -15,27 +17,71 @@ import {
   callerIdLocalSettings,
   type CallerIdStatus,
 } from '../lib/callerId';
-import { HuginSettings, loadHuginSettings, saveHuginSettings, testHuginConnection } from '../lib/huginTps';
+import {
+  HuginSettings,
+  loadHuginSettings,
+  saveHuginSettings,
+  testHuginConnection,
+  fetchHuginHardwareId,
+  huginRequiresDesktop,
+} from '../lib/huginTps';
+import { isElectron, loadPrintSettings, savePrintSettings } from '../lib/printService';
 import { isFeatureUnlocked, submitFeatureRequest, FEATURE_LABELS } from '../lib/featureGate';
 import { Branch } from '../contexts/AuthContext';
 import { PrinterSettings } from './PrinterSettings';
+import { SystemDiagnosticsPanel } from './SystemDiagnosticsPanel';
 import { SqlServerSettings } from './SqlServerSettings';
+import { isSqlServerMode } from '../lib/sqlDb';
+import { insertRestaurantTablesSkipDuplicates } from '../lib/restaurantTableBulk';
 import { DeviceManagement } from './DeviceManagement';
 import { WaiterManagement } from './WaiterManagement';
 import { ScaleCalibration } from './ScaleCalibration';
 import { QrMenuManager } from './QrMenuManager';
-import { callGetir, generateGetirApiKey } from '../lib/getirApi';
+import { callGetir, generateGetirApiKey, syncGetirRestaurantOpen } from '../lib/getirApi';
 import { publicPartnerEdgeUrl } from '../lib/publicWebhookBaseUrl';
+import { clearTablePaymentLock } from '../lib/paymentLock';
+import { queryCache } from '../lib/queryCache';
+import { clearAllTableGridSnapshots } from '../lib/tableGridData';
+import { TENANT_CURRENCY_OPTIONS, normalizeCurrencyCode, type TenantCurrencyCode } from '../lib/currency';
 
 type TableGroup = Database['public']['Tables']['table_groups']['Row'];
 
+type SettingsTabId =
+  | 'tables'
+  | 'products'
+  | 'manage'
+  | 'platforms'
+  | 'integrations'
+  | 'partner-api'
+  | 'branches'
+  | 'printers'
+  | 'account'
+  | 'system'
+  | 'security'
+  | 'branch-products'
+  | 'database'
+  | 'hugin'
+  | 'devices'
+  | 'waiters'
+  | 'scale'
+  | 'qr-menu'
+  | 'caller-id'
+  | 'loyalty';
+
 interface SettingsProps {
   onClose: () => void;
+  /** Dev tanılama / dış olay ile doğrudan sekme açma */
+  initialTab?: SettingsTabId;
 }
 
-export function Settings({ onClose }: SettingsProps) {
+export function Settings({ onClose, initialTab }: SettingsProps) {
   const { tenant, profile, activeBranch, refreshProfile, refreshBranches } = useAuth();
-  const [activeTab, setActiveTab] = useState<'tables' | 'products' | 'manage' | 'platforms' | 'branches' | 'printers' | 'account' | 'system' | 'security' | 'branch-products' | 'database' | 'hugin' | 'devices' | 'waiters' | 'scale' | 'qr-menu' | 'caller-id'>('branches');
+  const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab ?? 'branches');
+
+  useEffect(() => {
+    if (initialTab) setActiveTab(initialTab);
+  }, [initialTab]);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [groups, setGroups] = useState<TableGroup[]>([]);
   const [showGroupForm, setShowGroupForm] = useState(false);
   const [groupName, setGroupName] = useState('');
@@ -99,7 +145,11 @@ export function Settings({ onClose }: SettingsProps) {
         setUpdateCheckState({ kind: 'error', message: String(res.error) });
         return;
       }
-      if (res?.version) {
+      if (res?.version && appVersion && res.version !== appVersion) {
+        setUpdateCheckState({ kind: 'available', version: String(res.version) });
+      } else if (res?.version && appVersion && res.version === appVersion) {
+        setUpdateCheckState({ kind: 'not_available' });
+      } else if (res?.version) {
         setUpdateCheckState({ kind: 'available', version: String(res.version) });
       } else {
         setUpdateCheckState({ kind: 'not_available' });
@@ -159,6 +209,7 @@ export function Settings({ onClose }: SettingsProps) {
   const [restaurantName, setRestaurantName] = useState('');
   const [restaurantAddress, setRestaurantAddress] = useState('');
   const [restaurantPhone, setRestaurantPhone] = useState('');
+  const [restaurantCurrency, setRestaurantCurrency] = useState<TenantCurrencyCode>('TRY');
   const [profileFullName, setProfileFullName] = useState('');
   const [accountSaving, setAccountSaving] = useState(false);
   const [accountSaved, setAccountSaved] = useState(false);
@@ -266,6 +317,7 @@ export function Settings({ onClose }: SettingsProps) {
       setRestaurantName((tenant as any).name || '');
       setRestaurantAddress((tenant as any).address || '');
       setRestaurantPhone((tenant as any).phone || '');
+      setRestaurantCurrency(normalizeCurrencyCode((tenant as any).currency_code));
       setDeploymentMode((tenant as any).deployment_mode || 'online');
       supabase.from('tenants').select('lock_pin').eq('id', tenant.id).maybeSingle().then(({ data }) => {
         setCurrentPin((data as any)?.lock_pin || '');
@@ -279,6 +331,11 @@ export function Settings({ onClose }: SettingsProps) {
 
   useEffect(() => {
     if (!tenant || activeTab !== 'hugin') return;
+    if (huginRequiresDesktop() && !huginSettings.hardwareId.trim()) {
+      void fetchHuginHardwareId().then((mac) => {
+        if (mac) setHuginSettings((s) => ({ ...s, hardwareId: mac }));
+      });
+    }
     supabase
       .from('categories')
       .select('id, name, vat_rate, hugin_department_id')
@@ -400,9 +457,21 @@ export function Settings({ onClose }: SettingsProps) {
         name: restaurantName,
         address: restaurantAddress,
         phone: restaurantPhone,
+        currency_code: restaurantCurrency,
       } as any).eq('id', tenant.id),
       profile ? supabase.from('profiles').update({ full_name: profileFullName } as any).eq('id', profile.id) : Promise.resolve(),
     ]);
+    try {
+      const ps = loadPrintSettings();
+      savePrintSettings({
+        ...ps,
+        restaurantName: restaurantName.trim(),
+        restaurantPhone: restaurantPhone.trim(),
+        restaurantAddress: restaurantAddress.trim(),
+      });
+    } catch {
+      /* localStorage */
+    }
     await refreshProfile?.();
     setAccountSaving(false);
     setAccountSaved(true);
@@ -425,7 +494,7 @@ export function Settings({ onClose }: SettingsProps) {
       if (activeTab === 'platforms') {
         loadPlatforms();
       }
-      if (activeTab === 'branches') {
+      if (activeTab === 'integrations' || activeTab === 'partner-api' || activeTab === 'branches') {
         loadBranches();
       }
       if (activeTab === 'branch-products') {
@@ -529,12 +598,10 @@ export function Settings({ onClose }: SettingsProps) {
       .eq('id', branchId);
     if (error) {
       const msg = String(error.message || '');
-      if (/column .*default_discount/i.test(msg)) {
+      if (/column .*default_discount|Invalid column name.*default_discount/i.test(msg)) {
         alert(
           'Sabit iskonto kolonu veritabanında yok. ' +
-          'Supabase migration\'ı (20260515220000_branches_default_discount.sql) ' +
-          'henüz uygulanmamış. GitHub Actions deploy bitince tekrar deneyin ' +
-          'veya Studio → SQL\'de migration\'ı manuel çalıştırın.'
+          'Sunucu şeması güncellenmeli (default_discount_percent / default_discount_active).'
         );
       } else {
         alert('Hata: ' + msg);
@@ -590,53 +657,87 @@ export function Settings({ onClose }: SettingsProps) {
   const handleCreateGroup = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    console.log('Creating group - tenant:', tenant);
-    console.log('Group data:', { groupName, groupPrefix, groupColor });
-
     if (!tenant) {
-      alert('Tenant bulunamadı. Lütfen tekrar giriş yapın.');
+      alert('İşletme bilgisi bulunamadı. Lütfen çıkış yapıp tekrar giriş yapın.');
       return;
     }
 
-    if (!groupName.trim()) {
+    const name = groupName.trim();
+    if (!name) {
       alert('Grup adı girin.');
       return;
     }
 
-    const branchForGroup = groupBranchId || activeBranch?.id;
+    const branchForGroup = (groupBranchId || activeBranch?.id || '').trim();
     if (!branchForGroup) {
       alert('Önce üst menüden bir şube seçin veya formda şube seçin.');
       return;
     }
+    if (branches.length > 0 && !branches.some((b) => b.id === branchForGroup)) {
+      alert('Seçilen şube geçersiz. Listeden geçerli bir şube seçin.');
+      return;
+    }
 
-    const rawPrefix = (groupPrefix || groupName || 'M').trim();
-    const prefix = rawPrefix.slice(0, 12).toUpperCase() || 'M';
+    const rawPrefix = (groupPrefix || name || 'M').trim();
+    // TR locale ile büyük harf; max 3 (UI) / DB text
+    const prefix = rawPrefix.slice(0, 3).toLocaleUpperCase('tr-TR') || 'M';
 
     const { data, error } = await supabase
       .from('table_groups')
       .insert({
         tenant_id: tenant.id,
         branch_id: branchForGroup,
-        name: groupName.trim(),
+        name,
         prefix,
-        color: groupColor,
+        color: groupColor || '#FF6B35',
       })
-      .select();
-
-    console.log('Insert result:', { data, error });
+      .select('id, name, prefix, branch_id');
 
     if (error) {
       console.error('Group creation error:', error);
-      alert('Hata: ' + error.message);
+      const msg = String(error.message || '');
+      const code = String((error as { code?: string }).code || '');
+      if (/foreign key|table_groups_branch_id_fkey/i.test(msg) || code === '23503') {
+        alert('Şube kaydı bulunamadı. Üst menüden şubeyi yeniden seçip tekrar deneyin.');
+        return;
+      }
+      if (/row-level security|RLS|42501/i.test(msg) || code === '42501') {
+        alert(
+          'Bu işlem için yetkiniz yok veya oturum süresi dolmuş. Çıkış yapıp tekrar giriş yapın; sorun sürerse yönetici yetkisi gerekir.',
+        );
+        return;
+      }
+      if (/JWT|not authenticated|refresh/i.test(msg)) {
+        alert('Oturum geçersiz. Çıkış yapıp tekrar giriş yapın.');
+        return;
+      }
+      alert('Masa grubu oluşturulamadı: ' + msg);
       return;
     }
 
-    alert('Grup başarıyla oluşturuldu!');
+    // VDS/SQL insert tek satırda dizi yerine nesne dönebilir; PostgREST ise dizi
+    const createdRows = Array.isArray(data) ? data : data ? [data] : [];
+    if (createdRows.length === 0) {
+      const { data: verify } = await supabase
+        .from('table_groups')
+        .select('id')
+        .eq('tenant_id', tenant.id)
+        .eq('name', name)
+        .eq('branch_id', branchForGroup)
+        .limit(1);
+      const ok = Array.isArray(verify) ? verify.length > 0 : !!verify;
+      if (!ok) {
+        alert('Grup kaydı doğrulanamadı. Sayfayı yenileyip listeyi kontrol edin.');
+        return;
+      }
+    }
+
+    alert('Grup oluşturuldu. Masaların görünmesi için aynı ekranda «Toplu Masa Oluştur» ile masa ekleyin ve şube seçili olsun.');
     setGroupName('');
     setGroupPrefix('');
-    setGroupBranchId('');
+    setGroupBranchId(activeBranch?.id || '');
     setShowGroupForm(false);
-    loadGroups();
+    void loadGroups();
   };
 
   const handleBulkCreateTables = async () => {
@@ -661,16 +762,22 @@ export function Settings({ onClose }: SettingsProps) {
       return;
     }
 
-    const { data: existingTables } = await supabase
+    const branchId = tableBranchId || activeBranch?.id || null;
+    let existQ = supabase
       .from('restaurant_tables')
       .select('table_number')
-      .eq('tenant_id', tenant.id)
-      .like('table_number', `${group.prefix}-%`);
+      .eq('tenant_id', tenant.id);
+    if (branchId) existQ = existQ.eq('branch_id', branchId);
+    else existQ = existQ.is('branch_id', null);
+    const { data: existingTables } = await existQ;
 
+    const prefixTag = `${group.prefix}-`;
     const usedNumbers = new Set(
       (existingTables || [])
-        .map(t => parseInt(String(t.table_number).split('-').pop() || '0'))
-        .filter(n => !isNaN(n))
+        .map((t) => String((t as { table_number: string }).table_number))
+        .filter((tn) => tn.startsWith(prefixTag))
+        .map((tn) => parseInt(tn.slice(prefixTag.length), 10))
+        .filter((n) => !isNaN(n)),
     );
 
     const tables = [];
@@ -679,7 +786,7 @@ export function Settings({ onClose }: SettingsProps) {
       if (!usedNumbers.has(num)) {
         tables.push({
           tenant_id: tenant.id,
-          branch_id: tableBranchId || null,
+          branch_id: branchId,
           table_number: `${group.prefix}-${num}`,
           capacity: capacity,
           status: 'available' as const,
@@ -689,15 +796,18 @@ export function Settings({ onClose }: SettingsProps) {
       num++;
     }
 
-    const { error } = await supabase
-      .from('restaurant_tables')
-      .insert(tables);
+    const { inserted, skipped, error } = await insertRestaurantTablesSkipDuplicates(tables);
 
     if (!error) {
-      alert(`${count} masa başarıyla oluşturuldu`);
+      const msg =
+        skipped > 0
+          ? `${inserted} masa eklendi, ${skipped} masa zaten vardı (atlandı).`
+          : `${inserted} masa başarıyla oluşturuldu`;
+      alert(msg);
       setTableCount('10');
+      window.dispatchEvent(new CustomEvent('sefpos:tables-changed'));
     } else {
-      alert('Hata: ' + error.message);
+      alert('Hata: ' + error);
     }
   };
 
@@ -730,19 +840,25 @@ export function Settings({ onClose }: SettingsProps) {
       nextNumber = Math.max(...numbers) + 1;
     }
 
-    const { error } = await supabase
-      .from('restaurant_tables')
-      .insert({
+    const branchId = tableBranchId || activeBranch?.id || null;
+    const { inserted, skipped, error } = await insertRestaurantTablesSkipDuplicates([
+      {
         tenant_id: tenant.id,
-        branch_id: tableBranchId || null,
+        branch_id: branchId,
         table_number: `${group.prefix}-${nextNumber}`,
         capacity: parseInt(tableCapacity),
         status: 'available',
         group_id: group.id,
-      });
+      },
+    ]);
 
-    if (!error) {
+    if (!error && inserted > 0) {
       alert(`Masa ${group.prefix}-${nextNumber} oluşturuldu`);
+      window.dispatchEvent(new CustomEvent('sefpos:tables-changed'));
+    } else if (!error && skipped > 0) {
+      alert(`Masa ${group.prefix}-${nextNumber} zaten kayıtlı.`);
+    } else if (error) {
+      alert('Hata: ' + error);
     }
   };
 
@@ -793,10 +909,19 @@ export function Settings({ onClose }: SettingsProps) {
   };
 
   const handleUnlockTable = async (tableId: string) => {
+    const role = (profile as { role?: string } | null)?.role;
+    if (!['owner', 'admin', 'manager', 'super_admin'].includes(role || '')) {
+      alert(
+        'Kilidi açmak için yönetici yetkisi gerekir (Sahip, Yönetici veya Müdür rolü).\n\n' +
+          `Mevcut rolünüz: ${role || 'tanımsız'}`,
+      );
+      return;
+    }
+
     try {
       const { data, error } = await supabase.rpc('unlock_table_payment', {
         p_table_id: tableId,
-        p_reason: 'Admin override'
+        p_reason: 'Admin override — Ayarlar',
       });
 
       if (error) {
@@ -807,9 +932,17 @@ export function Settings({ onClose }: SettingsProps) {
       if (data?.success) {
         alert('Masa kilidi açıldı');
         loadTables();
-      } else {
-        alert('Hata: ' + (data?.error || 'Bilinmeyen hata'));
+        return;
       }
+
+      const errMsg = data?.error || 'Bilinmeyen hata';
+      if (errMsg === 'Unauthorized') {
+        await clearTablePaymentLock(tableId);
+        alert('Masa kilidi açıldı (yedek yol). Sunucu migration güncellemesi önerilir.');
+        loadTables();
+        return;
+      }
+      alert('Hata: ' + errMsg);
     } catch (err: any) {
       alert('Hata: ' + err.message);
     }
@@ -976,15 +1109,59 @@ export function Settings({ onClose }: SettingsProps) {
     loadPlatforms();
   };
 
-  const handleTogglePlatform = async (platformId: string, currentStatus: boolean) => {
+  const handleTogglePlatform = async (platform: {
+    id: string;
+    is_active: boolean;
+    platform_code: string;
+  }) => {
+    const nextActive = !platform.is_active;
+
+    if (platform.platform_code === 'getir') {
+      const label = nextActive ? 'açmak' : 'kapatmak';
+      if (
+        !confirm(
+          nextActive
+            ? 'Getir uygulamasında restoranı AÇMAK ve POS entegrasyonunu etkinleştirmek istiyor musunuz?'
+            : 'Getir uygulamasında restoranı KAPATMAK istiyor musunuz? (Müşteriler sipariş veremez.)',
+        )
+      ) {
+        return;
+      }
+      const res = await syncGetirRestaurantOpen(platform.id, nextActive, {
+        timeOffAmount: 15,
+        openPosToo: nextActive,
+      });
+      if (!res.ok) {
+        const dataObj =
+          res.data && typeof res.data === 'object' ? (res.data as Record<string, unknown>) : {};
+        const detail =
+          (dataObj.message as string | undefined) ||
+          (dataObj.error as string | undefined) ||
+          res.error ||
+          'Getir API hatası';
+        alert(`Getir restoranını ${label} başarısız:\n\n${detail}`);
+        return;
+      }
+      if (res.error) {
+        alert(res.error);
+      }
+    }
+
+    const patch: Record<string, unknown> = { is_active: nextActive };
+    if (platform.platform_code === 'getir') {
+      patch.getir_restaurant_open = nextActive;
+    }
+
     const { error } = await supabase
       .from('online_order_platforms')
-      .update({ is_active: !currentStatus })
-      .eq('id', platformId);
+      .update(patch)
+      .eq('id', platform.id);
 
-    if (!error) {
-      loadPlatforms();
+    if (error) {
+      alert('Kayıt güncellenemedi: ' + error.message);
+      return;
     }
+    loadPlatforms();
   };
 
   const handleDeletePlatform = async (platformId: string) => {
@@ -1002,15 +1179,21 @@ export function Settings({ onClose }: SettingsProps) {
     }
   };
 
+  const loyaltyModuleOn = tenant ? isModuleEnabled('loyalty', tenant as any) : false;
+
   const navItems = [
     { id: 'branches', label: 'Şubeler', icon: Building2, group: 'Yönetim' },
     { id: 'branch-products', label: 'Şube Ürünleri', icon: Package, group: 'Yönetim' },
     { id: 'qr-menu', label: 'QR Menü', icon: QrCode, group: 'Yönetim' },
+    ...(loyaltyModuleOn
+      ? [{ id: 'loyalty' as const, label: 'Sadakat', icon: Gift, group: 'Yönetim' as const }]
+      : []),
     { id: 'waiters', label: 'Garsonlar', icon: User, group: 'Yönetim' },
     { id: 'tables', label: 'Masa Grupları', icon: Store, group: 'Masalar' },
     { id: 'manage', label: 'Masa Düzenle', icon: SettingsIcon, group: 'Masalar' },
     { id: 'platforms', label: 'Online Platformlar', icon: Globe, group: 'Siparişler' },
-    { id: 'printers', label: 'Yazıcılar', icon: Printer, group: 'Sistem' },
+    { id: 'integrations', label: 'Entegrasyonlarımız', icon: Puzzle, group: 'Siparişler' },
+    { id: 'printers', label: 'Fiş & Yazıcı', icon: Receipt, group: 'Sistem' },
     { id: 'hugin', label: 'Yazarkasa (Hugin)', icon: Receipt, group: 'Sistem' },
     { id: 'scale', label: 'Terazi Testi', icon: Scale, group: 'Sistem' },
     { id: 'caller-id', label: 'Arayan No (Caller ID)', icon: PhoneIncoming, group: 'Sistem' },
@@ -1022,23 +1205,65 @@ export function Settings({ onClose }: SettingsProps) {
   ] as const;
 
   const navGroups = ['Yönetim', 'Masalar', 'Siparişler', 'Sistem', 'Hesap'];
+  const activeNavItem = navItems.find((i) => i.id === activeTab);
+
+  const selectSettingsTab = (id: typeof activeTab) => {
+    setActiveTab(id);
+    setMobileNavOpen(false);
+  };
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-100 flex flex-col">
-      <div className="bg-gradient-to-r from-slate-900 to-slate-800 text-white px-4 md:px-6 py-3 flex items-center justify-between flex-shrink-0">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 bg-gradient-to-br from-orange-400 to-red-500 rounded-lg flex items-center justify-center">
+    <div className="fixed inset-0 z-50 bg-slate-100 flex flex-col overflow-hidden">
+      <div className="bg-gradient-to-r from-slate-900 to-slate-800 text-white px-3 sm:px-4 md:px-6 py-3 flex items-center justify-between flex-shrink-0 gap-2">
+        <div className="flex items-center gap-2 min-w-0 flex-1">
+          <button
+            type="button"
+            onClick={() => setMobileNavOpen(true)}
+            className="md:hidden p-2 -ml-1 hover:bg-white/10 rounded-lg transition shrink-0"
+            aria-label="Ayarlar menüsünü aç"
+          >
+            <Menu className="w-5 h-5" />
+          </button>
+          <div className="w-8 h-8 bg-gradient-to-br from-orange-400 to-red-500 rounded-lg flex items-center justify-center shrink-0">
             <SettingsIcon className="w-4 h-4" />
           </div>
-          <h2 className="text-lg font-black">Ayarlar</h2>
+          <div className="min-w-0">
+            <h2 className="text-base sm:text-lg font-black truncate">Ayarlar</h2>
+            {activeNavItem && (
+              <p className="md:hidden text-[11px] text-white/75 truncate">{activeNavItem.label}</p>
+            )}
+          </div>
         </div>
-        <button onClick={onClose} className="p-2 hover:bg-white/10 rounded-lg transition active:scale-95">
+        <button onClick={onClose} className="p-2 hover:bg-white/10 rounded-lg transition active:scale-95 shrink-0" aria-label="Ayarları kapat">
           <X className="w-5 h-5" />
         </button>
       </div>
 
-      <div className="flex flex-1 min-h-0">
-        <aside className="w-52 md:w-64 bg-white border-r border-slate-200 flex-shrink-0 overflow-y-auto flex flex-col">
+      <div className="flex flex-1 min-h-0 min-w-0 relative">
+        {mobileNavOpen && (
+          <button
+            type="button"
+            className="fixed inset-0 z-[55] bg-black/50 md:hidden"
+            aria-label="Menüyü kapat"
+            onClick={() => setMobileNavOpen(false)}
+          />
+        )}
+        <aside
+          className={`fixed md:relative inset-y-0 left-0 z-[60] md:z-auto flex flex-col bg-white border-r border-slate-200 flex-shrink-0 overflow-y-auto w-[min(18rem,88vw)] md:w-64 transition-transform duration-300 ease-out ${
+            mobileNavOpen ? 'translate-x-0' : '-translate-x-full md:translate-x-0'
+          }`}
+        >
+          <div className="md:hidden flex items-center justify-between px-4 py-3 border-b border-slate-100">
+            <span className="text-sm font-bold text-slate-800">Menü</span>
+            <button
+              type="button"
+              onClick={() => setMobileNavOpen(false)}
+              className="p-2 text-slate-500 hover:bg-slate-100 rounded-lg"
+              aria-label="Menüyü kapat"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
           <nav className="flex-1 py-3 px-2 space-y-4">
             {navGroups.map(group => {
               const items = navItems.filter(i => i.group === group);
@@ -1051,7 +1276,7 @@ export function Settings({ onClose }: SettingsProps) {
                     return (
                       <button
                         key={item.id}
-                        onClick={() => setActiveTab(item.id as any)}
+                        onClick={() => selectSettingsTab(item.id as typeof activeTab)}
                         className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-semibold transition-all active:scale-95 mt-0.5 ${
                           active
                             ? 'bg-orange-50 text-orange-700 shadow-sm border border-orange-100'
@@ -1069,8 +1294,8 @@ export function Settings({ onClose }: SettingsProps) {
           </nav>
         </aside>
 
-        <main className="flex-1 overflow-y-auto">
-          <div className="max-w-3xl mx-auto p-4 md:p-6">
+        <main className="flex-1 min-w-0 overflow-y-auto overflow-x-hidden">
+          <div className="max-w-3xl mx-auto p-3 sm:p-4 md:p-6 w-full box-border">
 
           {activeTab === 'branches' ? (
             <div className="space-y-4">
@@ -1083,11 +1308,11 @@ export function Settings({ onClose }: SettingsProps) {
               </div>
 
               <div className="bg-gray-50 rounded-xl p-4 md:p-6">
-                <div className="flex items-center justify-between mb-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-4">
                   <h3 className="text-base md:text-lg font-bold text-gray-800">Şubeler ({branches.length})</h3>
                   <button
                     onClick={() => setShowBranchForm(!showBranchForm)}
-                    className="flex items-center gap-2 bg-orange-600 hover:bg-orange-700 text-white px-3 py-2 rounded-lg transition active:scale-95 text-sm"
+                    className="flex items-center justify-center gap-2 bg-orange-600 hover:bg-orange-700 text-white px-3 py-2.5 rounded-lg transition active:scale-95 text-sm w-full sm:w-auto"
                   >
                     <Plus className="w-4 h-4" />
                     <span>Yeni Şube</span>
@@ -1174,14 +1399,14 @@ export function Settings({ onClose }: SettingsProps) {
                           </div>
                         </div>
                       ) : (
-                        <div className="flex items-start justify-between gap-3">
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                           <div className="flex items-start gap-3 flex-1 min-w-0">
                             <div className={`w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 ${branch.is_main ? 'bg-orange-100' : 'bg-gray-100'}`}>
                               <MapPin className={`w-5 h-5 ${branch.is_main ? 'text-orange-600' : 'text-gray-500'}`} />
                             </div>
                             <div className="flex-1 min-w-0">
                               <div className="flex items-center gap-2 flex-wrap">
-                                <h4 className="font-bold text-gray-800">{branch.name}</h4>
+                                <h4 className="font-bold text-gray-800 break-words">{branch.name}</h4>
                                 {branch.is_main && (
                                   <span className="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded-full font-medium">Ana Şube</span>
                                 )}
@@ -1190,18 +1415,18 @@ export function Settings({ onClose }: SettingsProps) {
                                 </span>
                               </div>
                               {branch.address && (
-                                <p className="text-sm text-gray-500 mt-0.5 flex items-center gap-1">
-                                  <MapPin className="w-3 h-3" /> {branch.address}
+                                <p className="text-sm text-gray-500 mt-0.5 flex items-start gap-1 break-words">
+                                  <MapPin className="w-3 h-3 shrink-0 mt-0.5" /> <span>{branch.address}</span>
                                 </p>
                               )}
                               {branch.phone && (
-                                <p className="text-sm text-gray-500 flex items-center gap-1">
-                                  <Phone className="w-3 h-3" /> {branch.phone}
+                                <p className="text-sm text-gray-500 flex items-center gap-1 break-all">
+                                  <Phone className="w-3 h-3 shrink-0" /> {branch.phone}
                                 </p>
                               )}
                             </div>
                           </div>
-                          <div className="flex items-center gap-1.5 flex-shrink-0">
+                          <div className="flex items-center gap-1.5 flex-shrink-0 self-end sm:self-start">
                             <button
                               onClick={() => {
                                 setEditingBranch(branch.id);
@@ -1262,12 +1487,12 @@ export function Settings({ onClose }: SettingsProps) {
                     <p className="text-xs text-gray-500">Sipariş ve operasyon ayarları</p>
                   </div>
                 </div>
-                <div className="flex items-center justify-between py-3 border-t border-gray-100">
-                  <div className="flex-1">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between py-3 border-t border-gray-100">
+                  <div className="flex-1 min-w-0">
                     <div className="font-semibold text-gray-800 text-sm">İptal Açıklaması Zorunlu</div>
                     <div className="text-xs text-gray-500 mt-0.5">Ürün iptal edilirken garsondan açıklama istenir</div>
                   </div>
-                  <button onClick={toggleRequireCancelReason} className="ml-4 shrink-0 transition-all active:scale-95">
+                  <button onClick={toggleRequireCancelReason} className="shrink-0 self-start sm:self-center transition-all active:scale-95">
                     {requireCancelReason
                       ? <ToggleRight className="w-10 h-10 text-orange-500" />
                       : <ToggleLeft className="w-10 h-10 text-gray-400" />
@@ -1279,14 +1504,14 @@ export function Settings({ onClose }: SettingsProps) {
           ) : activeTab === 'tables' ? (
             <div className="space-y-6">
               <div className="bg-gray-50 rounded-xl p-6">
-                <div className="flex items-center justify-between mb-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-4">
                   <h3 className="text-lg font-bold text-gray-800">Masa Grupları</h3>
                   <button
                     onClick={() => {
                       setGroupBranchId(activeBranch?.id || '');
                       setShowGroupForm(!showGroupForm);
                     }}
-                    className="flex items-center space-x-2 bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded-lg transition"
+                    className="flex items-center justify-center gap-2 bg-orange-600 hover:bg-orange-700 text-white px-4 py-2.5 rounded-lg transition w-full sm:w-auto"
                   >
                     <Plus className="w-4 h-4" />
                     <span>Yeni Grup</span>
@@ -1308,15 +1533,16 @@ export function Settings({ onClose }: SettingsProps) {
                         />
                       </div>
                       <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-1">Kısa Kod (Önek)</label>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">
+                          Kısa Kod (Önek) <span className="font-normal text-gray-400">— boşsa adın ilk harfi</span>
+                        </label>
                         <input
                           type="text"
                           value={groupPrefix}
-                          onChange={(e) => setGroupPrefix(e.target.value.toUpperCase())}
+                          onChange={(e) => setGroupPrefix(e.target.value.toLocaleUpperCase('tr-TR'))}
                           placeholder="Örn: S"
                           maxLength={3}
                           className="w-full px-3 py-2 rounded-lg border border-gray-300 focus:ring-2 focus:ring-orange-500 focus:border-transparent uppercase"
-                          required
                         />
                       </div>
                     </div>
@@ -2219,6 +2445,25 @@ export function Settings({ onClose }: SettingsProps) {
                                       {platform.getir_pos_status === 100 ? 'AÇIK' : 'KAPALI'}
                                     </strong>
                                   </span>
+                                  <span className="text-gray-300">·</span>
+                                  <span>
+                                    Restoran:{' '}
+                                    <strong
+                                      className={
+                                        platform.getir_restaurant_open === false
+                                          ? 'text-red-700'
+                                          : platform.getir_restaurant_open === true
+                                            ? 'text-green-700'
+                                            : 'text-amber-700'
+                                      }
+                                    >
+                                      {platform.getir_restaurant_open === false
+                                        ? 'KAPALI'
+                                        : platform.getir_restaurant_open === true
+                                          ? 'AÇIK'
+                                          : '?'}
+                                    </strong>
+                                  </span>
                                 </>
                               )}
                             </div>
@@ -2244,7 +2489,7 @@ export function Settings({ onClose }: SettingsProps) {
                           <div className="border-t border-gray-200 px-4 py-3">
                             <div className="flex flex-wrap items-center justify-end gap-2 mb-3">
                               <button
-                                onClick={() => handleTogglePlatform(platform.id, platform.is_active)}
+                                onClick={() => handleTogglePlatform(platform)}
                                 className={`px-3 py-1.5 rounded-lg font-bold transition text-xs ${
                                   platform.is_active
                                     ? 'bg-green-600 hover:bg-green-700 text-white'
@@ -2436,6 +2681,17 @@ export function Settings({ onClose }: SettingsProps) {
               </>
               )}
             </div>
+          ) : activeTab === 'integrations' || activeTab === 'partner-api' ? (
+            tenant ? (
+              <IntegrationsSettings
+                tenantId={tenant.id}
+                branches={branches.map((b) => ({ id: b.id, name: b.name }))}
+                activeBranchId={activeBranch?.id ?? null}
+                userId={profile?.id ?? null}
+              />
+            ) : null
+          ) : activeTab === 'loyalty' && tenant ? (
+            <LoyaltySettingsPanel tenantId={tenant.id} embedded />
           ) : activeTab === 'printers' ? (
             <PrinterSettings />
           ) : activeTab === 'scale' ? (
@@ -2498,6 +2754,21 @@ export function Settings({ onClose }: SettingsProps) {
                     className="w-full px-3 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent text-sm"
                     placeholder="Telefon numarası"
                   />
+                </div>
+                <div>
+                  <label className="block text-sm font-semibold text-gray-700 mb-1">Satış Para Birimi</label>
+                  <select
+                    value={restaurantCurrency}
+                    onChange={e => setRestaurantCurrency(normalizeCurrencyCode(e.target.value))}
+                    className="w-full px-3 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 focus:border-transparent text-sm bg-white"
+                  >
+                    {TENANT_CURRENCY_OPTIONS.map((opt) => (
+                      <option key={opt.code} value={opt.code}>{opt.label}</option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Masalar, ödeme ekranı ve fişlerde gösterilir. Ürün fiyatları aynı rakamla, seçilen birim sembolüyle satılır.
+                  </p>
                 </div>
                 <div className="pt-1 pb-1 border-t border-gray-100">
                   <p className="text-xs text-gray-400">E-posta adresi değiştirilemez</p>
@@ -2565,11 +2836,27 @@ export function Settings({ onClose }: SettingsProps) {
               <div className="bg-white border-2 border-gray-200 rounded-xl p-5">
                 <div className="flex items-center justify-between mb-4">
                   <div className="flex items-center gap-2">
-                    {isOnline ? <Wifi className="w-5 h-5 text-green-500" /> : <WifiOff className="w-5 h-5 text-red-500" />}
+                    {isSqlServerMode() ? (
+                      <DatabaseIcon className="w-5 h-5 text-emerald-600" />
+                    ) : isOnline ? (
+                      <Wifi className="w-5 h-5 text-green-500" />
+                    ) : (
+                      <WifiOff className="w-5 h-5 text-red-500" />
+                    )}
                     <div>
-                      <h4 className="font-bold text-gray-800">İnternet Bağlantısı</h4>
-                      <p className={`text-sm font-semibold ${isOnline ? 'text-green-600' : 'text-red-600'}`}>
-                        {isOnline ? 'Bağlı' : 'Bağlantı Yok'}
+                      <h4 className="font-bold text-gray-800">
+                        {isSqlServerMode() ? 'Veri kaynağı (SQL Server)' : 'İnternet Bağlantısı'}
+                      </h4>
+                      <p
+                        className={`text-sm font-semibold ${
+                          isSqlServerMode() ? 'text-emerald-700' : isOnline ? 'text-green-600' : 'text-red-600'
+                        }`}
+                      >
+                        {isSqlServerMode()
+                          ? 'Yerel SQL Server — internet gerekmez'
+                          : isOnline
+                            ? 'Bağlı'
+                            : 'Bağlantı Yok'}
                       </p>
                     </div>
                   </div>
@@ -2642,7 +2929,8 @@ export function Settings({ onClose }: SettingsProps) {
                   </div>
                   <div className="text-[11px] text-gray-400 pt-1 border-t border-gray-100">
                     Şu anki sürüm: <code className="text-gray-600">{appVersion}</code> · Otomatik
-                    kontrol uygulama açıldıktan 8 saniye sonra ve her 4 saatte bir yapılır.
+                    kontrol uygulama açıldıktan birkaç saniye içinde (4 sn, 30 sn, 2 dk, 5 dk) ve
+                    yaklaşık her 20 dakikada bir yapılır. Oturum açılınca da kontrol edilir.
                   </div>
                 </div>
               )}
@@ -2697,9 +2985,11 @@ export function Settings({ onClose }: SettingsProps) {
                 <button
                   onClick={() => {
                     if ('caches' in window) {
-                      caches.keys().then(names => names.forEach(name => caches.delete(name)));
+                      void caches.keys().then((names) => names.forEach((name) => caches.delete(name)));
                     }
                     localStorage.removeItem('productGridSize');
+                    if (tenant?.id) queryCache.invalidateMenuForTenant(tenant.id);
+                    clearAllTableGridSnapshots();
                     alert('Önbellek temizlendi. Sayfa yenilenecek.');
                     window.location.reload();
                   }}
@@ -2708,6 +2998,8 @@ export function Settings({ onClose }: SettingsProps) {
                   <RefreshCw className="w-4 h-4" /> Önbelleği Temizle
                 </button>
               </div>
+
+              <SystemDiagnosticsPanel />
             </div>
           ) : activeTab === 'security' ? (
             <div className="space-y-5">
@@ -3111,17 +3403,35 @@ export function Settings({ onClose }: SettingsProps) {
                   <Receipt className="w-6 h-6" />
                   <h3 className="text-xl font-bold">Hugin S1 Yazarkasa Entegrasyonu</h3>
                 </div>
-                <p className="text-slate-300 text-sm">Nakit odeme alindiginda Hugin S1 yazarkasaniza otomatik fis keser. Cihazin ayni ag uzerinde olmasi gerekir.</p>
+                <p className="text-slate-300 text-sm">
+                  Nakit ve kart ödemede otomatik fiş. S1 kablosuz:{' '}
+                  <a href="https://developer.hugin.com.tr/" target="_blank" rel="noopener noreferrer" className="underline text-white">PC Link</a>
+                  {' '}(4443). Eski:{' '}
+                  <a href="https://github.com/huginsdk/tps" target="_blank" rel="noopener noreferrer" className="underline text-white">TPS</a>.
+                </p>
               </div>
+
+              {!isElectron() && (
+                <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-800">
+                  <p className="font-semibold">Masaüstü uygulama gerekli</p>
+                  <p className="mt-1 text-amber-700">Yazarkasa yerel ağda; bağlantı yalnızca ŞefPOS Windows uygulamasından yapılır.</p>
+                </div>
+              )}
 
               <div className="bg-white border-2 border-slate-200 rounded-xl p-5 space-y-4">
                 <div className="flex items-center justify-between">
                   <div>
                     <h4 className="font-bold text-slate-800">Yazarkasa Entegrasyonu</h4>
-                    <p className="text-sm text-slate-500 mt-0.5">Aktif edildiginde nakit odemede otomatik fis basilir</p>
+                    <p className="text-sm text-slate-500 mt-0.5">Nakit ve kart ödemede otomatik fiş kesilir</p>
                   </div>
                   <button
-                    onClick={() => setHuginSettings(s => ({ ...s, enabled: !s.enabled }))}
+                    onClick={() => {
+                      setHuginSettings((s) => {
+                        const next = { ...s, enabled: !s.enabled };
+                        saveHuginSettings(next);
+                        return next;
+                      });
+                    }}
                     className={`relative w-12 h-7 rounded-full transition-all ${huginSettings.enabled ? 'bg-green-500' : 'bg-slate-300'}`}
                   >
                     <div className={`absolute top-1 w-5 h-5 rounded-full bg-white shadow transition-all ${huginSettings.enabled ? 'left-6' : 'left-1'}`} />
@@ -3130,6 +3440,25 @@ export function Settings({ onClose }: SettingsProps) {
 
                 {huginSettings.enabled && (
                   <div className="border-t border-slate-100 pt-4 space-y-4">
+                    <div>
+                      <label className="block text-sm font-semibold text-slate-700 mb-1">API türü</label>
+                      <select
+                        value={huginSettings.apiMode || 'pc_link'}
+                        onChange={e => {
+                          const apiMode = e.target.value as 'pc_link' | 'tps';
+                          setHuginSettings(s => ({
+                            ...s,
+                            apiMode,
+                            devicePort: apiMode === 'pc_link' ? 4443 : 3001,
+                          }));
+                        }}
+                        className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm"
+                      >
+                        <option value="pc_link">PC Link — Hugin S1 kablosuz (HTTPS 4443, önerilen)</option>
+                        <option value="tps">TPS — Eski HTTP servisi (port 3001)</option>
+                      </select>
+                    </div>
+
                     <div className="grid grid-cols-2 gap-4">
                       <div>
                         <label className="block text-sm font-semibold text-slate-700 mb-1">Cihaz IP Adresi</label>
@@ -3146,35 +3475,85 @@ export function Settings({ onClose }: SettingsProps) {
                         <input
                           type="number"
                           value={huginSettings.devicePort}
-                          onChange={e => setHuginSettings(s => ({ ...s, devicePort: parseInt(e.target.value) || 3001 }))}
+                          onChange={e => setHuginSettings(s => ({ ...s, devicePort: parseInt(e.target.value) || (s.apiMode === 'pc_link' ? 4443 : 3001) }))}
                           className="w-full px-3 py-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-slate-500 focus:border-transparent text-sm font-mono"
-                          placeholder="3001"
+                          placeholder={huginSettings.apiMode === 'pc_link' ? '4443' : '3001'}
                         />
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-sm font-semibold text-slate-700 mb-1">OKC ID</label>
-                        <input
-                          type="text"
-                          value={huginSettings.okcId}
-                          onChange={e => setHuginSettings(s => ({ ...s, okcId: e.target.value }))}
-                          className="w-full px-3 py-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-slate-500 focus:border-transparent text-sm"
-                          placeholder="Cihaz kimlik numarasi"
-                        />
+                    {huginSettings.apiMode === 'pc_link' ? (
+                      <div className="space-y-4">
+                        <div className="grid grid-cols-2 gap-4">
+                          <div>
+                            <label className="block text-sm font-semibold text-slate-700 mb-1">Yazılım ID (VKN)</label>
+                            <input
+                              type="text"
+                              value={huginSettings.softwareId || ''}
+                              onChange={e => setHuginSettings(s => ({ ...s, softwareId: e.target.value }))}
+                              className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm font-mono"
+                              placeholder="Entegrasyon sözleşmesindeki VKN"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-sm font-semibold text-slate-700 mb-1">Donanım ID (MAC)</label>
+                            <div className="flex gap-2">
+                              <input
+                                type="text"
+                                value={huginSettings.hardwareId || ''}
+                                onChange={e => setHuginSettings(s => ({ ...s, hardwareId: e.target.value.toUpperCase() }))}
+                                className="flex-1 px-3 py-2.5 border border-slate-300 rounded-lg text-sm font-mono"
+                                placeholder="AA:BB:CC:DD:EE:FF"
+                              />
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  const mac = await fetchHuginHardwareId();
+                                  if (mac) setHuginSettings(s => ({ ...s, hardwareId: mac }));
+                                }}
+                                className="px-3 py-2 border border-slate-300 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+                              >
+                                MAC al
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                        <div>
+                          <label className="block text-sm font-semibold text-slate-700 mb-1">Mali sicil no (X-SerialNo)</label>
+                          <input
+                            type="text"
+                            value={huginSettings.serialNo || ''}
+                            onChange={e => setHuginSettings(s => ({ ...s, serialNo: e.target.value }))}
+                            className="w-full px-3 py-2.5 border border-slate-300 rounded-lg text-sm font-mono"
+                            placeholder="İlk eşleşmede boş bırakılabilir; test sonrası dolar"
+                          />
+                          <p className="text-xs text-slate-500 mt-1">Cihazda Uygulama Merkezi → PC Link → VKN girin; “Eşleşme bekleniyor” iken bağlantı testi yapın.</p>
+                        </div>
                       </div>
-                      <div>
-                        <label className="block text-sm font-semibold text-slate-700 mb-1">Sifre</label>
-                        <input
-                          type="password"
-                          value={huginSettings.password}
-                          onChange={e => setHuginSettings(s => ({ ...s, password: e.target.value }))}
-                          className="w-full px-3 py-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-slate-500 focus:border-transparent text-sm"
-                          placeholder="Cihaz sifresi"
-                        />
+                    ) : (
+                      <div className="grid grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-sm font-semibold text-slate-700 mb-1">OKC ID</label>
+                          <input
+                            type="text"
+                            value={huginSettings.okcId}
+                            onChange={e => setHuginSettings(s => ({ ...s, okcId: e.target.value }))}
+                            className="w-full px-3 py-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-slate-500 focus:border-transparent text-sm"
+                            placeholder="Cihaz kimlik numarasi"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-semibold text-slate-700 mb-1">Sifre</label>
+                          <input
+                            type="password"
+                            value={huginSettings.password}
+                            onChange={e => setHuginSettings(s => ({ ...s, password: e.target.value }))}
+                            className="w-full px-3 py-2.5 border border-slate-300 rounded-lg focus:ring-2 focus:ring-slate-500 focus:border-transparent text-sm"
+                            placeholder="Cihaz sifresi"
+                          />
+                        </div>
                       </div>
-                    </div>
+                    )}
 
                     <div className="grid grid-cols-2 gap-4">
                       <div>
@@ -3271,7 +3650,17 @@ export function Settings({ onClose }: SettingsProps) {
                         setHuginTesting(true);
                         setHuginTestResult(null);
                         const result = await testHuginConnection(huginSettings);
-                        setHuginTestResult({ ok: result.success, msg: result.success ? 'Cihaza basariyla baglandi!' : (result.error || 'Baglanti hatasi') });
+                        if (result.success && result.serialNo) {
+                          const next = { ...huginSettings, serialNo: result.serialNo };
+                          setHuginSettings(next);
+                          saveHuginSettings(next);
+                        }
+                        const msg = result.success
+                          ? result.serialNo
+                            ? `Bağlantı ve belge testi OK. Mali sicil: ${result.serialNo}`
+                            : 'Cihaza başarıyla bağlandı!'
+                          : (result.error || 'Bağlantı hatası');
+                        setHuginTestResult({ ok: result.success, msg });
                         setHuginTesting(false);
                       }}
                       disabled={huginTesting}
@@ -3304,11 +3693,11 @@ export function Settings({ onClose }: SettingsProps) {
               <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-800">
                 <p className="font-semibold mb-1">Kurulum Notu</p>
                 <ul className="space-y-1 list-disc list-inside text-amber-700">
-                  <li>Hugin S1 cihazi bilgisayarinizla ayni ag (Wi-Fi/LAN) uzerinde olmali</li>
-                  <li>Cihazin IP adresini Hugin S1 ekranindaki ag ayarlarindan ogrenebilirsiniz</li>
-                  <li>OKC ID ve sifre bilgilerini Hugin yetkili servisinden alin</li>
-                  <li>Nakit ve kredi karti odemelerde otomatik fis kesilir</li>
-                  <li>Kismi odeme durumunda her odeme ayri PayItem olarak gonderilir</li>
+                  <li>Cihaz ve kasa PC aynı Wi‑Fi/LAN üzerinde olmalı</li>
+                  <li>S1: Uygulama Merkezi → PC Link → Hugin entegrasyon VKN → ekrandaki IP (genelde port 4443)</li>
+                  <li>İlk eşleşme: Bağlantı testi → dönen mali sicil otomatik kaydedilir</li>
+                  <li>ŞefPOS yalnızca masaüstü (Electron) uygulamasından yazarkasaya bağlanır</li>
+                  <li>Nakit ve kredi kartı ödemelerde otomatik fiş; kısmi ödemede her ödeme ayrı satır</li>
                 </ul>
               </div>
             </div>
@@ -4146,6 +4535,7 @@ interface GetirPlatformControlsProps {
 function GetirPlatformControls({ platform, onChanged }: GetirPlatformControlsProps) {
   const [busy, setBusy] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [closeMinutes, setCloseMinutes] = useState<15 | 30 | 45>(15);
   const [section, setSection] = useState<'controls' | 'webhooks' | 'help' | null>('controls');
 
   const newOrderUrl = publicPartnerEdgeUrl('getir-webhook?type=new');
@@ -4163,6 +4553,38 @@ function GetirPlatformControls({ platform, onChanged }: GetirPlatformControlsPro
       setTimeout(() => setCopiedKey(null), 1500);
     } catch {
       window.prompt('Kopyalanacak değer:', text);
+    }
+  };
+
+  const setRestaurantOpen = async (open: boolean) => {
+    setBusy(open ? 'rest-open' : 'rest-close');
+    try {
+      const res = await syncGetirRestaurantOpen(platform.id, open, {
+        timeOffAmount: closeMinutes,
+        openPosToo: open,
+      });
+      if (!res.ok) {
+        const dataObj =
+          res.data && typeof res.data === 'object' ? (res.data as Record<string, unknown>) : {};
+        const msg =
+          (dataObj.message as string | undefined) ||
+          (dataObj.error as string | undefined) ||
+          res.error ||
+          'Getir tarafı hata döndü';
+        alert(`Restoran durumu güncellenemedi: ${msg}`);
+      } else {
+        if (res.error) alert(res.error);
+        else {
+          alert(
+            open
+              ? 'Getir uygulamasında restoran AÇIK. POS entegrasyonu da açıldı (gerekirse).'
+              : `Getir uygulamasında restoran ${closeMinutes} dk kapalı olarak işaretlendi.`,
+          );
+        }
+        onChanged();
+      }
+    } finally {
+      setBusy(null);
     }
   };
 
@@ -4308,8 +4730,14 @@ function GetirPlatformControls({ platform, onChanged }: GetirPlatformControlsPro
         <SectionHeader
           id="controls"
           icon={SettingsIcon}
-          title="Çalışma Modu & POS Durumu"
-          subtitle={`Ortam: ${platform.getir_environment === 'production' ? 'CANLI' : 'TEST'} · POS: ${platform.getir_pos_status === 100 ? 'AÇIK' : 'KAPALI'}`}
+          title="Restoran, POS & Ortam"
+          subtitle={`Ortam: ${platform.getir_environment === 'production' ? 'CANLI' : 'TEST'} · Restoran: ${
+            platform.getir_restaurant_open === false
+              ? 'KAPALI'
+              : platform.getir_restaurant_open === true
+                ? 'AÇIK'
+                : 'bilinmiyor'
+          } · POS: ${platform.getir_pos_status === 100 ? 'AÇIK' : 'KAPALI'}`}
         />
         {section === 'controls' && (
           <div className="px-3 pb-3 pt-1 space-y-3">
@@ -4344,7 +4772,49 @@ function GetirPlatformControls({ platform, onChanged }: GetirPlatformControlsPro
             </div>
 
             <div>
-              <label className="text-[11px] text-purple-900 font-bold block mb-1.5">Getir POS Durumu</label>
+              <label className="text-[11px] text-purple-900 font-bold block mb-1">Restoran Açık / Kapalı (Getir uygulaması)</label>
+              <p className="text-[10px] text-slate-600 mb-2 leading-snug">
+                Müşterinin Getir uygulamasında gördüğü durum. Getir paneline girmeden buradan yönetin.
+              </p>
+              <div className="grid grid-cols-2 gap-2 mb-2">
+                <button
+                  type="button"
+                  onClick={() => setRestaurantOpen(true)}
+                  disabled={busy !== null}
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-black py-2.5 px-2 rounded-lg shadow disabled:opacity-50 text-xs"
+                >
+                  {busy === 'rest-open' ? '...' : 'RESTORANI AÇ'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRestaurantOpen(false)}
+                  disabled={busy !== null}
+                  className="bg-rose-600 hover:bg-rose-700 text-white font-black py-2.5 px-2 rounded-lg shadow disabled:opacity-50 text-xs"
+                >
+                  {busy === 'rest-close' ? '...' : 'RESTORANI KAPAT'}
+                </button>
+              </div>
+              <div className="flex items-center gap-2 mb-3">
+                <span className="text-[10px] text-slate-600 shrink-0">Kapama süresi:</span>
+                {([15, 30, 45] as const).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setCloseMinutes(m)}
+                    className={`px-2 py-1 rounded text-[10px] font-bold border ${
+                      closeMinutes === m
+                        ? 'bg-purple-600 text-white border-purple-600'
+                        : 'bg-white text-purple-800 border-purple-200'
+                    }`}
+                  >
+                    {m} dk
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <label className="text-[11px] text-purple-900 font-bold block mb-1.5">Getir POS Durumu (teknik entegrasyon)</label>
               <div className="grid grid-cols-3 gap-2">
                 <button
                   type="button"
@@ -4580,15 +5050,16 @@ function BranchDefaultDiscountRow({
   branch: Branch;
   onChange: (branchId: string, patch: { percent?: number; active?: boolean }) => Promise<void> | void;
 }) {
-  const initialPercent = Number(branch.default_discount_percent || 0);
-  const initialActive = branch.default_discount_active === true;
+  const savedPercent = Number(branch.default_discount_percent || 0);
+  const savedActive = branch.default_discount_active === true;
 
   // Input metnini olduğu gibi tut (virgül de nokta da kabul). Sayıya çevirme
   // ancak blur/commit anında olur — böylece "3," yazarken "3" olarak yenilenmez.
   const formatForInput = (n: number) => (n === 0 ? '' : String(n).replace('.', ','));
-  const [inputText, setInputText] = useState<string>(formatForInput(initialPercent));
-  const [active, setActive] = useState<boolean>(initialActive);
+  const [inputText, setInputText] = useState<string>(formatForInput(savedPercent));
+  const [active, setActive] = useState<boolean>(savedActive);
   const [saving, setSaving] = useState(false);
+  const [savedFlash, setSavedFlash] = useState(false);
 
   useEffect(() => {
     setInputText(formatForInput(Number(branch.default_discount_percent || 0)));
@@ -4599,13 +5070,26 @@ function BranchDefaultDiscountRow({
     const raw = s.trim().replace(',', '.');
     if (!raw) return 0;
     const n = Number(raw);
-    if (Number.isNaN(n)) return initialPercent;
+    if (Number.isNaN(n)) return savedPercent;
     return Math.min(100, Math.max(0, Math.round(n * 100) / 100));
   };
 
-  const commit = async (next: { percent?: number; active?: boolean }) => {
+  const draftPercent = parsePercent(inputText);
+  const dirty = draftPercent !== savedPercent || active !== savedActive;
+
+  const commit = async (next?: { percent?: number; active?: boolean }) => {
+    const percent = next?.percent ?? draftPercent;
+    const nextActive = next?.active ?? active;
     setSaving(true);
-    try { await onChange(branch.id, next); } finally { setSaving(false); }
+    try {
+      await onChange(branch.id, { percent, active: nextActive });
+      setInputText(formatForInput(percent));
+      setActive(nextActive);
+      setSavedFlash(true);
+      window.setTimeout(() => setSavedFlash(false), 1800);
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -4621,7 +5105,7 @@ function BranchDefaultDiscountRow({
           </div>
         </div>
       </div>
-      <div className="flex items-center gap-2 shrink-0">
+      <div className="flex items-center gap-2 shrink-0 flex-wrap justify-end">
         <div className="relative">
           <input
             type="text"
@@ -4633,10 +5117,11 @@ function BranchDefaultDiscountRow({
               const cleaned = e.target.value.replace(/[^\d.,]/g, '');
               setInputText(cleaned);
             }}
-            onBlur={() => {
-              const parsed = parsePercent(inputText);
-              setInputText(formatForInput(parsed));
-              if (parsed !== initialPercent) void commit({ percent: parsed });
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                void commit();
+              }
             }}
             disabled={saving}
             className="w-20 px-2 py-1.5 pr-7 rounded-lg border-2 border-slate-200 focus:border-orange-400 focus:outline-none text-right font-bold text-sm"
@@ -4648,8 +5133,6 @@ function BranchDefaultDiscountRow({
           onClick={() => {
             const next = !active;
             setActive(next);
-            const parsed = parsePercent(inputText);
-            void commit({ active: next, percent: parsed });
           }}
           disabled={saving}
           className="transition-all active:scale-95"
@@ -4659,6 +5142,20 @@ function BranchDefaultDiscountRow({
             ? <ToggleRight className="w-9 h-9 text-orange-500" />
             : <ToggleLeft  className="w-9 h-9 text-slate-300" />
           }
+        </button>
+        <button
+          type="button"
+          onClick={() => void commit()}
+          disabled={saving || !dirty}
+          className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all active:scale-95 ${
+            dirty
+              ? 'bg-orange-600 hover:bg-orange-700 text-white shadow-sm'
+              : savedFlash
+                ? 'bg-emerald-100 text-emerald-700'
+                : 'bg-slate-100 text-slate-400 cursor-not-allowed'
+          }`}
+        >
+          {saving ? 'Kaydediliyor…' : savedFlash && !dirty ? 'Kaydedildi' : 'Kaydet'}
         </button>
       </div>
     </div>

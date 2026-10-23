@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo, useCallback, memo, startTransition } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import {
@@ -8,21 +8,20 @@ import {
 } from 'lucide-react';
 import { Courier, DeliveryCustomer } from './TakeawayOrders';
 import { loadPrintSettings, printTakeawayReceipt } from '../lib/printService';
+import { notifyHemenYolda } from '../lib/hemenyoldaApi';
+import { queryCache } from '../lib/queryCache';
+import {
+  searchTakeawayCustomers,
+  type CariCustomerHit,
+  type DeliveryCustomerHit,
+  type TakeawayCustomerSuggestion,
+} from '../lib/takeawayCustomerSearch';
+import { sendCourierAssignmentNotification } from '../lib/courierNotification';
+import { recordTakeawayPaymentIfNeeded } from '../lib/takeawayPayment';
 
-/** Cari hesap (customers tablosu) — paket formunda teslimat kaydı ile birlikte aranır */
-interface CariCustomerRow {
-  id: string;
-  name: string;
-  phone: string | null;
-  email: string | null;
-  address: string | null;
-  notes: string | null;
-  is_active: boolean;
-}
-
-type CustomerSuggestion =
-  | { kind: 'delivery'; row: DeliveryCustomer }
-  | { kind: 'cari'; row: CariCustomerRow };
+type CustomerSuggestion = TakeawayCustomerSuggestion;
+type CariCustomerRow = CariCustomerHit;
+type DeliveryCustomerSearchRow = DeliveryCustomerHit;
 
 type Category = { id: string; name: string; sort_order: number };
 type Product = { id: string; name: string; price: number; category_id: string | null; tax_rate?: number | null };
@@ -35,10 +34,10 @@ interface DeliveryOrderFormProps {
   editOrder?: any | null;
   /** Caller ID akışından gelen önyükleme: telefonu yaz, varsa müşteriyi seç. */
   prefillCustomer?: { phone: string; matched: DeliveryCustomer | null } | null;
-  onClose: () => void;
+  onClose: (result?: { orderId?: string; reload?: boolean }) => void;
 }
 
-export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClose }: DeliveryOrderFormProps) {
+function DeliveryOrderFormInner({ couriers, editOrder, prefillCustomer, onClose }: DeliveryOrderFormProps) {
   const { tenant, user, profile, activeBranch } = useAuth();
 
   const [subtype, setSubtype] = useState<OrderSubtype>(editOrder?.order_type === 'delivery' ? 'delivery' : editOrder?.order_subtype === 'gel_al' ? 'gel_al' : 'takeaway');
@@ -65,32 +64,51 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
   const [lastOrders, setLastOrders] = useState<any[]>([]);
   const [showLastOrders, setShowLastOrders] = useState(false);
   const [loadingCustomer, setLoadingCustomer] = useState(false);
+  const [fieldError, setFieldError] = useState<'name' | 'phone' | 'address' | 'cart' | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  /** Mobil paket: 1=ürün seç, 2=müşteri + onay (masaüstünde yok sayılır) */
+  const [mobileStep, setMobileStep] = useState<1 | 2>(1);
+  const productsSectionRef = useRef<HTMLDivElement | null>(null);
   const phoneDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const customerSearchSeq = useRef(0);
+  const customerSearchRef = useRef<HTMLDivElement | null>(null);
+  const nameInputRef = useRef<HTMLInputElement | null>(null);
+  const phoneInputRef = useRef<HTMLInputElement | null>(null);
+  const addressInputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const availableCouriers = couriers.filter(c => c.status === 'available');
   const isDelivery = subtype === 'delivery';
 
   useEffect(() => {
     if (!tenant) return;
-    void supabase
-      .from('categories')
-      .select('id, name, sort_order')
-      .eq('tenant_id', tenant.id)
-      .order('sort_order')
-      .then(({ data, error }) => {
-        if (error) console.error('[Paket] kategoriler:', error);
-        if (data) setCategories(data);
-      });
-    void supabase
-      .from('products')
-      .select('id, name, price, category_id, tax_rate')
-      .eq('tenant_id', tenant.id)
-      .eq('is_active', true)
-      .order('name')
-      .then(({ data, error }) => {
-        if (error) console.error('[Paket] ürünler:', error);
-        if (data) setProducts(data as Product[]);
-      });
+    let cancelled = false;
+    void queryCache.getProductsAndCategories(tenant.id).then(({ products: prods, categories: cats }) => {
+      if (cancelled) return;
+      setCategories(
+        (cats || [])
+          .map((c: { id: string; name: string; sort_order?: number }) => ({
+            id: c.id,
+            name: c.name,
+            sort_order: c.sort_order ?? 0,
+          }))
+          .sort((a: Category, b: Category) => a.sort_order - b.sort_order),
+      );
+      setProducts(
+        (prods || [])
+          .filter((p: { is_active?: boolean | null }) => p.is_active !== false)
+          .map((p: { id: string; name: string; price: number; category_id: string | null; tax_rate?: number | null }) => ({
+            id: p.id,
+            name: p.name,
+            price: p.price,
+            category_id: p.category_id,
+            tax_rate: p.tax_rate,
+          }))
+          .sort((a: Product, b: Product) => a.name.localeCompare(b.name, 'tr')),
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [tenant]);
 
   useEffect(() => {
@@ -115,91 +133,98 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
       setCustomerPhone(phone);
       setCustomerName('');
       setDeliveryAddress('');
+      setShowSuggestions(false);
+      window.setTimeout(() => nameInputRef.current?.focus(), 150);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefillCustomer?.phone, prefillCustomer?.matched?.id]);
 
-  const searchCustomers = async (raw: string) => {
-    const q = raw.trim();
-    if (!tenant || q.length < 2) {
-      setCustomerSuggestions([]);
+  useEffect(() => {
+    if (!showSuggestions) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (customerSearchRef.current?.contains(e.target as Node)) return;
       setShowSuggestions(false);
-      return;
-    }
-    setLoadingCustomer(true);
-    const safe = q.replace(/%/g, '').replace(/,/g, ' ').trim();
-    const pattern = `%${safe}%`;
+    };
+    document.addEventListener('pointerdown', onPointerDown);
+    return () => document.removeEventListener('pointerdown', onPointerDown);
+  }, [showSuggestions]);
 
-    const [byDelPhone, byDelName, byCariName, byCariPhone] = await Promise.all([
-      supabase
-        .from('delivery_customers')
-        .select('*')
-        .eq('tenant_id', tenant.id)
-        .ilike('phone', pattern)
-        .order('last_order_at', { ascending: false })
-        .limit(8),
-      supabase
-        .from('delivery_customers')
-        .select('*')
-        .eq('tenant_id', tenant.id)
-        .ilike('full_name', pattern)
-        .order('last_order_at', { ascending: false })
-        .limit(8),
-      supabase
-        .from('customers')
-        .select('id, name, phone, email, address, notes, is_active')
-        .eq('tenant_id', tenant.id)
-        .eq('is_active', true)
-        .ilike('name', pattern)
-        .order('name', { ascending: true })
-        .limit(8),
-      supabase
-        .from('customers')
-        .select('id, name, phone, email, address, notes, is_active')
-        .eq('tenant_id', tenant.id)
-        .eq('is_active', true)
-        .ilike('phone', pattern)
-        .order('name', { ascending: true })
-        .limit(8),
-    ]);
+  const searchCustomers = useCallback(
+    async (raw: string, seq: number) => {
+      if (!tenant) return;
+      const merged = await searchTakeawayCustomers(tenant.id, raw);
+      if (seq !== customerSearchSeq.current) return;
+      startTransition(() => {
+        setCustomerSuggestions(merged);
+        setShowSuggestions(merged.length > 0);
+        setLoadingCustomer(false);
+      });
+    },
+    [tenant],
+  );
 
-    const err = byDelPhone.error || byDelName.error || byCariName.error || byCariPhone.error;
-    if (err) console.error('[Paket] müşteri ara:', err);
+  const focusCustomerField = useCallback((field: 'name' | 'phone' | 'address') => {
+    setShowSuggestions(false);
+    requestAnimationFrame(() => {
+      window.setTimeout(() => {
+        if (field === 'name') nameInputRef.current?.focus();
+        else if (field === 'phone') phoneInputRef.current?.focus();
+        else addressInputRef.current?.focus();
+      }, 0);
+    });
+  }, []);
 
-    const merged: CustomerSuggestion[] = [];
-    const seenDel = new Set<string>();
-    const seenCari = new Set<string>();
-
-    for (const row of [...(byDelPhone.data || []), ...(byDelName.data || [])]) {
-      const r = row as DeliveryCustomer;
-      if (seenDel.has(r.id)) continue;
-      seenDel.add(r.id);
-      merged.push({ kind: 'delivery', row: r });
-    }
-    for (const row of [...(byCariName.data || []), ...(byCariPhone.data || [])]) {
-      const r = row as CariCustomerRow;
-      if (seenCari.has(r.id)) continue;
-      seenCari.add(r.id);
-      merged.push({ kind: 'cari', row: r });
-    }
-
-    setCustomerSuggestions(merged);
-    setShowSuggestions(merged.length > 0);
-    setLoadingCustomer(false);
-  };
+  const showValidationError = useCallback(
+    (field: 'name' | 'phone' | 'address' | 'cart') => {
+      setFieldError(field);
+      if (field === 'cart') {
+        setMobileStep(1);
+        productsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } else {
+        setMobileStep(2);
+        focusCustomerField(field);
+      }
+    },
+    [focusCustomerField],
+  );
 
   const handleCustomerSearchChange = (val: string) => {
+    if (fieldError === 'phone') setFieldError(null);
     setCustomerPhone(val);
-    setSelectedDeliveryCustomer(null);
-    setSelectedCariCustomer(null);
     if (phoneDebounce.current) clearTimeout(phoneDebounce.current);
-    phoneDebounce.current = setTimeout(() => searchCustomers(val), 300);
+    const q = val.trim();
+    if (q.length < 3) {
+      startTransition(() => {
+        setCustomerSuggestions([]);
+        setShowSuggestions(false);
+        setLoadingCustomer(false);
+      });
+      return;
+    }
+    if (selectedDeliveryCustomer || selectedCariCustomer) {
+      setSelectedDeliveryCustomer(null);
+      setSelectedCariCustomer(null);
+    }
+    const seq = ++customerSearchSeq.current;
+    phoneDebounce.current = setTimeout(() => {
+      startTransition(() => setLoadingCustomer(true));
+      void searchCustomers(val, seq);
+    }, 420);
   };
 
-  const loadLastOrdersForDeliveryCustomer = async (customer: DeliveryCustomer) => {
+  useEffect(() => {
+    return () => {
+      if (phoneDebounce.current) clearTimeout(phoneDebounce.current);
+    };
+  }, []);
+
+  const LAST_ORDERS_SELECT =
+    'id, created_at, subtotal, total_amount, order_items(quantity, unit_price, products(name))';
+
+  const loadLastOrdersForDeliveryCustomer = async (customer: DeliveryCustomerSearchRow) => {
     const { data } = await supabase
       .from('orders')
-      .select('*, order_items(quantity, unit_price, products(name))')
+      .select(LAST_ORDERS_SELECT)
       .eq('delivery_customer_id', customer.id)
       .order('created_at', { ascending: false })
       .limit(3);
@@ -207,53 +232,99 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
   };
 
   const loadLastOrdersForCari = async (cari: CariCustomerRow) => {
-    const { data: byId } = await supabase
-      .from('orders')
-      .select('*, order_items(quantity, unit_price, products(name))')
-      .eq('tenant_id', tenant.id)
-      .eq('customer_id', cari.id)
-      .in('order_type', ['takeaway', 'delivery'])
-      .order('created_at', { ascending: false })
-      .limit(3);
-    let data = byId;
-    if ((!data || data.length === 0) && cari.phone?.trim()) {
-      const p = cari.phone.trim().replace(/%/g, '');
-      const { data: byPhone } = await supabase
+    if (!tenant) return;
+    let data: typeof lastOrders | null = null;
+    const base = () =>
+      supabase
         .from('orders')
-        .select('*, order_items(quantity, unit_price, products(name))')
+        .select(LAST_ORDERS_SELECT)
         .eq('tenant_id', tenant.id)
         .in('order_type', ['takeaway', 'delivery'])
-        .ilike('customer_phone', `%${p}%`)
         .order('created_at', { ascending: false })
         .limit(3);
+
+    if (cari.phone?.trim()) {
+      const p = cari.phone.trim().replace(/%/g, '');
+      const { data: byPhone } = await base().ilike('customer_phone', `%${p}%`);
       data = byPhone;
+    }
+    if (!data?.length) {
+      const { data: byCariKey } = await base().eq('customer_phone', `cari-${cari.id}`);
+      data = byCariKey;
+    }
+    if (!data?.length && cari.name?.trim()) {
+      const { data: byName } = await base().ilike('customer_name', cari.name.trim());
+      data = byName;
     }
     if (data) setLastOrders(data);
   };
 
-  const selectDeliveryCustomer = async (customer: DeliveryCustomer) => {
+  const applyDeliveryCustomer = (customer: DeliveryCustomerSearchRow) => {
     setSelectedDeliveryCustomer(customer);
     setSelectedCariCustomer(null);
     setCustomerPhone(customer.phone);
     setCustomerName(customer.full_name);
     setDeliveryAddress(customer.address || '');
     setShowSuggestions(false);
-    await loadLastOrdersForDeliveryCustomer(customer);
+    setLoadingCustomer(false);
   };
 
-  const selectCariCustomer = async (cari: CariCustomerRow) => {
+  const applyCariCustomer = (cari: CariCustomerRow) => {
     setSelectedCariCustomer(cari);
     setSelectedDeliveryCustomer(null);
     setCustomerPhone(cari.phone?.trim() || '');
     setCustomerName(cari.name);
     setDeliveryAddress(cari.address || '');
     setShowSuggestions(false);
-    await loadLastOrdersForCari(cari);
+    setLoadingCustomer(false);
+  };
+
+  const selectDeliveryCustomer = async (customer: DeliveryCustomerSearchRow) => {
+    applyDeliveryCustomer(customer);
+    void loadLastOrdersForDeliveryCustomer(customer);
+  };
+
+  const selectCariCustomer = async (cari: CariCustomerRow) => {
+    applyCariCustomer(cari);
+    void loadLastOrdersForCari(cari);
   };
 
   const pickSuggestion = (s: CustomerSuggestion) => {
-    if (s.kind === 'delivery') void selectDeliveryCustomer(s.row);
-    else void selectCariCustomer(s.row);
+    if (s.kind === 'delivery') {
+      applyDeliveryCustomer(s.row);
+      void loadLastOrdersForDeliveryCustomer(s.row);
+    } else {
+      applyCariCustomer(s.row);
+      void loadLastOrdersForCari(s.row);
+    }
+  };
+
+  const looksLikePhone = (raw: string) => {
+    const digits = raw.replace(/\D/g, '');
+    return digits.length >= 7;
+  };
+
+  const resolveCustomerFields = () => {
+    const phoneRaw = customerPhone.trim();
+    let name =
+      customerName.trim() ||
+      selectedDeliveryCustomer?.full_name?.trim() ||
+      selectedCariCustomer?.name?.trim() ||
+      '';
+    if (!name && phoneRaw && !looksLikePhone(phoneRaw)) {
+      name = phoneRaw;
+    }
+    const phone = phoneRaw || selectedCariCustomer?.phone?.trim() || '';
+    let address =
+      deliveryAddress.trim() ||
+      selectedCariCustomer?.address?.trim() ||
+      selectedDeliveryCustomer?.address?.trim() ||
+      '';
+    if (!address) {
+      if (subtype === 'gel_al') address = 'Gel-Al';
+      else if (!isDelivery) address = 'Paket Servis';
+    }
+    return { name, phone, address };
   };
 
   const reorderFromHistory = (order: any) => {
@@ -271,11 +342,19 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
     setShowLastOrders(false);
   };
 
-  const filteredProducts = products.filter(p => {
-    const matchSearch = !search || p.name.toLowerCase().includes(search.toLowerCase());
-    const matchCat = !selectedCategory || p.category_id === selectedCategory;
-    return matchSearch && matchCat;
-  });
+  const searchLower = search.trim().toLowerCase();
+  const filteredProducts = useMemo(() => {
+    return products.filter((p) => {
+      const matchSearch = !searchLower || p.name.toLowerCase().includes(searchLower);
+      const matchCat = !selectedCategory || p.category_id === selectedCategory;
+      return matchSearch && matchCat;
+    });
+  }, [products, searchLower, selectedCategory]);
+
+  const cartTotal = useMemo(
+    () => cart.reduce((s, i) => s + i.product.price * i.quantity, 0),
+    [cart],
+  );
 
   const addToCart = (product: Product) => {
     setCart(prev => {
@@ -299,23 +378,32 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
     setCart(prev => prev.map(i => i.product.id === productId ? { ...i, note } : i));
   };
 
-  const cartTotal = cart.reduce((s, i) => s + i.product.price * i.quantity, 0);
+  /** Telefonsuz cari için dahili anahtar: delivery_customers ile eşleşir. */
+  const cariDeliveryPhoneKey = (cari: CariCustomerRow) => `cari-${cari.id}`;
 
-  const upsertCustomer = async (): Promise<string | null> => {
-    if (!tenant || !customerPhone.trim()) return null;
+  const upsertDeliveryCustomer = async (
+    name: string,
+    phone: string,
+    address: string,
+    cari: CariCustomerRow | null,
+  ): Promise<string | null> => {
+    if (!tenant) return null;
+    const phoneKey = phone.trim() || (cari ? cariDeliveryPhoneKey(cari) : '');
+    if (!phoneKey) return null;
+
     const { data: existing } = await supabase
       .from('delivery_customers')
       .select('id')
       .eq('tenant_id', tenant.id)
-      .eq('phone', customerPhone.trim())
+      .eq('phone', phoneKey)
       .maybeSingle();
 
     if (existing) {
       await supabase
         .from('delivery_customers')
         .update({
-          full_name: customerName.trim(),
-          address: deliveryAddress.trim(),
+          full_name: name,
+          address: address,
           last_order_at: new Date().toISOString(),
         })
         .eq('id', existing.id);
@@ -325,9 +413,9 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
     const { data: created } = await supabase.from('delivery_customers').insert({
       tenant_id: tenant.id,
       branch_id: activeBranch?.id || null,
-      full_name: customerName.trim(),
-      phone: customerPhone.trim(),
-      address: deliveryAddress.trim(),
+      full_name: name,
+      phone: phoneKey,
+      address: address,
       last_order_at: new Date().toISOString(),
       order_count: 1,
     }).select('id').single();
@@ -336,13 +424,49 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
 
   const handleSubmit = async () => {
     if (!tenant || !user) return;
-    if (!customerName.trim()) { alert('Müşteri adı zorunludur'); return; }
-    if (!customerPhone.trim()) { alert('Telefon zorunludur'); return; }
-    if (!deliveryAddress.trim()) { alert('Adres zorunludur'); return; }
-    if (cart.length === 0) { alert('En az 1 ürün ekleyin'); return; }
+    setFieldError(null);
+    setSubmitError(null);
+    setShowSuggestions(false);
+    const { name, phone, address } = resolveCustomerFields();
+    if (!name) {
+      showValidationError('name');
+      return;
+    }
+    if (!selectedCariCustomer && !phone) {
+      showValidationError('phone');
+      return;
+    }
+    if (isDelivery && !deliveryAddress.trim() && !selectedCariCustomer?.address?.trim()) {
+      showValidationError('address');
+      return;
+    }
+    if (cart.length === 0) {
+      showValidationError('cart');
+      return;
+    }
     setSubmitting(true);
 
-    const customerId = await upsertCustomer();
+    try {
+    let deliveryCustomerId =
+      selectedDeliveryCustomer?.id ??
+      null;
+    if (deliveryCustomerId) {
+      void supabase
+        .from('delivery_customers')
+        .update({
+          full_name: name,
+          address: address,
+          last_order_at: new Date().toISOString(),
+        })
+        .eq('id', deliveryCustomerId);
+    } else {
+      deliveryCustomerId = await upsertDeliveryCustomer(
+        name,
+        phone,
+        address,
+        selectedCariCustomer,
+      );
+    }
     const courier = assignCourierId ? couriers.find(c => c.id === assignCourierId) : null;
 
     const orderPayload: Record<string, any> = {
@@ -354,9 +478,9 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
       order_subtype: subtype === 'gel_al' ? 'gel_al' : null,
       status: 'active',
       delivery_status: 'pending',
-      customer_name: customerName.trim(),
-      customer_phone: customerPhone.trim() || null,
-      delivery_address: deliveryAddress.trim() || null,
+      customer_name: name,
+      customer_phone: phone || null,
+      delivery_address: address || null,
       delivery_note: deliveryNote.trim() || null,
       payment_method: paymentMethod,
       payment_collected: paymentCollected,
@@ -364,7 +488,7 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
       estimated_delivery_minutes: isDelivery ? parseInt(estimatedMinutes) || 30 : null,
       courier_id: courier?.id || null,
       courier_name: courier?.full_name || null,
-      delivery_customer_id: customerId,
+      delivery_customer_id: deliveryCustomerId,
       subtotal: cartTotal,
       total_amount: cartTotal,
     };
@@ -376,16 +500,32 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
     }
 
     let orderId: string;
+    let savedOrderNumber = editOrder?.order_number || '';
 
     if (editOrder) {
-      const { data: updated } = await supabase.from('orders').update(orderPayload).eq('id', editOrder.id).select('id').single();
+      const { data: updated } = await supabase.from('orders').update(orderPayload).eq('id', editOrder.id).select('id, order_number').single();
       if (!updated) { setSubmitting(false); return; }
       orderId = updated.id;
+      savedOrderNumber = updated.order_number || savedOrderNumber;
       await supabase.from('order_items').delete().eq('order_id', orderId);
     } else {
       const { data: created, error } = await supabase.from('orders').insert(orderPayload).select('id, order_number').single();
-      if (error || !created) { alert('Hata: ' + error?.message); setSubmitting(false); return; }
+      if (error || !created) {
+        const msg = error?.message || 'Sipariş kaydedilemedi';
+        const lower = msg.toLowerCase();
+        const friendly =
+          msg.includes('orders_tenant_id_order_number_key') || msg.includes('duplicate key')
+            ? 'Sipariş numarası çakıştı. Lütfen «Siparişi Oluştur»a bir kez daha basın.'
+            : lower.includes('order_number allocation failed')
+              ? 'Sipariş numarası üretilemedi. Birkaç saniye bekleyip tekrar deneyin.'
+            : lower.includes('statement timeout') || lower.includes('canceling statement')
+              ? 'Sipariş kaydı sunucuda zaman aşımına uğradı. Birkaç saniye bekleyip tekrar deneyin.'
+              : msg;
+        setSubmitError(friendly);
+        return;
+      }
       orderId = created.id;
+      savedOrderNumber = created.order_number || orderId.slice(0, 8).toUpperCase();
     }
 
     const items = cart.map((i) => {
@@ -403,40 +543,88 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
         notes: i.note || null,
       };
     });
-    await supabase.from('order_items').insert(items);
+    const { error: itemsErr } = await supabase.from('order_items').insert(items);
+    if (itemsErr) {
+      setSubmitError(itemsErr.message || 'Ürün satırları kaydedilemedi');
+      return;
+    }
 
-    if (courier) await supabase.from('couriers').update({ status: 'busy' }).eq('id', courier.id);
+    const receiptOrderNumber = savedOrderNumber || orderId.slice(0, 8).toUpperCase();
+    const printSnapshot = {
+      name,
+      phone,
+      address,
+      deliveryNote: deliveryNote.trim(),
+      cart: [...cart],
+      cartTotal,
+      courierName: courier?.full_name,
+      estimatedMinutes: isDelivery ? parseInt(estimatedMinutes) || 30 : 0,
+    };
+
+    onClose(editOrder ? { reload: true } : { orderId });
+
+    if (paymentCollected) {
+      void recordTakeawayPaymentIfNeeded({
+        tenantId: tenant.id,
+        branchId: activeBranch?.id ?? null,
+        orderId,
+        orderNumber: receiptOrderNumber,
+        orderType: isDelivery ? 'delivery' : 'takeaway',
+        orderSubtype: subtype === 'gel_al' ? 'gel_al' : null,
+        paymentMethod,
+        amount: cartTotal,
+        createdBy: user.id,
+        shouldRecord: true,
+      });
+    }
+
+    if (courier) {
+      void supabase.from('couriers').update({ status: 'busy' }).eq('id', courier.id);
+      void sendCourierAssignmentNotification(
+        tenant.id,
+        courier.id,
+        orderId,
+        receiptOrderNumber,
+        address || null,
+      );
+    }
 
     if (!editOrder) {
       const printSettings = loadPrintSettings();
       if ((printSettings as any).autoPrintTakeaway !== false) {
-        printTakeawayReceipt({
+        void printTakeawayReceipt({
           settings: printSettings,
+          tenant,
           orderType: isDelivery ? 'delivery' : 'takeaway',
-          orderNumber: '',
-          customerName: customerName.trim(),
-          customerPhone: customerPhone.trim(),
-          // Adres her durumda fişe basılır — paket / gel-al / kurye fark etmez.
-          // Müşteri adres yazdıysa termal fişte "MUSTERI ADRESI" kutusunda görünür.
-          deliveryAddress: deliveryAddress.trim(),
-          deliveryNote: deliveryNote.trim(),
-          courierName: courier?.full_name,
-          estimatedMinutes: isDelivery ? parseInt(estimatedMinutes) || 30 : 0,
-          items: cart.map(i => ({
+          orderNumber: receiptOrderNumber,
+          customerName: printSnapshot.name,
+          customerPhone: printSnapshot.phone,
+          deliveryAddress: printSnapshot.address,
+          deliveryNote: printSnapshot.deliveryNote,
+          courierName: printSnapshot.courierName,
+          estimatedMinutes: printSnapshot.estimatedMinutes,
+          items: printSnapshot.cart.map((i) => ({
             productName: i.product.name,
             quantity: i.quantity,
             unitPrice: i.product.price,
             totalAmount: i.product.price * i.quantity,
             notes: i.note || null,
           })),
-          subtotal: cartTotal,
-          total: cartTotal,
-        });
+          subtotal: printSnapshot.cartTotal,
+          total: printSnapshot.cartTotal,
+        }).catch((e) => console.warn('[paket] fiş yazdırma:', e));
       }
     }
 
-    setSubmitting(false);
-    onClose();
+    if (subtype !== 'gel_al') {
+      notifyHemenYolda(orderId, editOrder ? 'update' : 'new', activeBranch?.id ?? null);
+    }
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : 'Sipariş kaydedilemedi';
+      setSubmitError(msg);
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const SUBTYPES: { key: OrderSubtype; label: string; icon: any; color: string; active: string }[] = [
@@ -448,12 +636,15 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
   return (
     <div className="h-full flex flex-col bg-slate-50">
       <div className="bg-white border-b border-slate-200 px-4 py-3 flex items-center gap-3 shrink-0">
-        <button onClick={onClose} className="p-2 hover:bg-slate-100 rounded-xl transition">
+        <button type="button" onClick={() => onClose()} className="p-2 hover:bg-slate-100 rounded-xl transition">
           <ChevronLeft className="w-5 h-5 text-slate-600" />
         </button>
-        <div className="flex-1">
+        <div className="flex-1 min-w-0">
           <h1 className="text-lg font-black text-slate-800">{editOrder ? 'Sipariş Düzenle' : 'Yeni Sipariş'}</h1>
-          <p className="text-xs text-slate-500">Müşteri bilgilerini girin ve ürünleri ekleyin</p>
+          <p className="text-xs text-slate-500 lg:hidden">
+            {mobileStep === 1 ? '1/2 Ürün seçin' : '2/2 Müşteri bilgisi'}
+          </p>
+          <p className="text-xs text-slate-500 hidden lg:block">Müşteri bilgilerini girin ve ürünleri ekleyin</p>
         </div>
         {cart.length > 0 && (
           <div className="bg-orange-500 text-white rounded-xl px-3 py-1.5 text-sm font-black">
@@ -462,8 +653,39 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
         )}
       </div>
 
-      <div className="flex-1 overflow-hidden flex flex-col lg:flex-row">
-        <div className="lg:w-80 xl:w-96 bg-white border-b lg:border-b-0 lg:border-r border-slate-200 flex flex-col shrink-0 overflow-y-auto">
+      <div className="lg:hidden shrink-0 flex gap-1 px-3 py-2 bg-white border-b border-slate-100">
+        <button
+          type="button"
+          onClick={() => setMobileStep(1)}
+          className={`flex-1 py-2 rounded-lg text-xs font-bold ${
+            mobileStep === 1 ? 'bg-orange-500 text-white' : 'bg-slate-100 text-slate-600'
+          }`}
+        >
+          1. Ürünler {cart.length > 0 ? `(${cart.reduce((s, i) => s + i.quantity, 0)})` : ''}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            if (cart.length === 0) {
+              showValidationError('cart');
+              return;
+            }
+            setMobileStep(2);
+          }}
+          className={`flex-1 py-2 rounded-lg text-xs font-bold ${
+            mobileStep === 2 ? 'bg-orange-500 text-white' : 'bg-slate-100 text-slate-600'
+          }`}
+        >
+          2. Müşteri
+        </button>
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-hidden flex flex-col lg:flex-row">
+        <div
+          className={`${
+            mobileStep === 2 ? 'flex' : 'hidden'
+          } lg:flex shrink-0 lg:w-80 xl:w-96 lg:overflow-y-auto lg:max-h-full bg-white border-b lg:border-b-0 lg:border-r border-slate-200 flex-col min-h-0 max-lg:flex-1 max-lg:overflow-y-auto`}
+        >
           <div className="p-4 space-y-4">
             <div className="flex gap-1.5">
               {SUBTYPES.map(s => {
@@ -481,17 +703,26 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
               })}
             </div>
 
-            <div className="relative">
-              <label className="text-xs font-bold text-slate-600 mb-1 block">Müşteri ara (cari adı, teslimat kaydı veya telefon)</label>
+            <div className="relative" ref={customerSearchRef}>
+              <label className="text-xs font-bold text-slate-600 mb-1 block">Telefon veya cari ara</label>
+              <p className="text-[11px] text-slate-500 mb-1.5 hidden lg:block">
+                Üst kutu arama içindir. Müşteri adını <strong>aşağıdaki «Ad Soyad»</strong> alanına yazın.
+              </p>
               <div className="relative">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
                 <input
-                  type="text"
+                  ref={phoneInputRef}
+                  type="tel"
+                  inputMode="tel"
                   value={customerPhone}
                   onChange={(e) => handleCustomerSearchChange(e.target.value)}
                   onFocus={() => customerSuggestions.length > 0 && setShowSuggestions(true)}
                   placeholder="Cari adı, isim veya 05XX…"
-                  className="w-full pl-9 pr-8 py-2.5 border border-slate-300 rounded-xl text-sm focus:ring-2 focus:ring-orange-400 focus:border-transparent"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className={`w-full pl-9 pr-8 py-2.5 border rounded-xl text-sm focus:ring-2 focus:ring-orange-400 focus:border-transparent ${
+                    fieldError === 'phone' ? 'border-red-400 bg-red-50/50' : 'border-slate-300'
+                  }`}
                 />
                 {loadingCustomer && <div className="absolute right-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 border-2 border-orange-400 border-t-transparent rounded-full animate-spin" />}
                 {(selectedDeliveryCustomer || selectedCariCustomer) && (
@@ -499,8 +730,14 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
                 )}
               </div>
 
+              {fieldError === 'phone' && (
+                <p className="mt-1.5 text-xs font-semibold text-red-600" role="alert">
+                  Telefon numarası zorunludur.
+                </p>
+              )}
+
               {showSuggestions && customerSuggestions.length > 0 && (
-                <div className="absolute z-20 top-full mt-1 left-0 right-0 bg-white border border-slate-200 rounded-xl shadow-xl overflow-hidden max-h-72 overflow-y-auto">
+                <div className="mt-1 bg-white border border-slate-200 rounded-xl shadow-md overflow-hidden max-h-40 overflow-y-auto">
                   <div className="px-3 py-1.5 bg-slate-50 border-b border-slate-100">
                     <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">Eşleşen kayıtlar</p>
                   </div>
@@ -567,25 +804,49 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
             <div>
               <label className="text-xs font-bold text-slate-600 mb-1 block">Ad Soyad *</label>
               <input
+                ref={nameInputRef}
                 type="text"
                 value={customerName}
-                onChange={e => setCustomerName(e.target.value)}
-                placeholder="Müşteri adı"
-                className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm focus:ring-2 focus:ring-orange-400 focus:border-transparent"
+                onChange={e => {
+                  if (fieldError === 'name') setFieldError(null);
+                  setCustomerName(e.target.value);
+                }}
+                onFocus={() => setShowSuggestions(false)}
+                placeholder="Örn. Ahmet Yılmaz"
+                autoComplete="name"
+                className={`w-full px-3 py-2.5 border rounded-xl text-sm focus:ring-2 focus:ring-orange-400 focus:border-transparent bg-white ${
+                  fieldError === 'name' ? 'border-red-400 ring-2 ring-red-200' : 'border-slate-300'
+                }`}
               />
+              {fieldError === 'name' && (
+                <p className="mt-1.5 text-xs font-semibold text-red-600" role="alert">
+                  Müşteri adı zorunludur — hemen bu alana yazabilirsiniz.
+                </p>
+              )}
             </div>
 
             <div>
               <label className="text-xs font-bold text-slate-600 mb-1 block">
-                Adres <span className="text-red-500">*</span>
+                Adres {isDelivery ? <span className="text-red-500">*</span> : <span className="text-slate-400 font-normal">(opsiyonel)</span>}
               </label>
               <textarea
+                ref={addressInputRef}
                 value={deliveryAddress}
-                onChange={e => setDeliveryAddress(e.target.value)}
+                onChange={e => {
+                  if (fieldError === 'address') setFieldError(null);
+                  setDeliveryAddress(e.target.value);
+                }}
                 placeholder="Mahalle, sokak, bina, daire..."
                 rows={2}
-                className="w-full px-3 py-2.5 border border-slate-300 rounded-xl text-sm focus:ring-2 focus:ring-orange-400 focus:border-transparent resize-none"
+                className={`w-full px-3 py-2.5 border rounded-xl text-sm focus:ring-2 focus:ring-orange-400 focus:border-transparent resize-none ${
+                  fieldError === 'address' ? 'border-red-400 bg-red-50/50' : 'border-slate-300'
+                }`}
               />
+              {fieldError === 'address' && (
+                <p className="mt-1.5 text-xs font-semibold text-red-600" role="alert">
+                  Teslimat için adres zorunludur.
+                </p>
+              )}
             </div>
 
             <div>
@@ -635,24 +896,26 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
               </div>
             </div>
 
-            {isDelivery && (
+            {(isDelivery || subtype === 'takeaway') && (
               <div className="space-y-2">
-                <div>
-                  <label className="text-xs font-bold text-slate-600 mb-1 block flex items-center gap-1">
-                    <Clock className="w-3 h-3" /> Tahmini Süre
-                  </label>
-                  <div className="flex gap-1.5">
-                    {[15, 30, 45, 60].map(m => (
-                      <button
-                        key={m}
-                        onClick={() => setEstimatedMinutes(String(m))}
-                        className={`flex-1 py-2 rounded-xl text-xs font-bold transition ${estimatedMinutes === String(m) ? 'bg-blue-500 text-white' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
-                      >
-                        {m}dk
-                      </button>
-                    ))}
+                {isDelivery && (
+                  <div>
+                    <label className="text-xs font-bold text-slate-600 mb-1 block flex items-center gap-1">
+                      <Clock className="w-3 h-3" /> Tahmini Süre
+                    </label>
+                    <div className="flex gap-1.5">
+                      {[15, 30, 45, 60].map(m => (
+                        <button
+                          key={m}
+                          onClick={() => setEstimatedMinutes(String(m))}
+                          className={`flex-1 py-2 rounded-xl text-xs font-bold transition ${estimatedMinutes === String(m) ? 'bg-blue-500 text-white' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
+                        >
+                          {m}dk
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                </div>
+                )}
 
                 <div>
                   <label className="text-xs font-bold text-slate-600 mb-1 block">Kurye (Opsiyonel)</label>
@@ -714,7 +977,12 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
           </div>
         </div>
 
-        <div className="flex-1 overflow-hidden flex flex-col">
+        <div
+          ref={productsSectionRef}
+          className={`${
+            mobileStep === 1 ? 'flex' : 'hidden'
+          } lg:flex flex-col flex-1 min-h-0 lg:overflow-hidden`}
+        >
           <div className="border-b bg-white p-3 space-y-2 shrink-0">
             <div className="relative">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
@@ -746,9 +1014,14 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
             </div>
           </div>
 
-          <div className="flex-1 overflow-hidden flex flex-col md:flex-row">
-            <div className="flex-1 overflow-y-auto p-3">
-              {filteredProducts.length === 0 ? (
+          <div className="flex flex-col lg:flex-row lg:flex-1 lg:min-h-0 lg:overflow-hidden min-h-0">
+            <div className="flex-1 min-h-0 overflow-y-auto p-3 pb-2">
+              {products.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-32 text-slate-400 text-sm gap-2">
+                  <RefreshCw className="w-6 h-6 animate-spin text-orange-400" />
+                  Ürünler yükleniyor…
+                </div>
+              ) : filteredProducts.length === 0 ? (
                 <div className="flex items-center justify-center h-32 text-slate-400 text-sm">Ürün bulunamadı</div>
               ) : (
                 <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-2 lg:grid-cols-3 gap-2">
@@ -774,7 +1047,45 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
               )}
             </div>
 
-            <div className="w-full md:w-64 lg:w-72 border-t md:border-t-0 md:border-l bg-white flex flex-col max-h-96 md:max-h-full">
+            {cart.length > 0 && (
+              <div className="lg:hidden shrink-0 border-t border-slate-200 bg-white max-h-36 overflow-y-auto">
+                <div className="px-3 py-2 flex items-center justify-between border-b border-slate-100">
+                  <span className="text-xs font-bold text-slate-600">Sepet</span>
+                  <button type="button" onClick={() => setCart([])} className="text-xs text-red-500 font-semibold">
+                    Temizle
+                  </button>
+                </div>
+                <div className="p-2 space-y-1.5">
+                  {cart.map((item) => (
+                    <div key={item.product.id} className="flex items-center gap-2 bg-slate-50 rounded-lg px-2 py-1.5">
+                      <div className="flex-1 min-w-0 text-xs font-semibold text-slate-800 truncate">{item.product.name}</div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => updateQty(item.product.id, -1)}
+                          className="w-7 h-7 bg-slate-200 rounded-lg flex items-center justify-center"
+                        >
+                          <Minus className="w-3 h-3" />
+                        </button>
+                        <span className="w-5 text-center text-xs font-black">{item.quantity}</span>
+                        <button
+                          type="button"
+                          onClick={() => updateQty(item.product.id, 1)}
+                          className="w-7 h-7 bg-orange-500 text-white rounded-lg flex items-center justify-center"
+                        >
+                          <Plus className="w-3 h-3" />
+                        </button>
+                      </div>
+                      <span className="text-xs font-black text-orange-600 w-14 text-right shrink-0">
+                        {(item.product.price * item.quantity).toFixed(0)}₺
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="hidden lg:flex w-72 border-l bg-white flex-col shrink-0 min-h-0">
               <div className="p-3 border-b flex items-center justify-between">
                 <span className="font-bold text-slate-700 text-sm">Sepet</span>
                 {cart.length > 0 && (
@@ -817,7 +1128,18 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
                   <span className="text-sm font-semibold text-slate-600">Toplam</span>
                   <span className="text-xl font-black text-orange-600">{cartTotal.toFixed(2)}₺</span>
                 </div>
+                {fieldError === 'cart' && (
+                  <p className="mb-2 text-xs font-semibold text-red-600 text-center" role="alert">
+                    En az 1 ürün ekleyin.
+                  </p>
+                )}
+                {submitError && (
+                  <p className="mb-2 text-xs font-semibold text-red-600 text-center px-1" role="alert">
+                    {submitError}
+                  </p>
+                )}
                 <button
+                  type="button"
                   onClick={handleSubmit}
                   disabled={submitting || cart.length === 0}
                   className="w-full py-3 bg-gradient-to-r from-orange-500 to-red-600 text-white font-bold rounded-xl transition active:scale-95 disabled:opacity-50 flex items-center justify-center gap-2 shadow-md"
@@ -834,6 +1156,71 @@ export function DeliveryOrderForm({ couriers, editOrder, prefillCustomer, onClos
           </div>
         </div>
       </div>
+
+      <div className="lg:hidden shrink-0 border-t border-slate-200 bg-white px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-[0_-8px_24px_rgba(15,23,42,0.1)] z-20">
+        {fieldError === 'cart' && mobileStep === 1 && (
+          <p className="text-xs font-semibold text-red-600 text-center mb-2" role="alert">
+            En az 1 ürün ekleyin.
+          </p>
+        )}
+        {(fieldError === 'name' || fieldError === 'phone' || fieldError === 'address') && mobileStep === 2 && (
+          <p className="text-xs font-semibold text-red-600 text-center mb-2" role="alert">
+            Zorunlu müşteri alanlarını doldurun.
+          </p>
+        )}
+        {submitError && (
+          <p className="text-xs font-semibold text-red-600 text-center mb-2 px-1" role="alert">
+            {submitError}
+          </p>
+        )}
+        <div className="flex items-center justify-between gap-3 mb-2">
+          <span className="text-sm text-slate-600">
+            {cart.length > 0
+              ? `${cart.reduce((s, i) => s + i.quantity, 0)} ürün`
+              : 'Sepet boş'}
+          </span>
+          <span className="text-xl font-black text-orange-600">{cartTotal.toFixed(2)} ₺</span>
+        </div>
+        {mobileStep === 1 ? (
+          <button
+            type="button"
+            disabled={cart.length === 0}
+            onClick={() => {
+              setFieldError(null);
+              setMobileStep(2);
+            }}
+            className="w-full py-3.5 bg-gradient-to-r from-orange-500 to-red-600 text-white font-bold rounded-xl disabled:opacity-50 flex items-center justify-center gap-2"
+          >
+            Devam — müşteri bilgisi
+            <ChevronRight className="w-5 h-5" />
+          </button>
+        ) : (
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setMobileStep(1)}
+              className="shrink-0 px-4 py-3.5 rounded-xl border-2 border-slate-200 text-slate-700 font-bold text-sm"
+            >
+              Ürünler
+            </button>
+            <button
+              type="button"
+              onClick={handleSubmit}
+              disabled={submitting || cart.length === 0}
+              className="flex-1 py-3.5 bg-gradient-to-r from-orange-500 to-red-600 text-white font-bold rounded-xl disabled:opacity-50 flex items-center justify-center gap-2 min-w-0"
+            >
+              {submitting ? (
+                <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+              ) : (
+                <Check className="w-5 h-5 shrink-0" />
+              )}
+              <span className="truncate">{editOrder ? 'Güncelle' : 'Siparişi Oluştur'}</span>
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
+
+export const DeliveryOrderForm = memo(DeliveryOrderFormInner);

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo, memo, useDeferredValue } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import {
@@ -8,6 +8,9 @@ import {
   PhoneIncoming, Wifi, WifiOff, FlaskConical,
 } from 'lucide-react';
 import { DeliveryOrderForm } from './DeliveryOrderForm';
+import { sendCourierAssignmentNotification } from '../lib/courierNotification';
+import { recordTakeawayPaymentIfNeeded } from '../lib/takeawayPayment';
+import { CourierLiveMapModal, type CourierLiveMapOrder } from './CourierLiveMapModal';
 import { CourierManagement } from './CourierManagement';
 import {
   isCallerIdAvailable,
@@ -22,6 +25,20 @@ import {
   type CallerIdRing,
   type CallerIdStatus,
 } from '../lib/callerId';
+import { notifyHemenYolda } from '../lib/hemenyoldaApi';
+import { subscribeLiveTick } from '../lib/liveTick';
+import { startAdaptivePoller } from '../lib/pollSchedule';
+import { useCurrency } from '../lib/currency';
+import {
+  fetchTakeawayOrderById,
+  fetchTakeawayActiveOrders,
+  fetchTakeawayCompletedOrders,
+  takeawayItemCount,
+  takeawayListCacheKey,
+  readTakeawayListCache,
+  writeTakeawayListCache,
+  type TakeawayOrderListRow,
+} from '../lib/takeawayOrdersApi';
 
 export interface Courier {
   id: string;
@@ -50,36 +67,16 @@ export interface DeliveryCustomer {
   created_at: string;
 }
 
-interface TakeawayOrder {
-  id: string;
-  tenant_id: string;
-  branch_id: string | null;
-  order_number: string;
-  order_type: string;
-  order_subtype: string | null;
-  status: string;
-  delivery_status: string;
-  customer_name: string | null;
-  customer_phone: string | null;
-  delivery_address: string | null;
-  delivery_note: string | null;
-  courier_id: string | null;
-  courier_name: string | null;
-  payment_method: string | null;
-  payment_collected: boolean;
-  total_amount: number;
-  delivery_customer_id: string | null;
-  estimated_delivery_minutes: number | null;
-  assigned_at: string | null;
-  picked_up_at: string | null;
-  delivered_at: string | null;
-  created_at: string;
-  waiter_name: string | null;
-  order_items?: { id: string; quantity: number; unit_price: number; products?: { name: string } }[];
-}
+export type TakeawayOrder = TakeawayOrderListRow;
 
 type StatusFilter = 'all' | 'pending' | 'preparing' | 'ready' | 'on_the_way' | 'delivered';
 type TypeFilter = 'all' | 'takeaway' | 'delivery' | 'gel_al';
+
+/** Ekranda aynı anda çizilen kart üst sınırı — çok pakette donmayı önler */
+const MAX_VISIBLE_ORDER_CARDS = 80;
+const TAKEAWAY_FETCH_ACTIVE_LIMIT = 150;
+const REALTIME_UPDATE_BATCH_MS = 800;
+const REALTIME_INSERT_BATCH_MS = 500;
 
 export const DELIVERY_STATUSES: { key: string; label: string; color: string; bg: string; dotColor: string }[] = [
   { key: 'pending',    label: 'Bekliyor',       color: 'text-amber-700',  bg: 'bg-amber-100',  dotColor: 'bg-amber-500' },
@@ -109,20 +106,60 @@ const PAYMENT_LABELS: Record<string, { label: string; icon: any; color: string }
   online: { label: 'Online', icon: Smartphone,  color: 'text-orange-600' },
 };
 
-export function TakeawayOrders() {
-  const { tenant, activeBranch } = useAuth();
-  const [orders, setOrders] = useState<TakeawayOrder[]>([]);
+interface TakeawayOrdersProps {
+  /** Masalar vb. başka sayfadayken realtime ve ağ yükünü keser. */
+  isActive?: boolean;
+}
+
+export function TakeawayOrders({ isActive = true }: TakeawayOrdersProps) {
+  const { tenant, activeBranch, user } = useAuth();
+  const initialListKey =
+    tenant?.id != null
+      ? takeawayListCacheKey(tenant.id, activeBranch?.id, false)
+      : null;
+  const initialCached = initialListKey ? readTakeawayListCache(initialListKey) : null;
+  const [orders, setOrders] = useState<TakeawayOrder[]>(() => initialCached ?? []);
   const [couriers, setCouriers] = useState<Courier[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => !initialCached);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
   const [showCompleted, setShowCompleted] = useState(false);
   const [showNewOrderForm, setShowNewOrderForm] = useState(false);
   const [showCourierMgmt, setShowCourierMgmt] = useState(false);
+  const [liveMapOrder, setLiveMapOrder] = useState<CourierLiveMapOrder | null>(null);
   const [editingOrder, setEditingOrder] = useState<TakeawayOrder | null>(null);
   const [assigningCourierId, setAssigningCourierId] = useState<string | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const realtimeFlushRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const updateFlushRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingInsertIdsRef = useRef<Set<string>>(new Set());
+  const pendingUpdatesRef = useRef<Map<string, Record<string, unknown>>>(new Map());
+  const [elapsedTick, setElapsedTick] = useState(0);
+  const showCompletedRef = useRef(showCompleted);
+  const ordersRef = useRef(orders);
+  const formOpenRef = useRef(false);
+  const activeBranchRef = useRef(activeBranch?.id ?? null);
+  const lastCourierLoadRef = useRef(0);
+  const couriersForFormRef = useRef<Courier[]>([]);
   const [customerQuery, setCustomerQuery] = useState('');
+  const deferredCustomerQuery = useDeferredValue(customerQuery);
+
+  const formOpen = showNewOrderForm || !!editingOrder;
+  useEffect(() => {
+    showCompletedRef.current = showCompleted;
+  }, [showCompleted]);
+  useEffect(() => {
+    ordersRef.current = orders;
+  }, [orders]);
+  useEffect(() => {
+    activeBranchRef.current = activeBranch?.id ?? null;
+  }, [activeBranch?.id]);
+  useEffect(() => {
+    formOpenRef.current = formOpen;
+    if (formOpen) {
+      couriersForFormRef.current = couriers;
+    }
+  }, [formOpen, couriers]);
 
   // ===== Caller ID =====
   const cidAvailable = isCallerIdAvailable();
@@ -132,6 +169,8 @@ export function TakeawayOrders() {
   const [incomingCalls, setIncomingCalls] = useState<Array<{ id: string; ring: CallerIdRing; matched: DeliveryCustomer | null; }>>([]);
   const [cidPrefill, setCidPrefill] = useState<{ phone: string; matched: DeliveryCustomer | null } | null>(null);
   const [cidError, setCidError] = useState<string | null>(null);
+  /** X ile kapatılan numaralar tekrar çalma gelene kadar listede gösterilmez (ms). */
+  const dismissedPhonesUntilRef = useRef<Map<string, number>>(new Map());
 
   const refreshCidStatus = useCallback(async () => {
     try {
@@ -142,9 +181,9 @@ export function TakeawayOrders() {
     }
   }, []);
 
-  // Otomatik başlat (electron + ayar açık)
+  // Otomatik başlat (electron + ayar açık) — yalnızca paket ekranı aktifken
   useEffect(() => {
-    if (!cidAvailable) return;
+    if (!cidAvailable || !isActive) return;
     let cancelled = false;
     (async () => {
       const s = await callerIdStatus();
@@ -162,13 +201,16 @@ export function TakeawayOrders() {
     return () => {
       cancelled = true;
     };
-  }, [cidAvailable, cidSettings.autoStart, cidSettings.softTest]);
+  }, [cidAvailable, cidSettings.autoStart, cidSettings.softTest, isActive]);
 
-  // Olay dinleyiciler: çağrı, sinyal, hata
+  // Olay dinleyiciler: çağrı, sinyal, hata — paket ekranı dışında dinleme
   useEffect(() => {
-    if (!cidAvailable) return;
+    if (!cidAvailable || !isActive) return;
     const offRing = onCallerIdRing(async (ring) => {
       if (!tenant || !ring.phone) return;
+      const snoozeUntil = dismissedPhonesUntilRef.current.get(ring.phone) ?? 0;
+      if (snoozeUntil > Date.now()) return;
+
       let matched: DeliveryCustomer | null = null;
       try {
         const { data } = await supabase
@@ -193,10 +235,13 @@ export function TakeawayOrders() {
       } catch (e) {
         console.error('[CallerID] müşteri arama hatası:', e);
       }
-      setIncomingCalls((prev) => [
-        { id: `${ring.ts}-${ring.phone}`, ring, matched },
-        ...prev,
-      ].slice(0, 5));
+      setIncomingCalls((prev) => {
+        const withoutDup = prev.filter((p) => p.ring.phone !== ring.phone);
+        return [
+          { id: `${ring.ts}-${ring.phone}`, ring, matched },
+          ...withoutDup,
+        ].slice(0, 3);
+      });
     });
     const offSignal = onCallerIdSignal((sig) => {
       setCidStatusInfo((prev) => ({
@@ -213,7 +258,7 @@ export function TakeawayOrders() {
       offSignal();
       offError();
     };
-  }, [cidAvailable, tenant]);
+  }, [cidAvailable, tenant, isActive]);
 
   const handleAcceptCall = (item: { ring: CallerIdRing; matched: DeliveryCustomer | null }) => {
     setCidPrefill({ phone: item.ring.phone, matched: item.matched });
@@ -221,8 +266,15 @@ export function TakeawayOrders() {
     setIncomingCalls((prev) => prev.filter((p) => p.ring.ts !== item.ring.ts));
   };
 
-  const handleDismissCall = (id: string) =>
-    setIncomingCalls((prev) => prev.filter((p) => p.id !== id));
+  const handleDismissCall = (id: string) => {
+    setIncomingCalls((prev) => {
+      const hit = prev.find((p) => p.id === id);
+      if (hit?.ring.phone) {
+        dismissedPhonesUntilRef.current.set(hit.ring.phone, Date.now() + 15 * 60 * 1000);
+      }
+      return prev.filter((p) => p.id !== id);
+    });
+  };
 
   const updateCidSetting = async (patch: Partial<{ autoStart: boolean; softTest: boolean }>) => {
     const next = { ...cidSettings, ...patch };
@@ -260,19 +312,19 @@ export function TakeawayOrders() {
     return () => window.removeEventListener('sefpos:takeaway-search', handler as EventListener);
   }, []);
 
-  const loadOrders = useCallback(async () => {
+  const loadOrders = useCallback(async (opts?: { silent?: boolean }) => {
     if (!tenant) return;
-    let q = supabase
-      .from('orders')
-      .select('*, order_items(id, quantity, unit_price, products(name))')
-      .eq('tenant_id', tenant.id)
-      .in('order_type', ['takeaway', 'delivery'])
-      .is('table_id', null)
-      .order('created_at', { ascending: false })
-      .limit(300);
-    if (activeBranch) q = q.eq('branch_id', activeBranch.id);
-    const { data } = await q;
-    if (data) setOrders(data as TakeawayOrder[]);
+    const key = takeawayListCacheKey(
+      tenant.id,
+      activeBranch?.id,
+      showCompletedRef.current,
+    );
+    if (!opts?.silent && !readTakeawayListCache(key)?.length) setLoading(true);
+    const data = showCompletedRef.current
+      ? await fetchTakeawayCompletedOrders(tenant.id, activeBranch?.id, 200)
+      : await fetchTakeawayActiveOrders(tenant.id, activeBranch?.id, TAKEAWAY_FETCH_ACTIVE_LIMIT);
+    writeTakeawayListCache(key, data);
+    setOrders(data);
     setLoading(false);
   }, [tenant, activeBranch]);
 
@@ -284,56 +336,245 @@ export function TakeawayOrders() {
     if (data) setCouriers(data as Courier[]);
   }, [tenant, activeBranch]);
 
-  const handleOrderChange = useCallback((payload: any) => {
-    const { eventType, new: newRecord, old: oldRecord } = payload;
-    if (!newRecord && !oldRecord) return;
-    const record = newRecord || oldRecord;
-    if (!record) return;
-    if (!['takeaway', 'delivery'].includes(record.order_type)) return;
-    if (eventType === 'INSERT') {
-      loadOrders();
-    } else if (eventType === 'UPDATE') {
-      setOrders(prev => {
-        const exists = prev.find(o => o.id === record.id);
-        if (!exists) return prev;
-        return prev.map(o => o.id === record.id ? { ...o, ...record } : o);
+  const flushPendingInserts = useCallback(() => {
+    const ids = [...pendingInsertIdsRef.current];
+    pendingInsertIdsRef.current.clear();
+    if (!ids.length || !tenant) return;
+    void (async () => {
+      const rows = await Promise.all(ids.map((id) => fetchTakeawayOrderById(id)));
+      const valid = rows.filter(Boolean) as TakeawayOrder[];
+      if (!valid.length) return;
+      const viewingCompleted = showCompletedRef.current;
+      setOrders((prev) => {
+        let next = [...prev];
+        for (const row of valid) {
+          const isDone = row.status === 'completed' || row.status === 'cancelled';
+          if (viewingCompleted !== isDone) continue;
+          if (next.some((o) => o.id === row.id)) continue;
+          next = [row, ...next];
+        }
+        return next.slice(0, viewingCompleted ? 200 : 250);
       });
-    } else if (eventType === 'DELETE') {
-      setOrders(prev => prev.filter(o => o.id !== (oldRecord?.id)));
-    }
-  }, [loadOrders]);
+    })();
+  }, [tenant]);
+
+  const isPaketOrderRow = useCallback((row: { order_type?: string; table_id?: string | null; branch_id?: string | null } | null) => {
+    if (!row) return false;
+    if (row.table_id) return false;
+    if (!['takeaway', 'delivery'].includes(String(row.order_type || ''))) return false;
+    const branchId = activeBranchRef.current;
+    if (branchId && row.branch_id && row.branch_id !== branchId) return false;
+    return true;
+  }, []);
+
+  const loadCouriersThrottled = useCallback(() => {
+    const now = Date.now();
+    if (now - lastCourierLoadRef.current < 90_000) return;
+    lastCourierLoadRef.current = now;
+    void loadCouriers();
+  }, [loadCouriers]);
+
+  const flushPendingUpdates = useCallback(() => {
+    const batch = new Map(pendingUpdatesRef.current);
+    pendingUpdatesRef.current.clear();
+    if (batch.size === 0) return;
+
+    const viewingCompleted = showCompletedRef.current;
+    setOrders((prev) => {
+      let next = prev;
+      let changed = false;
+      for (const [id, record] of batch) {
+        const isDone = record.status === 'completed' || record.status === 'cancelled';
+        const idx = next.findIndex((o) => o.id === id);
+        if (idx < 0) {
+          if (viewingCompleted === isDone) continue;
+          continue;
+        }
+        if (viewingCompleted !== isDone) {
+          next = next.filter((o) => o.id !== id);
+          changed = true;
+          continue;
+        }
+        const cur = next[idx];
+        const merged = { ...cur, ...record } as TakeawayOrder;
+        if (
+          cur.delivery_status === merged.delivery_status &&
+          cur.status === merged.status &&
+          cur.courier_id === merged.courier_id &&
+          cur.total_amount === merged.total_amount &&
+          cur.payment_collected === merged.payment_collected
+        ) {
+          continue;
+        }
+        if (!changed) next = next.slice();
+        next[idx] = merged;
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, []);
+
+  const schedulePendingUpdatesFlush = useCallback(() => {
+    if (updateFlushRef.current) clearTimeout(updateFlushRef.current);
+    updateFlushRef.current = setTimeout(() => {
+      updateFlushRef.current = null;
+      flushPendingUpdates();
+    }, REALTIME_UPDATE_BATCH_MS);
+  }, [flushPendingUpdates]);
+
+  const handleOrderChange = useCallback(
+    (payload: any) => {
+      if (formOpenRef.current) return;
+      const { eventType, new: newRecord, old: oldRecord } = payload;
+      if (!newRecord && !oldRecord) return;
+      const record = newRecord || oldRecord;
+      if (!record) return;
+      if (eventType === 'DELETE') {
+        if (!oldRecord?.id) return;
+      } else if (!isPaketOrderRow(record)) {
+        return;
+      }
+
+      const isDone = record.status === 'completed' || record.status === 'cancelled';
+      const viewingCompleted = showCompletedRef.current;
+
+      if (eventType === 'INSERT') {
+        if (viewingCompleted !== isDone) return;
+        pendingInsertIdsRef.current.add(record.id);
+        if (realtimeFlushRef.current) clearTimeout(realtimeFlushRef.current);
+        realtimeFlushRef.current = setTimeout(() => {
+          realtimeFlushRef.current = null;
+          flushPendingInserts();
+        }, REALTIME_INSERT_BATCH_MS);
+      } else if (eventType === 'UPDATE') {
+        const prevPatch = pendingUpdatesRef.current.get(record.id) || {};
+        pendingUpdatesRef.current.set(record.id, { ...prevPatch, ...record });
+        schedulePendingUpdatesFlush();
+      } else if (eventType === 'DELETE') {
+        setOrders((prev) => {
+          if (!prev.some((o) => o.id === oldRecord?.id)) return prev;
+          return prev.filter((o) => o.id !== oldRecord?.id);
+        });
+      }
+    },
+    [flushPendingInserts, isPaketOrderRow],
+  );
 
   const debouncedCourierRefresh = useCallback(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => { loadCouriers(); }, 500);
-  }, [loadCouriers]);
+    debounceRef.current = setTimeout(() => {
+      loadCouriersThrottled();
+    }, 800);
+  }, [loadCouriersThrottled]);
 
   useEffect(() => {
-    if (!tenant) return;
-    loadOrders();
-    loadCouriers();
+    if (!tenant || !isActive) return;
+    const key = takeawayListCacheKey(tenant.id, activeBranch?.id, showCompleted);
+    const cached = readTakeawayListCache(key);
+    if (cached) {
+      setOrders(cached);
+      setLoading(false);
+      void loadOrders({ silent: true });
+    } else {
+      setLoading(true);
+      void loadOrders();
+    }
+    void loadCouriers();
+    lastCourierLoadRef.current = Date.now();
+  }, [tenant, activeBranch, isActive, showCompleted, loadOrders, loadCouriers]);
+
+  useEffect(() => {
+    if (!tenant || !isActive || formOpen) return;
     const ch = supabase
       .channel(`takeaway-${tenant.id}-${activeBranch?.id || 'all'}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'orders', filter: `tenant_id=eq.${tenant.id}` }, handleOrderChange)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'orders', filter: 'order_type=eq.takeaway' },
+        handleOrderChange,
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'orders', filter: 'order_type=eq.delivery' },
+        handleOrderChange,
+      )
       .on('postgres_changes', { event: '*', schema: 'public', table: 'couriers', filter: `tenant_id=eq.${tenant.id}` }, debouncedCourierRefresh)
       .subscribe();
-    return () => { supabase.removeChannel(ch); if (debounceRef.current) clearTimeout(debounceRef.current); };
-  }, [tenant, activeBranch, loadOrders, loadCouriers, handleOrderChange, debouncedCourierRefresh]);
+    return () => {
+      supabase.removeChannel(ch);
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+      if (realtimeFlushRef.current) clearTimeout(realtimeFlushRef.current);
+      if (updateFlushRef.current) clearTimeout(updateFlushRef.current);
+      pendingUpdatesRef.current.clear();
+    };
+  }, [tenant, activeBranch, isActive, formOpen, handleOrderChange, debouncedCourierRefresh]);
 
-  const sendCourierNotification = async (courierId: string, orderId: string, orderNumber: string, address: string | null) => {
-    if (!tenant) return;
-    await supabase.from('courier_notifications').insert({
-      tenant_id: tenant.id,
-      courier_id: courierId,
-      order_id: orderId,
-      title: 'Yeni Teslimat',
-      message: `${orderNumber} numaralı sipariş size atandı.${address ? ` Adres: ${address}` : ''}`,
-      type: 'order_assigned',
-      is_read: false,
+  /** Realtime kaçarsa yedek; seyrek imza kontrolü (masa siparişleri dinlenmez). */
+  useEffect(() => {
+    if (!tenant || !isActive || formOpen) return;
+    let lastSig = '';
+    const stopPoll = startAdaptivePoller({
+      diagLabel: 'takeaway-backup-poll',
+      baseMs: 180_000,
+      idleMs: 300_000,
+      hiddenMs: 0,
+      run: async () => {
+        if (formOpenRef.current) return;
+        try {
+          const runSigPoll = async (selectCols: string) => {
+            let q = supabase
+              .from('orders')
+              .select(selectCols)
+              .eq('tenant_id', tenant.id)
+              .in('order_type', ['takeaway', 'delivery'])
+              .is('table_id', null)
+              .not('status', 'in', '(completed,cancelled)')
+              .order('created_at', { ascending: false })
+              .limit(40);
+            if (activeBranchRef.current) q = q.eq('branch_id', activeBranchRef.current);
+            const { data, error } = await q;
+            if (error) return { error, data: null as null };
+            return { error: null, data: data || [] };
+          };
+
+          let res = await runSigPoll('id, status, delivery_status, created_at');
+          if (res.error) {
+            res = await runSigPoll('id, status, created_at');
+          }
+          if (res.error) {
+            if (import.meta.env.DEV) {
+              console.debug('[TakeawayOrders] yedek poll atlandı:', res.error.message);
+            }
+            return;
+          }
+          const sig = res.data
+            .map(
+              (r: {
+                id: string;
+                status?: string;
+                delivery_status?: string;
+                created_at?: string;
+              }) => `${r.id}:${r.status}:${r.delivery_status ?? ''}:${r.created_at || ''}`,
+            )
+            .join('|');
+          if (sig && sig !== lastSig) {
+            lastSig = sig;
+            await loadOrders();
+          }
+        } catch (e) {
+          console.warn('[TakeawayOrders] yedek poll:', e);
+        }
+      },
+      immediate: false,
     });
-  };
+    return () => stopPoll();
+  }, [tenant, isActive, formOpen, loadOrders]);
 
-  const updateStatus = async (orderId: string, newStatus: string, courierId?: string, courierName?: string) => {
+  useEffect(() => {
+    if (!isActive) return;
+    return subscribeLiveTick(() => setElapsedTick((n) => n + 1));
+  }, [isActive]);
+
+  const updateStatus = useCallback(async (orderId: string, newStatus: string, courierId?: string, courierName?: string) => {
     const updates: Record<string, any> = { delivery_status: newStatus };
     if (courierId) {
       updates.courier_id = courierId;
@@ -343,81 +584,171 @@ export function TakeawayOrders() {
         updates.picked_up_at = new Date().toISOString();
       }
       await supabase.from('couriers').update({ status: 'busy' }).eq('id', courierId);
-      const order = orders.find(o => o.id === orderId);
+      const order = ordersRef.current.find(o => o.id === orderId);
       if (order?.courier_id && order.courier_id !== courierId) {
         await supabase.from('couriers').update({ status: 'available' }).eq('id', order.courier_id);
       }
-      if (order) {
-        await sendCourierNotification(courierId, orderId, order.order_number, order.delivery_address);
+      if (order && tenant) {
+        await sendCourierAssignmentNotification(
+          tenant.id,
+          courierId,
+          orderId,
+          order.order_number,
+          order.delivery_address,
+        );
       }
     }
     if (newStatus === 'delivered') {
       updates.delivered_at = new Date().toISOString();
       updates.status = 'completed';
       updates.payment_status = 'paid';
-      const order = orders.find(o => o.id === orderId);
+      updates.payment_collected = true;
+      const order = ordersRef.current.find(o => o.id === orderId);
       if (order?.courier_id) await supabase.from('couriers').update({ status: 'available' }).eq('id', order.courier_id);
+      if (order && tenant && user) {
+        await recordTakeawayPaymentIfNeeded({
+          tenantId: tenant.id,
+          branchId: order.branch_id ?? activeBranch?.id ?? null,
+          orderId: order.id,
+          orderNumber: order.order_number || order.id.slice(0, 8).toUpperCase(),
+          orderType: order.order_type,
+          orderSubtype: order.order_subtype,
+          paymentMethod: order.payment_method,
+          amount: order.total_amount || 0,
+          createdBy: user.id,
+          shouldRecord: true,
+        });
+      }
     }
     if (newStatus === 'cancelled') {
       updates.status = 'cancelled';
-      const order = orders.find(o => o.id === orderId);
+      const order = ordersRef.current.find(o => o.id === orderId);
       if (order?.courier_id) await supabase.from('couriers').update({ status: 'available' }).eq('id', order.courier_id);
     }
     await supabase.from('orders').update(updates).eq('id', orderId);
+    const order = ordersRef.current.find((o) => o.id === orderId);
+    if (order?.order_subtype !== 'gel_al') {
+      if (newStatus === 'cancelled') {
+        notifyHemenYolda(orderId, 'cancel');
+      } else if (courierId || newStatus === 'on_the_way' || newStatus === 'delivered') {
+        notifyHemenYolda(orderId, 'update');
+      }
+    }
     setOrders(prev => prev.map(o => o.id === orderId ? { ...o, ...updates } : o));
     setAssigningCourierId(null);
-  };
+  }, [tenant, user, activeBranch?.id]);
 
-  const deleteOrder = async (orderId: string) => {
+  const deleteOrder = useCallback(async (orderId: string) => {
     if (!confirm('Siparişi silmek istediğinizden emin misiniz?')) return;
     setOrders(prev => prev.filter(o => o.id !== orderId));
     await supabase.from('order_items').delete().eq('order_id', orderId);
+    const order = ordersRef.current.find((o) => o.id === orderId);
+    if (order && order.order_subtype !== 'gel_al') {
+      notifyHemenYolda(orderId, 'cancel');
+    }
     await supabase.from('orders').delete().eq('id', orderId);
-  };
+  }, []);
 
-  const getTotal = (order: TakeawayOrder) => {
-    if (order.total_amount) return order.total_amount;
-    return (order.order_items || []).reduce((s, i) => s + (i.unit_price || 0) * i.quantity, 0);
-  };
+  const couriersById = useMemo(() => new Map(couriers.map((c) => [c.id, c])), [couriers]);
 
-  const getElapsed = (createdAt: string) => Math.floor((Date.now() - new Date(createdAt).getTime()) / 60000);
+  const getElapsed = useCallback(
+    (createdAt: string) => Math.floor((Date.now() - new Date(createdAt).getTime()) / 60000),
+    [elapsedTick],
+  );
 
-  const activeOrders = orders.filter(o => o.status !== 'completed' && o.status !== 'cancelled');
-  const completedOrders = orders.filter(o => o.status === 'completed' || o.status === 'cancelled');
+  const activeOrders = useMemo(
+    () => (showCompleted ? [] : orders),
+    [orders, showCompleted],
+  );
 
-  const displayOrders = (showCompleted ? completedOrders : activeOrders).filter(o => {
-    if (typeFilter === 'takeaway') return o.order_type === 'takeaway' && o.order_subtype !== 'gel_al';
-    if (typeFilter === 'delivery') return o.order_type === 'delivery';
-    if (typeFilter === 'gel_al') return o.order_subtype === 'gel_al';
-    return true;
-  }).filter(o => {
-    if (statusFilter === 'all') return true;
-    return o.delivery_status === statusFilter;
-  }).filter((o) => {
-    const q = customerQuery.trim().toLowerCase();
-    if (!q) return true;
-    const name = (o.customer_name || '').toLowerCase();
-    const phone = (o.customer_phone || '').toLowerCase();
-    const addr = (o.delivery_address || '').toLowerCase();
-    return name.includes(q) || phone.includes(q) || addr.includes(q);
-  });
+  const completedOrders = useMemo(
+    () => (showCompleted ? orders : []),
+    [orders, showCompleted],
+  );
 
-  const availableCouriers = couriers.filter(c => c.status === 'available');
+  const statusCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const o of activeOrders) {
+      counts[o.delivery_status] = (counts[o.delivery_status] || 0) + 1;
+    }
+    return counts;
+  }, [activeOrders]);
 
-  if (showNewOrderForm || editingOrder) {
+  const displayOrders = useMemo(() => {
+    const base = showCompleted ? completedOrders : activeOrders;
+    const q = deferredCustomerQuery.trim().toLowerCase();
+    return base.filter((o) => {
+      if (typeFilter === 'takeaway') return o.order_type === 'takeaway' && o.order_subtype !== 'gel_al';
+      if (typeFilter === 'delivery') return o.order_type === 'delivery';
+      if (typeFilter === 'gel_al') return o.order_subtype === 'gel_al';
+      return true;
+    }).filter((o) => {
+      if (statusFilter === 'all') return true;
+      return o.delivery_status === statusFilter;
+    }).filter((o) => {
+      if (!q) return true;
+      const name = (o.customer_name || '').toLowerCase();
+      const phone = (o.customer_phone || '').toLowerCase();
+      const addr = (o.delivery_address || '').toLowerCase();
+      return name.includes(q) || phone.includes(q) || addr.includes(q);
+    });
+  }, [showCompleted, completedOrders, activeOrders, typeFilter, statusFilter, deferredCustomerQuery]);
+
+  const visibleOrders = useMemo(
+    () => displayOrders.slice(0, MAX_VISIBLE_ORDER_CARDS),
+    [displayOrders],
+  );
+  const hiddenOrderCount = Math.max(0, displayOrders.length - visibleOrders.length);
+
+  const availableCouriers = useMemo(() => couriers.filter((c) => c.status === 'available'), [couriers]);
+
+  const handleFormClose = useCallback(
+    (result?: { orderId?: string; reload?: boolean }) => {
+      setShowNewOrderForm(false);
+      setEditingOrder(null);
+      setCidPrefill(null);
+      if (result?.orderId && tenant) {
+        void fetchTakeawayOrderById(result.orderId).then((row) => {
+          if (!row) return;
+          setOrders((prev) => [row, ...prev.filter((o) => o.id !== row.id)].slice(0, 250));
+        });
+      } else if (result?.reload !== false) {
+        void loadOrders();
+        void loadCouriers();
+      }
+    },
+    [tenant, loadOrders, loadCouriers],
+  );
+
+  const handleEditOrder = useCallback(async (order: TakeawayOrder) => {
+    const { data: items } = await supabase
+      .from('order_items')
+      .select('id, quantity, unit_price, product_id, notes, products(name)')
+      .eq('order_id', order.id);
+    setEditingOrder({
+      ...order,
+      order_items: items || [],
+    } as TakeawayOrder & { order_items: unknown[] });
+  }, []);
+
+  const onEditById = useCallback(
+    (orderId: string) => {
+      const order = ordersRef.current.find((o) => o.id === orderId);
+      if (order) void handleEditOrder(order);
+    },
+    [handleEditOrder],
+  );
+
+  if (formOpen) {
     return (
-      <DeliveryOrderForm
-        couriers={couriers}
-        editOrder={editingOrder}
-        prefillCustomer={cidPrefill}
-        onClose={() => {
-          setShowNewOrderForm(false);
-          setEditingOrder(null);
-          setCidPrefill(null);
-          loadOrders();
-          loadCouriers();
-        }}
-      />
+      <div className="fixed inset-0 top-14 md:top-20 z-30 flex flex-col min-h-0 bg-slate-50">
+        <DeliveryOrderForm
+          couriers={couriersForFormRef.current.length > 0 ? couriersForFormRef.current : couriers}
+          editOrder={editingOrder}
+          prefillCustomer={cidPrefill}
+          onClose={handleFormClose}
+        />
+      </div>
     );
   }
 
@@ -572,6 +903,14 @@ export function TakeawayOrders() {
           </div>
         )}
 
+        {cidStatusInfo.softTest && (
+          <div className="mt-3 mb-2 p-3 rounded-xl border border-purple-200 bg-purple-50 text-sm text-purple-900">
+            <strong>Soft test açık:</strong> Aynı numaradan sürekli sahte çağrı gelebilir. Kapatmak için üstteki telefon
+            simgesine tıklayın → <strong>Soft test</strong> işaretini kaldırın veya <strong>Dinlemeyi durdur</strong>.
+            HemenYolda testi için sipariş açmanız gerekmez.
+          </div>
+        )}
+
         {incomingCalls.length > 0 && (
           <div className="mt-3 mb-2 space-y-2">
             {incomingCalls.map((item) => (
@@ -666,7 +1005,7 @@ export function TakeawayOrders() {
               Tümü ({activeOrders.length})
             </button>
             {DELIVERY_STATUSES.filter(s => s.key !== 'cancelled').map(s => {
-              const count = activeOrders.filter(o => o.delivery_status === s.key).length;
+              const count = statusCounts[s.key] || 0;
               return (
                 <button
                   key={s.key}
@@ -683,7 +1022,7 @@ export function TakeawayOrders() {
       </div>
 
       <div className="flex-1 overflow-y-auto p-3 md:p-4">
-        {loading ? (
+        {loading && orders.length === 0 ? (
           <div className="flex items-center justify-center h-40">
             <div className="w-10 h-10 border-4 border-orange-500 border-t-transparent rounded-full animate-spin" />
           </div>
@@ -698,32 +1037,62 @@ export function TakeawayOrders() {
             )}
           </div>
         ) : (
+          <>
+          {hiddenOrderCount > 0 && (
+            <div className="mb-3 px-4 py-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-sm flex flex-wrap items-center gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0" />
+              <span>
+                <strong>{hiddenOrderCount}</strong> sipariş daha var — liste performansı için ilk{' '}
+                {MAX_VISIBLE_ORDER_CARDS} gösteriliyor. Arama veya durum filtresi kullanın.
+              </span>
+            </div>
+          )}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
-            {displayOrders.map(order => (
+            {visibleOrders.map((order) => (
               <OrderCard
                 key={order.id}
                 order={order}
-                couriers={couriers}
-                assigningCourierId={assigningCourierId}
+                courier={order.courier_id ? couriersById.get(order.courier_id) : undefined}
+                availableCouriers={availableCouriers}
+                isAssigning={assigningCourierId === order.id}
                 setAssigningCourierId={setAssigningCourierId}
-                onEdit={() => setEditingOrder(order)}
-                onDelete={() => deleteOrder(order.id)}
+                onEdit={onEditById}
+                onDelete={deleteOrder}
                 onUpdateStatus={updateStatus}
-                getTotal={getTotal}
-                getElapsed={getElapsed}
+                elapsedMinutes={getElapsed(order.created_at)}
                 isCompleted={showCompleted}
+                onOpenLiveMap={setLiveMapOrder}
               />
             ))}
           </div>
+          </>
         )}
       </div>
+
+      {liveMapOrder && (
+        <CourierLiveMapModal
+          open
+          onClose={() => setLiveMapOrder(null)}
+          order={liveMapOrder}
+          courierLat={couriers.find((c) => c.id === liveMapOrder.courier_id)?.latitude ?? null}
+          courierLng={couriers.find((c) => c.id === liveMapOrder.courier_id)?.longitude ?? null}
+        />
+      )}
     </div>
   );
 }
 
-function CourierLocationBadge({ order, couriers }: { order: TakeawayOrder; couriers: Courier[] }) {
-  const courier = couriers.find(c => c.id === order.courier_id);
-  const hasLocation = courier?.latitude && courier?.longitude;
+function CourierLocationBadge({
+  order,
+  courier,
+  onOpenLiveMap,
+}: {
+  order: TakeawayOrder;
+  courier?: Courier;
+  onOpenLiveMap: (order: CourierLiveMapOrder) => void;
+}) {
+  const courierId = order.courier_id;
+  const hasLocation = courier?.latitude != null && courier?.longitude != null;
   const locationAge = courier?.location_updated_at
     ? Math.floor((Date.now() - new Date(courier.location_updated_at).getTime()) / 60000)
     : null;
@@ -731,25 +1100,33 @@ function CourierLocationBadge({ order, couriers }: { order: TakeawayOrder; couri
   return (
     <div className="space-y-1">
       <div className="flex items-center gap-1.5 text-xs text-slate-600">
-        <Bike className="w-3.5 h-3.5 text-blue-500" />
+        <span className="text-base leading-none" title="Kurye">🛵</span>
         <span className="font-semibold">{order.courier_name}</span>
         {hasLocation && (
           <span className={`flex items-center gap-0.5 ml-auto ${locationAge !== null && locationAge < 3 ? 'text-green-500' : 'text-slate-400'}`}>
             <div className={`w-1.5 h-1.5 rounded-full ${locationAge !== null && locationAge < 3 ? 'bg-green-500 animate-pulse' : 'bg-slate-300'}`} />
-            <span className="text-[10px]">{locationAge !== null ? `${locationAge}dk` : ''}</span>
+            <span className="text-[10px]">{locationAge !== null ? `${locationAge}dk` : 'canlı'}</span>
           </span>
         )}
       </div>
-      {hasLocation && (
-        <a
-          href={`https://www.google.com/maps?q=${courier!.latitude},${courier!.longitude}`}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="flex items-center gap-1 text-[10px] text-blue-500 font-semibold hover:underline"
+      {courierId && (
+        <button
+          type="button"
+          onClick={() =>
+            onOpenLiveMap({
+              id: order.id,
+              order_number: order.order_number,
+              customer_name: order.customer_name,
+              delivery_address: order.delivery_address,
+              courier_id: courierId,
+              courier_name: order.courier_name,
+            })
+          }
+          className="w-full flex items-center justify-center gap-1.5 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded-lg text-[11px] font-black transition active:scale-[0.98]"
         >
-          <Navigation className="w-3 h-3" />
-          Kurye Konumunu Gör
-        </a>
+          <span className="text-sm">🛵</span>
+          Canlı harita & müşteri adresi
+        </button>
       )}
     </div>
   );
@@ -757,30 +1134,75 @@ function CourierLocationBadge({ order, couriers }: { order: TakeawayOrder; couri
 
 interface OrderCardProps {
   order: TakeawayOrder;
-  couriers: Courier[];
-  assigningCourierId: string | null;
+  courier?: Courier;
+  availableCouriers: Courier[];
+  isAssigning: boolean;
   setAssigningCourierId: (id: string | null) => void;
-  onEdit: () => void;
-  onDelete: () => void;
+  onEdit: (orderId: string) => void;
+  onDelete: (orderId: string) => void;
   onUpdateStatus: (id: string, status: string, courierId?: string, courierName?: string) => void;
-  getTotal: (o: TakeawayOrder) => number;
-  getElapsed: (t: string) => number;
+  elapsedMinutes: number;
   isCompleted: boolean;
+  onOpenLiveMap: (order: CourierLiveMapOrder) => void;
 }
 
-function OrderCard({ order, couriers, assigningCourierId, setAssigningCourierId, onEdit, onDelete, onUpdateStatus, getTotal, getElapsed, isCompleted }: OrderCardProps) {
+function orderCardPropsAreEqual(prev: OrderCardProps, next: OrderCardProps): boolean {
+  if (prev.isAssigning !== next.isAssigning) return false;
+  if (prev.isCompleted !== next.isCompleted) return false;
+  if (prev.elapsedMinutes !== next.elapsedMinutes) return false;
+  if (prev.courier !== next.courier) return false;
+  if (prev.availableCouriers !== next.availableCouriers) return false;
+  const po = prev.order;
+  const no = next.order;
+  if (po === no) return true;
+  if (po.id !== no.id) return false;
+  return (
+    po.delivery_status === no.delivery_status &&
+    po.courier_id === no.courier_id &&
+    po.courier_name === no.courier_name &&
+    po.payment_collected === no.payment_collected &&
+    po.total_amount === no.total_amount &&
+    po.customer_name === no.customer_name &&
+    po.customer_phone === no.customer_phone &&
+    po.delivery_address === no.delivery_address &&
+    po.delivery_note === no.delivery_note &&
+    po.payment_method === no.payment_method &&
+    po.order_number === no.order_number &&
+    po.latitude === no.latitude &&
+    po.longitude === no.longitude
+  );
+}
+
+const OrderCard = memo(function OrderCard({
+  order,
+  courier,
+  availableCouriers,
+  isAssigning,
+  setAssigningCourierId,
+  onEdit,
+  onDelete,
+  onUpdateStatus,
+  elapsedMinutes,
+  isCompleted,
+  onOpenLiveMap,
+}: OrderCardProps) {
+  const { format: fmtMoney } = useCurrency();
   const isDelivery = order.order_type === 'delivery';
   const isGelAl = order.order_subtype === 'gel_al';
   const statusInfo = DELIVERY_STATUSES.find(s => s.key === order.delivery_status) || DELIVERY_STATUSES[0];
-  const total = getTotal(order);
-  const elapsed = getElapsed(order.created_at);
-  const itemCount = (order.order_items || []).reduce((s, i) => s + i.quantity, 0);
-  const statusMap = isDelivery ? STATUS_NEXT_DELIVERY : STATUS_NEXT_TAKEAWAY;
+  const total = order.total_amount || 0;
+  const elapsed = elapsedMinutes;
+  const itemCount = takeawayItemCount(order);
+  const statusMap =
+    isDelivery
+      ? STATUS_NEXT_DELIVERY
+      : order.courier_id
+        ? { pending: 'preparing', preparing: 'ready', ready: 'on_the_way', on_the_way: 'delivered' }
+        : STATUS_NEXT_TAKEAWAY;
   const nextStatus = statusMap[order.delivery_status];
   const nextStatusInfo = nextStatus ? DELIVERY_STATUSES.find(s => s.key === nextStatus) : null;
   const payInfo = PAYMENT_LABELS[order.payment_method || 'cash'] || PAYMENT_LABELS.cash;
   const PayIcon = payInfo.icon;
-  const availableCouriers = couriers.filter(c => c.status === 'available');
 
   const headerGradient = isDelivery
     ? 'from-blue-600 to-blue-700'
@@ -792,7 +1214,9 @@ function OrderCard({ order, couriers, assigningCourierId, setAssigningCourierId,
   const typeLabel = isDelivery ? 'Kurye' : isGelAl ? 'Gel-Al' : 'Paket';
 
   return (
-    <div className={`bg-white rounded-xl shadow hover:shadow-lg transition-all overflow-hidden border-l-4 ${isDelivery ? 'border-blue-500' : isGelAl ? 'border-teal-500' : 'border-orange-500'} ${isCompleted ? 'opacity-80' : ''}`}>
+    <div
+      className={`bg-white rounded-xl shadow hover:shadow-lg transition-all overflow-hidden border-l-4 [content-visibility:auto] [contain-intrinsic-size:0_280px] ${isDelivery ? 'border-blue-500' : isGelAl ? 'border-teal-500' : 'border-orange-500'} ${isCompleted ? 'opacity-80' : ''}`}
+    >
       <div className={`bg-gradient-to-r ${headerGradient} p-3 text-white`}>
         <div className="flex items-start justify-between gap-2">
           <div className="flex-1 min-w-0">
@@ -836,8 +1260,12 @@ function OrderCard({ order, couriers, assigningCourierId, setAssigningCourierId,
           </div>
         )}
 
-        {isDelivery && order.courier_name && (
-          <CourierLocationBadge order={order} couriers={couriers} />
+        {order.courier_id && order.courier_name && order.delivery_status !== 'delivered' && order.delivery_status !== 'cancelled' && (
+          <CourierLocationBadge
+            order={order}
+            courier={courier}
+            onOpenLiveMap={onOpenLiveMap}
+          />
         )}
 
         {order.delivery_note && (
@@ -846,15 +1274,8 @@ function OrderCard({ order, couriers, assigningCourierId, setAssigningCourierId,
           </div>
         )}
 
-        {order.order_items && order.order_items.length > 0 && (
-          <div className="space-y-0.5 max-h-20 overflow-y-auto">
-            {order.order_items.map((item, i) => (
-              <div key={i} className="flex justify-between text-xs text-slate-600">
-                <span className="truncate mr-1">{item.quantity}x {item.products?.name || 'Ürün'}</span>
-                <span className="shrink-0 font-semibold">{((item.unit_price || 0) * item.quantity).toFixed(2)}₺</span>
-              </div>
-            ))}
-          </div>
+        {itemCount > 0 && (
+          <p className="text-xs text-slate-500 font-semibold">{itemCount} ürün · detay için düzenle</p>
         )}
 
         <div className="pt-1 border-t border-slate-100 space-y-1.5">
@@ -863,7 +1284,7 @@ function OrderCard({ order, couriers, assigningCourierId, setAssigningCourierId,
               <PayIcon className="w-3.5 h-3.5" />
               <span>{payInfo.label}</span>
             </div>
-            <span className="font-black text-base text-slate-800">{total.toFixed(2)}₺</span>
+            <span className="font-black text-base text-slate-800">{fmtMoney(total)}</span>
           </div>
           {order.payment_collected ? (
             <div className="flex items-center gap-1 text-xs font-bold text-green-600 bg-green-50 px-2 py-1 rounded-lg">
@@ -880,7 +1301,7 @@ function OrderCard({ order, couriers, assigningCourierId, setAssigningCourierId,
 
         {!isCompleted && (
           <div className="space-y-1.5 pt-1">
-            {assigningCourierId === order.id ? (
+            {isAssigning ? (
               <div className="space-y-1">
                 <p className="text-xs font-bold text-slate-600">Kurye Seç:</p>
                 {availableCouriers.map(c => (
@@ -936,7 +1357,7 @@ function OrderCard({ order, couriers, assigningCourierId, setAssigningCourierId,
 
             <div className="flex gap-1.5">
               <button
-                onClick={onEdit}
+                onClick={() => onEdit(order.id)}
                 className="flex-1 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg text-xs font-bold transition active:scale-95"
               >
                 Düzenle
@@ -948,7 +1369,7 @@ function OrderCard({ order, couriers, assigningCourierId, setAssigningCourierId,
                 <X className="w-3.5 h-3.5" />
               </button>
               <button
-                onClick={onDelete}
+                onClick={() => onDelete(order.id)}
                 className="px-2.5 py-1.5 bg-red-50 hover:bg-red-100 text-red-500 rounded-lg text-xs transition active:scale-95"
               >
                 <Trash2 className="w-3.5 h-3.5" />
@@ -959,4 +1380,4 @@ function OrderCard({ order, couriers, assigningCourierId, setAssigningCourierId,
       </div>
     </div>
   );
-}
+}, orderCardPropsAreEqual);

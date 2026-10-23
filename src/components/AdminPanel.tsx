@@ -1,9 +1,28 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
+import type { LucideIcon } from 'lucide-react';
 import { supabase, invokeEdgeFunction } from '../lib/supabase';
-import { Shield, Search, Building2, Users, CheckCircle, XCircle, Clock, AlertTriangle, RefreshCw, ChevronDown, ChevronUp, X, Save, Calendar, CreditCard, TrendingUp, LogOut, Bell, Send, TicketCheck, MessageCircle, Trash2, Eye, EyeOff, Ban, Play, ChevronRight, Mail, Phone, MapPin, Hash, UserCheck, AlertCircle, Info, Headphones, BarChart3, Banknote, Package2, Server, Handshake, Key, Plus, CreditCard as Edit2 } from 'lucide-react';
+import '../styles/admin-panel.css';
+import { Shield, Search, Building2, Users, CheckCircle, XCircle, Clock, AlertTriangle, RefreshCw, ChevronDown, ChevronUp, X, Save, Calendar, CreditCard, TrendingUp, LogOut, Bell, Send, TicketCheck, MessageCircle, Trash2, Eye, EyeOff, Ban, Play, ChevronRight, Mail, Phone, MapPin, Hash, UserCheck, AlertCircle, Info, Headphones, BarChart3, Banknote, Package2, Server, Handshake, Key, Plus, CreditCard as Edit2, Smartphone, HardDrive, Download } from 'lucide-react';
+import {
+  fetchPlatformReleasePolicy,
+  savePlatformReleasePolicy,
+  type PlatformReleasePolicy,
+} from '../lib/releasePolicy';
+import { sendWipeLocalCommand } from '../lib/remoteWipe';
 import { useAuth } from '../contexts/AuthContext';
 import { AYKA_ADMIN_PATH } from '../lib/aykaRoute';
 import { TOGGLEABLE_MODULES } from '../lib/modules';
+import { canAccessAdminPanel, isAdminAllowedEmail } from '../lib/adminAccess';
+import {
+  fetchOnlineProfileIdsByTenant,
+  fetchTenantProfiles,
+  formatLastSeenLabel,
+  formatOnlineLabel,
+  isProfileOnline,
+  onlineUserIdsFromProfiles,
+} from '../lib/tenantPresence';
+import { resolveProvinceSlug, provinceDisplayName } from '../lib/resellerProvince';
+import { TURKEY_PROVINCES } from './landing/content/turkeyLocations.generated';
 
 interface TenantRow {
   id: string;
@@ -19,6 +38,7 @@ interface TenantRow {
   notes: string;
   onboarding_completed: boolean;
   deployment_mode: string | null;
+  disabled_modules?: string[] | null;
   created_at: string;
   _profileCount?: number;
   _branchCount?: number;
@@ -31,6 +51,8 @@ interface ProfileRow {
   email: string;
   role: string;
   branch_id: string | null;
+  phone?: string | null;
+  last_active_at?: string | null;
 }
 
 const PLANS = [
@@ -47,18 +69,63 @@ const STATUSES = [
   { value: 'expired', label: 'Süresi Doldu', color: 'bg-amber-100 text-amber-700', dot: 'bg-amber-500', icon: AlertTriangle },
 ];
 
+function OnlinePresenceBadge({ count }: { count: number }) {
+  const online = count > 0;
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 text-xs font-semibold ${
+        online ? 'text-emerald-700' : 'text-slate-400'
+      }`}
+      title={online ? 'Son 2 dk içinde uygulama açık' : 'Şu an çevrimiçi kullanıcı yok'}
+    >
+      <span
+        className={`w-2 h-2 rounded-full shrink-0 ${
+          online ? 'bg-emerald-500 animate-pulse' : 'bg-slate-300'
+        }`}
+      />
+      {formatOnlineLabel(count)}
+    </span>
+  );
+}
+
 function PlanBadge({ plan }: { plan: string }) {
   const p = PLANS.find(x => x.value === plan) || PLANS[0];
-  return <span className={`px-2.5 py-1 rounded-full text-xs font-bold ${p.color}`}>{p.label}</span>;
+  return <span className={`admin-badge ${p.color} border-slate-200/60`}>{p.label}</span>;
 }
 
 function StatusBadge({ status }: { status: string }) {
   const s = STATUSES.find(x => x.value === status) || STATUSES[0];
   return (
-    <span className={`px-2.5 py-1 rounded-full text-xs font-bold flex items-center gap-1.5 w-fit ${s.color}`}>
-      <span className={`w-1.5 h-1.5 rounded-full ${s.dot}`} />
+    <span className={`admin-badge ${s.color}`}>
+      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${s.dot}`} />
       {s.label}
     </span>
+  );
+}
+
+type AdminKpiTone = 'slate' | 'emerald' | 'blue' | 'red' | 'amber';
+
+function AdminKpiCard({
+  label,
+  value,
+  icon: Icon,
+  tone,
+}: {
+  label: string;
+  value: number;
+  icon: LucideIcon;
+  tone: AdminKpiTone;
+}) {
+  return (
+    <div className={`admin-kpi-card admin-kpi--${tone}`}>
+      <div>
+        <p className="admin-kpi-label">{label}</p>
+        <p className="admin-kpi-value">{value}</p>
+      </div>
+      <div className="admin-kpi-icon">
+        <Icon className="w-4 h-4" strokeWidth={2.25} />
+      </div>
+    </div>
   );
 }
 
@@ -394,10 +461,97 @@ interface TenantDetailProps {
   planUpdating: boolean;
   onStatusChange: (status: string) => void;
   statusChanging: boolean;
+  onWipeLocal: () => void;
+  wipeSending: boolean;
 }
 
-function TenantDetailPanel({ tenant, onlineUserIds, onClose, onEdit, onDelete, onImpersonate, onApplyPlan, planUpdating, onStatusChange, statusChanging }: TenantDetailProps) {
+function TenantDetailPanel({ tenant, onlineUserIds, onClose, onEdit, onDelete, onImpersonate, onApplyPlan, planUpdating, onStatusChange, statusChanging, onWipeLocal, wipeSending }: TenantDetailProps) {
   const [showUsers, setShowUsers] = useState(true);
+  const [userPresenceFilter, setUserPresenceFilter] = useState<'all' | 'online' | 'offline'>('all');
+  const [pwTarget, setPwTarget] = useState<ProfileRow | null>(null);
+  const [pwValue, setPwValue] = useState('');
+  const [pwNotifySms, setPwNotifySms] = useState(true);
+  const [pwSaving, setPwSaving] = useState(false);
+  const [pwMsg, setPwMsg] = useState('');
+
+  const ownerProfile =
+    (tenant._profiles || []).find((p) => p.role === 'owner') ||
+    (tenant._profiles || [])[0] ||
+    null;
+  const displayEmail = (tenant.email || ownerProfile?.email || '').trim() || '—';
+  const displayPhone = (tenant.phone || ownerProfile?.phone || '').trim() || '—';
+  const enabledModuleLabels = TOGGLEABLE_MODULES.filter(
+    (m) => !(tenant.disabled_modules || []).includes(m.code),
+  ).map((m) => m.label);
+
+  const onlineIdSet = new Set(onlineUserIds);
+  const sortedProfiles = [...(tenant._profiles || [])].sort((a, b) => {
+    const ao = onlineIdSet.has(a.id) || isProfileOnline(a.last_active_at) ? 1 : 0;
+    const bo = onlineIdSet.has(b.id) || isProfileOnline(b.last_active_at) ? 1 : 0;
+    if (ao !== bo) return bo - ao;
+    return (a.full_name || '').localeCompare(b.full_name || '', 'tr');
+  });
+  const filteredProfiles = sortedProfiles.filter((p) => {
+    const on = onlineIdSet.has(p.id) || isProfileOnline(p.last_active_at);
+    if (userPresenceFilter === 'online') return on;
+    if (userPresenceFilter === 'offline') return !on;
+    return true;
+  });
+  const onlineCount = sortedProfiles.filter(
+    (p) => onlineIdSet.has(p.id) || isProfileOnline(p.last_active_at),
+  ).length;
+  const offlineCount = Math.max(0, sortedProfiles.length - onlineCount);
+
+  const openPasswordReset = (p: ProfileRow) => {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let gen = '';
+    for (let i = 0; i < 8; i++) gen += alphabet[Math.floor(Math.random() * alphabet.length)];
+    setPwTarget(p);
+    setPwValue(gen);
+    setPwNotifySms(!!p.phone);
+    setPwMsg('');
+  };
+
+  const savePasswordReset = async () => {
+    if (!pwTarget) return;
+    const next = pwValue.trim();
+    if (next.length < 6) {
+      setPwMsg('Şifre en az 6 karakter olmalı');
+      return;
+    }
+    setPwSaving(true);
+    setPwMsg('');
+    try {
+      const data = await invokeEdgeFunction<{
+        success?: boolean;
+        error?: string;
+        sms_sent?: boolean;
+        sms_error?: string;
+      }>('update-user', {
+        target_user_id: pwTarget.id,
+        new_password: next,
+        notify_sms: pwNotifySms,
+        phone: pwTarget.phone || undefined,
+      });
+      if (!data?.success) {
+        setPwMsg(data?.error || 'Şifre güncellenemedi');
+        return;
+      }
+      if (pwNotifySms) {
+        setPwMsg(
+          data.sms_sent
+            ? `Şifre kaydedildi ve SMS gönderildi.\nYeni şifre: ${next}`
+            : `Şifre kaydedildi. SMS gönderilemedi: ${data.sms_error || 'telefon yok'}\nYeni şifre: ${next}`,
+        );
+      } else {
+        setPwMsg(`Şifre kaydedildi.\nYeni şifre: ${next}`);
+      }
+    } catch (e: any) {
+      setPwMsg(e?.message || 'Şifre güncellenemedi');
+    } finally {
+      setPwSaving(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-start justify-end z-50 p-4">
@@ -431,13 +585,13 @@ function TenantDetailPanel({ tenant, onlineUserIds, onClose, onEdit, onDelete, o
               <p className="text-xs font-bold text-slate-400 uppercase mb-1 flex items-center gap-1.5">
                 <Mail className="w-3 h-3" /> E-posta
               </p>
-              <p className="text-sm font-semibold text-slate-700 break-all">{tenant.email}</p>
+              <p className="text-sm font-semibold text-slate-700 break-all">{displayEmail}</p>
             </div>
             <div className="bg-slate-50 rounded-xl p-3">
               <p className="text-xs font-bold text-slate-400 uppercase mb-1 flex items-center gap-1.5">
                 <Phone className="w-3 h-3" /> Telefon
               </p>
-              <p className="text-sm font-semibold text-slate-700">{tenant.phone || '—'}</p>
+              <p className="text-sm font-semibold text-slate-700">{displayPhone}</p>
             </div>
             <div className="bg-slate-50 rounded-xl p-3">
               <p className="text-xs font-bold text-slate-400 uppercase mb-1 flex items-center gap-1.5">
@@ -480,16 +634,41 @@ function TenantDetailPanel({ tenant, onlineUserIds, onClose, onEdit, onDelete, o
                  tenant.deployment_mode === 'hybrid' ? '⚡ Hibrit' : '☁️ Bulut (Online)'}
               </span>
             </div>
+            <div className="bg-slate-50 rounded-xl p-3 col-span-2">
+              <p className="text-xs font-bold text-slate-400 uppercase mb-1.5 flex items-center gap-1.5">
+                <Package2 className="w-3 h-3" /> Açık Modüller
+              </p>
+              {enabledModuleLabels.length > 0 ? (
+                <div className="flex flex-wrap gap-1.5">
+                  {enabledModuleLabels.map((label) => (
+                    <span
+                      key={label}
+                      className="inline-flex px-2 py-0.5 rounded-full text-[11px] font-bold bg-orange-50 text-orange-700 border border-orange-100"
+                    >
+                      {label}
+                    </span>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm text-slate-500">—</p>
+              )}
+              {ownerProfile && (
+                <p className="text-xs text-slate-500 mt-2">
+                  Sahip: <span className="font-semibold text-slate-700">{ownerProfile.full_name || '—'}</span>
+                  {ownerProfile.email ? ` · ${ownerProfile.email}` : ''}
+                </p>
+              )}
+            </div>
           </div>
 
-          {tenant.address && (
+          {(tenant.address || '').trim() ? (
             <div className="bg-slate-50 rounded-xl p-3">
               <p className="text-xs font-bold text-slate-400 uppercase mb-1 flex items-center gap-1.5">
                 <MapPin className="w-3 h-3" /> Adres
               </p>
               <p className="text-sm text-slate-700">{tenant.address}</p>
             </div>
-          )}
+          ) : null}
 
           {tenant.notes && (
             <div className="bg-amber-50 border border-amber-200 rounded-xl p-3">
@@ -506,49 +685,179 @@ function TenantDetailPanel({ tenant, onlineUserIds, onClose, onEdit, onDelete, o
               className="w-full flex items-center justify-between py-2 text-sm font-bold text-slate-700 hover:text-slate-900 transition"
             >
               <span className="flex items-center gap-2">
-                <UserCheck className="w-4 h-4" /> Kullanıcı Listesi ({tenant._profiles?.length || 0})
+                <UserCheck className="w-4 h-4" /> Kullanıcı durumu ({tenant._profiles?.length || 0})
               </span>
               {showUsers ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
             </button>
-            {showUsers && tenant._profiles && tenant._profiles.length > 0 && (
+            {showUsers && sortedProfiles.length > 0 && (
               <div className="mt-2 space-y-2">
-                {tenant._profiles.map(p => (
-                  <div key={p.id} className="flex items-center gap-3 px-3 py-2.5 bg-slate-50 rounded-xl">
-                    <div className="w-8 h-8 bg-orange-100 rounded-full flex items-center justify-center shrink-0">
-                      <span className="text-xs font-black text-orange-700">
-                        {p.full_name?.charAt(0)?.toUpperCase() || '?'}
+                <div className="flex flex-wrap items-center gap-2 px-1">
+                  <span className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-700 bg-emerald-50 border border-emerald-100 px-2.5 py-1 rounded-full">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                    {onlineCount} çevrimiçi
+                  </span>
+                  <span className="inline-flex items-center gap-1.5 text-xs font-bold text-slate-500 bg-slate-100 border border-slate-200 px-2.5 py-1 rounded-full">
+                    <span className="w-2 h-2 rounded-full bg-slate-400" />
+                    {offlineCount} çevrimdışı
+                  </span>
+                  <div className="flex gap-1 ml-auto">
+                    {(
+                      [
+                        ['all', 'Tümü'],
+                        ['online', 'Çevrimiçi'],
+                        ['offline', 'Çevrimdışı'],
+                      ] as const
+                    ).map(([key, label]) => (
+                      <button
+                        key={key}
+                        type="button"
+                        onClick={() => setUserPresenceFilter(key)}
+                        className={`text-[10px] font-bold px-2 py-1 rounded-lg border transition ${
+                          userPresenceFilter === key
+                            ? 'bg-slate-800 text-white border-slate-800'
+                            : 'bg-white text-slate-500 border-slate-200 hover:border-slate-300'
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <p className="text-[10px] text-slate-400 px-1">
+                  Çevrimiçi = son ~2 dk içinde uygulama açık (sekme görünür). Çıkış / sekme kapanınca çevrimdışı.
+                </p>
+                {filteredProfiles.map((p) => {
+                  const online = onlineIdSet.has(p.id) || isProfileOnline(p.last_active_at);
+                  return (
+                    <div
+                      key={p.id}
+                      className={`flex items-center gap-3 px-3 py-2.5 rounded-xl border ${
+                        online
+                          ? 'bg-emerald-50/70 border-emerald-100'
+                          : 'bg-slate-50 border-slate-100'
+                      }`}
+                    >
+                      <div className="relative shrink-0">
+                        <div
+                          className={`w-8 h-8 rounded-full flex items-center justify-center ${
+                            online ? 'bg-emerald-100' : 'bg-orange-100'
+                          }`}
+                        >
+                          <span
+                            className={`text-xs font-black ${
+                              online ? 'text-emerald-800' : 'text-orange-700'
+                            }`}
+                          >
+                            {p.full_name?.charAt(0)?.toUpperCase() || '?'}
+                          </span>
+                        </div>
+                        <span
+                          className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-white ${
+                            online ? 'bg-emerald-500' : 'bg-slate-300'
+                          }`}
+                          title={online ? 'Çevrimiçi' : 'Çevrimdışı'}
+                        />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-semibold text-slate-800 truncate">{p.full_name}</p>
+                        <p className="text-xs text-slate-400 truncate">
+                          {p.email?.includes('.shefpos.local') ? `@${p.email.split('@')[0]}` : p.email}
+                        </p>
+                        {p.phone && (
+                          <p className="text-[10px] text-slate-500 truncate">{p.phone}</p>
+                        )}
+                        <div className="flex flex-wrap items-center gap-2 mt-1">
+                          <span
+                            className={`text-[10px] font-black uppercase tracking-wide px-1.5 py-0.5 rounded ${
+                              online
+                                ? 'bg-emerald-600 text-white'
+                                : 'bg-slate-200 text-slate-600'
+                            }`}
+                          >
+                            {online ? 'Çevrimiçi' : 'Çevrimdışı'}
+                          </span>
+                          <span className="text-[10px] text-slate-500">
+                            {formatLastSeenLabel(p.last_active_at)}
+                          </span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => openPasswordReset(p)}
+                        className="p-2 rounded-lg text-orange-600 hover:bg-orange-50 border border-orange-100 shrink-0"
+                        title="Şifre yenile"
+                        aria-label="Şifre yenile"
+                      >
+                        <Key className="w-4 h-4" />
+                      </button>
+                      <span className={`text-xs font-bold px-2 py-0.5 rounded-full shrink-0 ${
+                        p.role === 'owner' ? 'bg-orange-100 text-orange-700' :
+                        p.role === 'admin' ? 'bg-blue-100 text-blue-700' :
+                        p.role === 'manager' ? 'bg-emerald-100 text-emerald-700' :
+                        p.role === 'cashier' ? 'bg-yellow-100 text-yellow-700' :
+                        'bg-slate-100 text-slate-600'
+                      }`}>
+                        {p.role === 'owner' ? 'Sahip' :
+                         p.role === 'admin' ? 'Yönetici' :
+                         p.role === 'manager' ? 'Müdür' :
+                         p.role === 'cashier' ? 'Kasiyer' :
+                         p.role === 'waiter' ? 'Garson' : p.role}
                       </span>
                     </div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-semibold text-slate-800 truncate">{p.full_name}</p>
-                      <p className="text-xs text-slate-400 truncate">
-                        {p.email?.includes('.shefpos.local') ? `@${p.email.split('@')[0]}` : p.email}
-                      </p>
-                      <p className={`text-[10px] font-bold mt-0.5 ${onlineUserIds.includes(p.id) ? 'text-emerald-600' : 'text-slate-400'}`}>
-                        {onlineUserIds.includes(p.id) ? 'Online' : 'Offline'}
-                      </p>
-                    </div>
-                    <span className={`text-xs font-bold px-2 py-0.5 rounded-full shrink-0 ${
-                      p.role === 'owner' ? 'bg-orange-100 text-orange-700' :
-                      p.role === 'admin' ? 'bg-blue-100 text-blue-700' :
-                      p.role === 'manager' ? 'bg-emerald-100 text-emerald-700' :
-                      p.role === 'cashier' ? 'bg-yellow-100 text-yellow-700' :
-                      'bg-slate-100 text-slate-600'
-                    }`}>
-                      {p.role === 'owner' ? 'Sahip' :
-                       p.role === 'admin' ? 'Yönetici' :
-                       p.role === 'manager' ? 'Müdür' :
-                       p.role === 'cashier' ? 'Kasiyer' :
-                       p.role === 'waiter' ? 'Garson' : p.role}
-                    </span>
-                  </div>
-                ))}
+                  );
+                })}
+                {filteredProfiles.length === 0 && (
+                  <p className="text-sm text-slate-400 text-center py-3">
+                    Bu filtrede kullanıcı yok
+                  </p>
+                )}
               </div>
             )}
-            {showUsers && (!tenant._profiles || tenant._profiles.length === 0) && (
+            {showUsers && sortedProfiles.length === 0 && (
               <p className="text-sm text-slate-400 text-center py-4">Kullanıcı bulunamadı</p>
             )}
           </div>
+
+          {pwTarget && (
+            <div className="rounded-xl border-2 border-orange-200 bg-orange-50/60 p-4 space-y-3">
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <p className="text-sm font-bold text-slate-800">Şifre yenile</p>
+                  <p className="text-xs text-slate-500">{pwTarget.full_name} · {pwTarget.email}</p>
+                </div>
+                <button type="button" onClick={() => setPwTarget(null)} className="p-1 text-slate-400 hover:text-slate-700">
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              <input
+                type="text"
+                value={pwValue}
+                onChange={(e) => setPwValue(e.target.value)}
+                className="w-full px-3 py-2 rounded-lg border-2 border-slate-200 focus:border-orange-400 focus:outline-none text-sm font-mono"
+                placeholder="Yeni şifre"
+              />
+              <label className="flex items-center gap-2 text-xs text-slate-600 select-none">
+                <input
+                  type="checkbox"
+                  checked={pwNotifySms}
+                  onChange={(e) => setPwNotifySms(e.target.checked)}
+                  disabled={!pwTarget.phone}
+                />
+                Kayıtlı telefona SMS gönder {pwTarget.phone ? `(${pwTarget.phone})` : '(telefon yok)'}
+              </label>
+              {pwMsg && (
+                <pre className="text-xs whitespace-pre-wrap bg-white border border-slate-200 rounded-lg p-2 text-slate-700">{pwMsg}</pre>
+              )}
+              <button
+                type="button"
+                disabled={pwSaving}
+                onClick={() => void savePasswordReset()}
+                className="w-full py-2.5 rounded-xl bg-orange-600 hover:bg-orange-700 text-white text-sm font-bold disabled:opacity-50"
+              >
+                {pwSaving ? 'Kaydediliyor…' : 'Şifreyi kaydet'}
+              </button>
+            </div>
+          )}
 
           <div className="border-t border-slate-100 pt-4">
             <p className="text-xs font-bold text-slate-400 uppercase mb-3">Hızlı Aksiyonlar</p>
@@ -616,6 +925,18 @@ function TenantDetailPanel({ tenant, onlineUserIds, onClose, onEdit, onDelete, o
                   Deneme Moduna Al
                 </button>
               )}
+              <button
+                type="button"
+                onClick={onWipeLocal}
+                disabled={wipeSending}
+                className="w-full flex items-center gap-3 px-4 py-3 bg-amber-50 hover:bg-amber-100 border border-amber-200 rounded-xl text-amber-900 font-semibold text-sm transition disabled:opacity-50"
+              >
+                <HardDrive className="w-4 h-4 shrink-0" />
+                Kasa yerel verisini sil (uzaktan)
+              </button>
+              <p className="text-[11px] text-slate-500 leading-snug px-1">
+                Açık kasalarda AppData önbelleği ve oturum dosyaları temizlenir; bulut verileri ve sipariş geçmişi korunur.
+              </p>
             </div>
           </div>
         </div>
@@ -692,7 +1013,7 @@ function extractPhoneFromEmail(email: string | null | undefined) {
 
 function SupportPanel({ tenants }: { tenants: TenantRow[] }) {
   const { user } = useAuth();
-  const [activeTab, setActiveTab] = useState<'tickets' | 'notifications'>('tickets');
+  const [activeTab, setActiveTab] = useState<'tickets' | 'notifications' | 'sms'>('tickets');
   const [tickets, setTickets] = useState<SupportTicket[]>([]);
   const [notifications, setNotifications] = useState<SupportNotification[]>([]);
   const [deletingTicketId, setDeletingTicketId] = useState<string | null>(null);
@@ -729,7 +1050,7 @@ function SupportPanel({ tenants }: { tenants: TenantRow[] }) {
         if (hiddenTicketBefore && t.created_at && t.created_at <= hiddenTicketBefore) return false;
         return true;
       }));
-    } else {
+    } else if (activeTab === 'notifications') {
       const { data } = await supabase
         .from('support_notifications')
         .select('*')
@@ -913,41 +1234,57 @@ function SupportPanel({ tenants }: { tenants: TenantRow[] }) {
   const openCount = tickets.filter(t => t.status === 'open').length;
 
   return (
-    <div className="max-w-7xl mx-auto px-6 py-8">
-      <div className="flex items-center gap-3 mb-6">
-        <div className="w-10 h-10 bg-blue-500 rounded-xl flex items-center justify-center">
-          <Headphones className="w-5 h-5 text-white" />
-        </div>
+    <div className="admin-main">
+      <div className="admin-page-head">
         <div>
-          <h2 className="font-black text-slate-800 text-xl">Destek Merkezi</h2>
-          <p className="text-slate-500 text-sm">Destek talepleri ve bildirim yönetimi</p>
+          <h2 className="admin-page-title">
+            <Headphones className="w-5 h-5 text-orange-500" />
+            Destek Merkezi
+          </h2>
+          <p className="admin-page-sub">Destek talepleri · uygulama bildirimleri · SMS duyuru</p>
         </div>
         {openCount > 0 && (
-          <span className="ml-auto bg-red-500 text-white text-xs font-bold px-2.5 py-1 rounded-full">
+          <span className="admin-badge bg-red-100 text-red-700 border-red-200/80">
             {openCount} açık talep
           </span>
         )}
       </div>
 
-      <div className="flex gap-2 mb-6">
+      <div className="admin-subnav flex flex-wrap gap-2 mb-6" role="tablist" aria-label="Destek alt menüsü">
         <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'tickets'}
           onClick={() => setActiveTab('tickets')}
-          className={`px-4 py-2.5 rounded-xl font-semibold text-sm flex items-center gap-2 transition ${activeTab === 'tickets' ? 'bg-slate-800 text-white shadow' : 'bg-white text-slate-600 hover:bg-slate-50 border border-slate-200'}`}
+          className={`admin-subnav-btn${activeTab === 'tickets' ? ' is-active' : ''}`}
         >
-          <TicketCheck className="w-4 h-4" />
+          <TicketCheck className="w-4 h-4 shrink-0" />
           Destek Talepleri
           {openCount > 0 && (
-            <span className="bg-red-500 text-white text-xs font-bold w-5 h-5 rounded-full flex items-center justify-center">
+            <span className="bg-red-500 text-white text-xs font-bold min-w-[1.25rem] h-5 px-1 rounded-full flex items-center justify-center">
               {openCount}
             </span>
           )}
         </button>
         <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'notifications'}
           onClick={() => setActiveTab('notifications')}
-          className={`px-4 py-2.5 rounded-xl font-semibold text-sm flex items-center gap-2 transition ${activeTab === 'notifications' ? 'bg-slate-800 text-white shadow' : 'bg-white text-slate-600 hover:bg-slate-50 border border-slate-200'}`}
+          className={`admin-subnav-btn${activeTab === 'notifications' ? ' is-active' : ''}`}
         >
-          <Bell className="w-4 h-4" />
-          Bildirimler
+          <Bell className="w-4 h-4 shrink-0" />
+          Uygulama Bildirimleri
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'sms'}
+          onClick={() => setActiveTab('sms')}
+          className={`admin-subnav-btn admin-subnav-btn--sms${activeTab === 'sms' ? ' is-active' : ''}`}
+        >
+          <Smartphone className="w-4 h-4 shrink-0" />
+          SMS Duyuru
         </button>
       </div>
 
@@ -1024,63 +1361,77 @@ function SupportPanel({ tenants }: { tenants: TenantRow[] }) {
         </div>
       )}
 
+      {activeTab === 'sms' && (
+        <div className="max-w-xl">
+          <div className="admin-card p-6 space-y-4">
+            <div className="flex items-start gap-3 pb-1 border-b border-slate-100">
+              <div className="w-10 h-10 rounded-xl bg-emerald-50 flex items-center justify-center shrink-0">
+                <Smartphone className="w-5 h-5 text-emerald-600" />
+              </div>
+              <div>
+                <h3 className="font-bold text-slate-800">SMS Duyuru Gönder</h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Restoran telefonu veya kayıtlı kullanıcı numarasına kısa mesaj gider. Uygulama içi bildirim değildir.
+                </p>
+              </div>
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-slate-500 mb-1.5 uppercase tracking-wide">Alıcı</label>
+              <select
+                value={smsForm.tenant_id}
+                onChange={e => setSmsForm(p => ({ ...p, tenant_id: e.target.value }))}
+                className="admin-select w-full"
+              >
+                <option value="">Tüm Restoranlar</option>
+                {tenants.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-slate-500 mb-1.5 uppercase tracking-wide">Konu</label>
+              <input
+                type="text"
+                value={smsForm.title}
+                onChange={e => setSmsForm(p => ({ ...p, title: e.target.value }))}
+                placeholder="Bayram, kampanya, duyuru..."
+                className="admin-select w-full"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-slate-500 mb-1.5 uppercase tracking-wide">SMS Metni</label>
+              <textarea
+                value={smsForm.message}
+                onChange={e => setSmsForm(p => ({ ...p, message: e.target.value }))}
+                rows={4}
+                placeholder="Restoranlara gidecek SMS metni..."
+                className="admin-select w-full resize-none"
+              />
+              <p className="text-[11px] text-slate-400 mt-1.5">Türkçe karakter ve uzun metinler operatöre göre kısaltılabilir.</p>
+            </div>
+            <button
+              type="button"
+              onClick={handleSendSms}
+              disabled={sendingSms || !smsForm.message.trim()}
+              className="w-full py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold flex items-center justify-center gap-2 transition shadow-md shadow-emerald-600/25"
+            >
+              <Send className="w-4 h-4" />
+              {sendingSms ? 'SMS Gönderiliyor...' : (smsForm.tenant_id ? 'Seçili Restorana SMS Gönder' : 'Tüm Restoranlara SMS Gönder')}
+            </button>
+            {smsResult && (
+              <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 px-4 py-3 rounded-xl text-sm font-semibold">
+                {smsResult}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {activeTab === 'notifications' && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <div>
             <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2">
-              <MessageCircle className="w-4 h-4" /> SMS Duyuru
+              <Send className="w-4 h-4 text-orange-500" /> Yeni Uygulama Bildirimi
             </h3>
-            <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-6 space-y-4 mb-6">
-              <div>
-                <label className="block text-xs font-bold text-slate-500 mb-1.5 uppercase tracking-wide">Alıcı</label>
-                <select
-                  value={smsForm.tenant_id}
-                  onChange={e => setSmsForm(p => ({ ...p, tenant_id: e.target.value }))}
-                  className="w-full px-3 py-2.5 rounded-xl border border-slate-200 focus:ring-2 focus:ring-emerald-400 outline-none text-sm"
-                >
-                  <option value="">Tüm Restoranlar</option>
-                  {tenants.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs font-bold text-slate-500 mb-1.5 uppercase tracking-wide">Konu</label>
-                <input
-                  type="text"
-                  value={smsForm.title}
-                  onChange={e => setSmsForm(p => ({ ...p, title: e.target.value }))}
-                  placeholder="Bayram, kampanya, duyuru..."
-                  className="w-full px-3 py-2.5 rounded-xl border border-slate-200 focus:ring-2 focus:ring-emerald-400 outline-none text-sm"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-bold text-slate-500 mb-1.5 uppercase tracking-wide">SMS Mesajı</label>
-                <textarea
-                  value={smsForm.message}
-                  onChange={e => setSmsForm(p => ({ ...p, message: e.target.value }))}
-                  rows={3}
-                  placeholder="Restoranlara gidecek SMS metni..."
-                  className="w-full px-3 py-2.5 rounded-xl border border-slate-200 focus:ring-2 focus:ring-emerald-400 outline-none text-sm resize-none"
-                />
-              </div>
-              <button
-                onClick={handleSendSms}
-                disabled={sendingSms || !smsForm.message.trim()}
-                className="w-full bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold py-3 rounded-xl flex items-center justify-center gap-2 transition"
-              >
-                <Send className="w-4 h-4" />
-                {sendingSms ? 'SMS Gönderiliyor...' : (smsForm.tenant_id ? 'Seçili Restorana SMS Gönder' : 'Tüm Restoranlara SMS Gönder')}
-              </button>
-              {smsResult && (
-                <div className="bg-slate-50 border border-slate-200 text-slate-700 px-4 py-3 rounded-xl text-sm font-semibold">
-                  {smsResult}
-                </div>
-              )}
-            </div>
-
-            <h3 className="font-bold text-slate-700 mb-4 flex items-center gap-2">
-              <Send className="w-4 h-4" /> Yeni Bildirim Gönder
-            </h3>
-            <div className="bg-white rounded-2xl border border-slate-100 shadow-sm p-6 space-y-4">
+            <div className="admin-card p-6 space-y-4">
               <div>
                 <label className="block text-xs font-bold text-slate-500 mb-1.5 uppercase tracking-wide">Alıcı</label>
                 <select
@@ -1140,20 +1491,25 @@ function SupportPanel({ tenants }: { tenants: TenantRow[] }) {
                 </div>
               )}
               <button
+                type="button"
                 onClick={handleSendNotification}
                 disabled={sendingNotif || !notifForm.title.trim() || !notifForm.message.trim()}
-                className="w-full bg-gradient-to-r from-orange-500 to-red-500 hover:from-orange-600 hover:to-red-600 disabled:opacity-50 text-white font-bold py-3 rounded-xl flex items-center justify-center gap-2 transition"
+                className="admin-btn-primary w-full justify-center py-3 disabled:opacity-50"
               >
                 <Send className="w-4 h-4" />
                 {sendingNotif ? 'Gönderiliyor...' : notifForm.tenant_id ? 'Seçili Restoran\'a Gönder' : 'Herkese Gönder'}
               </button>
             </div>
+            <p className="text-xs text-slate-400 mt-3 flex items-center gap-1.5">
+              <Info className="w-3.5 h-3.5 shrink-0" />
+              Bu bildirimler restoran panelinde görünür; SMS sekmesinden gönderilmez.
+            </p>
           </div>
 
           <div>
             <div className="flex items-center justify-between mb-4">
               <h3 className="font-bold text-slate-700 flex items-center gap-2">
-                <Bell className="w-4 h-4" /> Gönderilmiş Bildirimler
+                <Bell className="w-4 h-4 text-orange-500" /> Gönderilmiş Bildirimler
               </h3>
               <button
                 onClick={handleDeleteAllNotifications}
@@ -1281,9 +1637,17 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
   const [salesLoading, setSalesLoading] = useState(false);
   const [onlineByTenant, setOnlineByTenant] = useState<Record<string, string[]>>({});
   const [planUpdating, setPlanUpdating] = useState(false);
-  const presenceChannelsRef = useRef<ReturnType<typeof supabase.channel>[]>([]);
+  const [wipeSending, setWipeSending] = useState(false);
+
+  const adminAllowed =
+    canAccessAdminPanel(profile, { isAykaRoute: true }) &&
+    isAdminAllowedEmail(profile?.email);
 
   const loadTenants = async () => {
+    if (!profile?.is_super_admin) {
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     setLoadError('');
     const { data, error } = await supabase
@@ -1299,15 +1663,19 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
 
     if (data) {
       const tenantIds = data.map(t => t.id);
-      const [profilesRes, branchesRes] = await Promise.all([
-        supabase.from('profiles').select('id, tenant_id, full_name, email, role, branch_id').in('tenant_id', tenantIds),
+      const [profilesBundle, branchesRes] = await Promise.all([
+        fetchTenantProfiles(tenantIds),
         supabase.from('branches').select('id, tenant_id').in('tenant_id', tenantIds),
       ]);
+
+      if (profilesBundle.error) {
+        setLoadError(profilesBundle.error.message || 'Kullanicilar yuklenemedi');
+      }
 
       const profilesByTenant: Record<string, ProfileRow[]> = {};
       const branchCounts: Record<string, number> = {};
 
-      (profilesRes.data || []).forEach(p => {
+      profilesBundle.data.forEach((p) => {
         if (!profilesByTenant[p.tenant_id]) profilesByTenant[p.tenant_id] = [];
         profilesByTenant[p.tenant_id].push(p as ProfileRow);
       });
@@ -1385,46 +1753,38 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
     if (activeTab === 'sales' && tenants.length > 0) loadSalesData();
   }, [activeTab, tenants]);
 
+  const refreshOnlineFromDb = async (tenantList: TenantRow[]) => {
+    if (!adminAllowed || tenantList.length === 0) {
+      setOnlineByTenant({});
+      return;
+    }
+    const map = await fetchOnlineProfileIdsByTenant(tenantList.map((t) => t.id));
+    setOnlineByTenant(map);
+  };
+
   useEffect(() => {
-    presenceChannelsRef.current.forEach(ch => supabase.removeChannel(ch));
-    presenceChannelsRef.current = [];
-    setOnlineByTenant({});
+    if (activeTab !== 'restaurants' || tenants.length === 0 || !adminAllowed) {
+      setOnlineByTenant({});
+      return;
+    }
 
-    if (activeTab !== 'restaurants' || tenants.length === 0) return;
-
-    const refreshTenantPresence = (tenantId: string, channel: ReturnType<typeof supabase.channel>) => {
-      const state = channel.presenceState() as Record<string, any[]>;
-      const activeIds = new Set<string>();
-      const now = Date.now();
-      Object.values(state).forEach((entries: any[]) => {
-        entries.forEach((e: any) => {
-          if (!e?.user_id) return;
-          const seenAt = e?.at ? new Date(e.at).getTime() : now;
-          if (now - seenAt <= 70000) {
-            activeIds.add(e.user_id);
-          }
-        });
+    const syncFromLoaded = () => {
+      const map: Record<string, string[]> = {};
+      tenants.forEach((t) => {
+        map[t.id] = onlineUserIdsFromProfiles(t._profiles);
       });
-      setOnlineByTenant(prev => ({ ...prev, [tenantId]: Array.from(activeIds) }));
+      setOnlineByTenant(map);
     };
+    syncFromLoaded();
+    void refreshOnlineFromDb(tenants);
 
-    const channels = tenants.map((t) => {
-      const ch = supabase
-        .channel(`tenant-presence-${t.id}`)
-        .on('presence', { event: 'sync' }, () => refreshTenantPresence(t.id, ch))
-        .on('presence', { event: 'join' }, () => refreshTenantPresence(t.id, ch))
-        .on('presence', { event: 'leave' }, () => refreshTenantPresence(t.id, ch));
-      ch.subscribe();
-      return ch;
-    });
+    const timer = setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      void refreshOnlineFromDb(tenants);
+    }, 20_000);
 
-    presenceChannelsRef.current = channels;
-
-    return () => {
-      channels.forEach(ch => supabase.removeChannel(ch));
-      presenceChannelsRef.current = [];
-    };
-  }, [activeTab, tenants]);
+    return () => clearInterval(timer);
+  }, [activeTab, tenants, adminAllowed]);
 
   const handleDeleteTenant = async () => {
     if (!deletingTenant) return;
@@ -1460,6 +1820,23 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
     setStatusChanging(false);
   };
 
+  const handleWipeLocal = async () => {
+    if (!detailTenant) return;
+    const ok = window.confirm(
+      `"${detailTenant.name}" için tüm açık kasalarda yerel önbellek ve oturum dosyaları silinecek.\n\n` +
+        'Bulut verileri (siparişler, menü, kullanıcılar) korunur. Devam edilsin mi?',
+    );
+    if (!ok) return;
+    setWipeSending(true);
+    const err = await sendWipeLocalCommand(detailTenant.id);
+    setWipeSending(false);
+    if (err) {
+      alert(`Komut gönderilemedi: ${err}`);
+      return;
+    }
+    alert('Komut gönderildi. Kasalar bildirimi alınca yerel veriyi temizleyip yeniden başlayacak.');
+  };
+
   const handleImpersonateTenant = async (tenantId: string) => {
     const { data: { session } } = await supabase.auth.getSession();
     if (!session?.user?.id) {
@@ -1486,7 +1863,12 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
     } catch {
       /* private mode */
     }
-    await refreshProfile();
+    try {
+      sessionStorage.removeItem('sefpos.auth.sessionSnap');
+    } catch {
+      /* */
+    }
+    await refreshProfile({ force: true });
     window.location.assign('/');
   };
 
@@ -1551,96 +1933,119 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
       ? (sortDir === 'asc' ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />)
       : <ChevronDown className="w-3 h-3 text-slate-300" />;
 
+  if (!adminAllowed) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-900 text-white p-6">
+        <div className="max-w-lg text-center space-y-4 border border-white/10 rounded-2xl p-8 bg-slate-800/80">
+          <Shield className="w-12 h-12 text-red-400 mx-auto" />
+          <h1 className="text-xl font-black">Lisans paneli — erişim reddedildi</h1>
+          <p className="text-slate-300 text-sm leading-relaxed">
+            Bu oturum yetkili kurucu hesabı değil veya güvenli giriş tamamlanmadı. Panel yalnızca{' '}
+            <span className="font-mono text-amber-200">{AYKA_ADMIN_PATH}</span> üzerinden, kayıtlı
+            e-posta ile açılır.
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              void signOut();
+              onExit();
+            }}
+            className="px-5 py-2.5 rounded-xl bg-red-600 hover:bg-red-500 font-bold text-sm"
+          >
+            Çıkış yap
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const displayName = profile?.full_name || profile?.email?.split('@')[0] || 'Yönetici';
+  const initials = displayName
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((w) => w[0]?.toUpperCase() || '')
+    .join('') || 'SP';
+
+  const onlineUsersTotal = Object.values(onlineByTenant).reduce((s, ids) => s + ids.length, 0);
+
   return (
-    <div className="min-h-screen bg-slate-50">
-      <div className="bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 text-white px-4 md:px-6 py-3 flex items-center justify-between shadow-xl border-b border-white/10">
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 bg-gradient-to-br from-orange-400 to-red-500 rounded-xl flex items-center justify-center shadow-lg ring-1 ring-orange-300/30">
-            <Shield className="w-4 h-4 text-white" />
+    <div className="admin-panel">
+      <header className="admin-header">
+        <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="admin-brand-icon shrink-0">
+              <Shield className="w-4 h-4 text-white" strokeWidth={2.5} />
+            </div>
+            <div className="min-w-0">
+              <h1 className="font-black text-base md:text-lg tracking-tight text-white">
+                ŞefPOS Lisans Merkezi
+              </h1>
+              <p className="text-slate-400 text-[11px] md:text-xs truncate">
+                {stats.total} restoran · {stats.active} aktif · {onlineUsersTotal} çevrimiçi
+              </p>
+            </div>
           </div>
-          <div>
-            <h1 className="font-black text-base tracking-tight">ŞefPOS Admin</h1>
-            <p className="text-slate-300 text-[11px]">{stats.total} restoran · {stats.active} aktif</p>
+          <div className="admin-user-chip hidden sm:flex">
+            <div className="admin-user-avatar">{initials}</div>
+            <div className="pr-1">
+              <p className="text-xs font-bold text-white leading-tight">{displayName}</p>
+              <p className="text-[10px] text-emerald-300/90 font-semibold">Kurucu · Güvenli oturum</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button type="button" onClick={onExit} className="admin-btn-ghost">
+              <Building2 className="w-4 h-4" />
+              <span className="hidden sm:inline">Panelime Dön</span>
+            </button>
+            <button type="button" onClick={signOut} className="admin-btn-exit">
+              <LogOut className="w-4 h-4" />
+              <span className="hidden sm:inline">Çıkış</span>
+            </button>
           </div>
         </div>
-        <div className="hidden lg:flex items-center gap-2.5 bg-white/10 border border-white/15 rounded-xl px-3 py-1.5">
-          <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-emerald-400 to-cyan-500 text-white flex items-center justify-center font-black text-xs">
-            AK
-          </div>
-          <div>
-            <p className="text-xs font-bold text-white leading-tight">Alper Karaaslan Hos Geldiniz</p>
-            <p className="text-[10px] text-emerald-200 font-semibold">Kurucu</p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={onExit}
-            className="px-3 py-1.5 bg-white/10 hover:bg-white/20 rounded-lg text-xs md:text-sm font-semibold transition flex items-center gap-1.5"
-          >
-            <Building2 className="w-4 h-4" /> Panelime Dön
-          </button>
-          <button
-            onClick={signOut}
-            className="px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30 rounded-lg text-xs md:text-sm font-semibold transition flex items-center gap-1.5 text-red-300"
-          >
-            <LogOut className="w-4 h-4" /> Çıkış
-          </button>
-        </div>
-      </div>
+      </header>
 
-      <div className="mx-4 md:mx-6 mt-2.5 rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs text-slate-600 flex flex-wrap items-center gap-x-4 gap-y-1">
-        <span><b>Proje:</b> {(import.meta as any).env?.VITE_SUPABASE_URL || '-'}</span>
-        <span><b>Rol:</b> {profile?.role || '-'}</span>
-        <span className={profile?.is_super_admin ? 'text-emerald-700 font-semibold' : 'text-red-600 font-semibold'}>
-          <b>Super Admin:</b> {profile?.is_super_admin ? 'Evet' : 'Hayir'}
-        </span>
-      </div>
-
-      {!profile?.is_super_admin && (
-        <div className="mx-4 md:mx-6 mt-2 p-2.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-xs md:text-sm font-semibold">
-          Bu hesap super-admin degil. Eski restoran/lisans listesinin tamami gorunmez. {AYKA_ADMIN_PATH} icin super-admin hesapla giris yapin.
+      {import.meta.env.DEV && (
+        <div className="admin-dev-bar">
+          <div className="flex flex-wrap gap-x-4 gap-y-1">
+            <span><b>Geliştirme:</b> canlılık ping (last_active_at)</span>
+            <span><b>Oturum:</b> {profile?.email || '-'}</span>
+          </div>
         </div>
       )}
 
-      <div className="px-6 py-4 bg-white border-b border-slate-200">
-        <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+      <section className="admin-kpi-strip" aria-label="Özet istatistikler">
+        <div className="admin-kpi-grid">
+          <AdminKpiCard label="Toplam Restoran" value={stats.total} icon={Building2} tone="slate" />
+          <AdminKpiCard label="Aktif Lisans" value={stats.active} icon={CheckCircle} tone="emerald" />
+          <AdminKpiCard label="Deneme" value={stats.trial} icon={Clock} tone="blue" />
+          <AdminKpiCard label="Askıda" value={stats.suspended} icon={Ban} tone="red" />
+          <AdminKpiCard label="Süresi Yaklaşan" value={stats.expiringSoon} icon={AlertTriangle} tone="amber" />
+        </div>
+      </section>
+
+      <nav className="admin-nav" aria-label="Ana menü">
+        <div className="admin-nav-inner">
           {[
-            { label: 'Toplam Restoran', value: stats.total, color: 'text-slate-700', bg: 'bg-slate-100' },
-            { label: 'Aktif Lisans', value: stats.active, color: 'text-emerald-700', bg: 'bg-emerald-100' },
-            { label: 'Deneme', value: stats.trial, color: 'text-blue-700', bg: 'bg-blue-100' },
-            { label: 'Askıda', value: stats.suspended, color: 'text-red-700', bg: 'bg-red-100' },
-            { label: 'Süresi Yaklaşan', value: stats.expiringSoon, color: 'text-amber-700', bg: 'bg-amber-100' },
-          ].map((item) => (
-            <div key={item.label} className="rounded-xl border border-slate-200 bg-white px-3 py-2.5 flex items-center justify-between">
-              <div>
-                <p className="text-[11px] uppercase tracking-wide text-slate-400 font-semibold">{item.label}</p>
-                <p className={`text-xl font-black ${item.color}`}>{item.value}</p>
-              </div>
-              <div className={`w-8 h-8 rounded-lg ${item.bg}`} />
-            </div>
+            { key: 'restaurants', label: 'Restoranlar', icon: Building2 },
+            { key: 'sales', label: 'Satışlar', icon: BarChart3 },
+            { key: 'resellers', label: 'Bayiler', icon: Handshake },
+            { key: 'licenses', label: 'Lisanslar', icon: Key },
+            { key: 'support', label: 'Destek', icon: Headphones },
+          ].map((tab) => (
+            <button
+              key={tab.key}
+              type="button"
+              onClick={() => setActiveTab(tab.key as typeof activeTab)}
+              className={`admin-nav-btn${activeTab === tab.key ? ' is-active' : ''}`}
+            >
+              <tab.icon className="w-4 h-4 shrink-0" strokeWidth={2} />
+              {tab.label}
+            </button>
           ))}
         </div>
-      </div>
-
-      <div className="sticky top-0 z-20 bg-slate-800/95 backdrop-blur-sm px-6 py-2.5 flex gap-1 border-t border-white/5">
-        {[
-          { key: 'restaurants', label: 'Restoranlar', icon: Building2 },
-          { key: 'sales', label: 'Satışlar', icon: BarChart3 },
-          { key: 'resellers', label: 'Bayiler', icon: UserCheck },
-          { key: 'licenses', label: 'Lisanslar', icon: CreditCard },
-          { key: 'support', label: 'Destek', icon: Headphones },
-        ].map(tab => (
-          <button
-            key={tab.key}
-            onClick={() => setActiveTab(tab.key as any)}
-            className={`px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 transition ${
-              activeTab === tab.key ? 'bg-white text-slate-900 shadow' : 'text-slate-300 hover:bg-white/10'
-            }`}
-          >
-            <tab.icon className="w-4 h-4" /> {tab.label}
-          </button>
-        ))}
-      </div>
+      </nav>
 
       {loadError && (
         <div className="mx-6 mt-4 p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-sm font-semibold">
@@ -1649,15 +2054,23 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
       )}
 
       {activeTab === 'resellers' && <ResellersPanel />}
-      {activeTab === 'licenses' && <LicensesPanel tenants={tenants} />}
+      {activeTab === 'licenses' && (
+        <>
+          <UpdatePolicyPanel />
+          <LicensesPanel tenants={tenants} />
+        </>
+      )}
       {activeTab === 'support' && <SupportPanel tenants={tenants} />}
 
       {activeTab === 'sales' && (
-        <div className="max-w-7xl mx-auto px-6 py-8">
-          <div className="flex items-center justify-between mb-6">
+        <div className="admin-main">
+          <div className="admin-page-head">
             <div>
-              <h2 className="text-xl font-black text-slate-800">Bugünün Satışları</h2>
-              <p className="text-slate-400 text-sm">Tüm restoranlar ve şubeler — bugün</p>
+              <h2 className="admin-page-title">
+                <BarChart3 className="w-5 h-5 text-orange-500" />
+                Bugünün Satışları
+              </h2>
+              <p className="admin-page-sub">Tüm restoranlar ve şubeler — bugün</p>
             </div>
             <button onClick={loadSalesData} disabled={salesLoading} className="p-2.5 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 transition">
               <RefreshCw className={`w-4 h-4 text-slate-500 ${salesLoading ? 'animate-spin' : ''}`} />
@@ -1706,12 +2119,12 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
                   </div>
                 </div>
               ))}
-              <div className="bg-gradient-to-r from-slate-800 to-slate-900 rounded-2xl p-5 flex items-center justify-between text-white">
+              <div className="admin-card p-5 flex items-center justify-between bg-gradient-to-r from-slate-800 to-slate-900 border-slate-700 text-white shadow-lg">
                 <div className="flex items-center gap-3">
                   <Banknote className="w-6 h-6 text-emerald-400" />
                   <span className="font-bold">Toplam Platform Geliri (Bugün)</span>
                 </div>
-                <span className="text-2xl font-black text-emerald-400">
+                <span className="text-2xl font-black text-emerald-400 tabular-nums">
                   {salesData.reduce((s, t) => s + t.totalRevenue, 0).toFixed(0)} ₺
                 </span>
               </div>
@@ -1721,42 +2134,42 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
       )}
 
       {activeTab === 'restaurants' && (
-        <div className="max-w-7xl mx-auto px-6 py-8">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-            {[
-              { label: 'Toplam', value: stats.total, icon: Building2, color: 'text-slate-600', bg: 'bg-slate-100', border: 'border-slate-200' },
-              { label: 'Aktif', value: stats.active, icon: CheckCircle, color: 'text-emerald-600', bg: 'bg-emerald-50', border: 'border-emerald-200' },
-              { label: 'Deneme', value: stats.trial, icon: Clock, color: 'text-blue-600', bg: 'bg-blue-50', border: 'border-blue-200' },
-              { label: 'Askıda', value: stats.suspended, icon: Ban, color: 'text-red-600', bg: 'bg-red-50', border: 'border-red-200' },
-            ].map(({ label, value, icon: Icon, color, bg, border }) => (
-              <div key={label} className={`bg-white rounded-2xl border ${border} p-5 flex items-center gap-4 shadow-sm`}>
-                <div className={`w-12 h-12 ${bg} rounded-xl flex items-center justify-center`}>
-                  <Icon className={`w-6 h-6 ${color}`} />
-                </div>
-                <div>
-                  <div className="text-2xl font-black text-slate-800">{value}</div>
-                  <div className="text-xs text-slate-400 font-semibold uppercase tracking-wide">{label}</div>
-                </div>
-              </div>
-            ))}
+        <div className="admin-main">
+          <div className="admin-page-head">
+            <div>
+              <h2 className="admin-page-title">
+                <Building2 className="w-5 h-5 text-orange-500" />
+                Restoranlar
+              </h2>
+              <p className="admin-page-sub">{filtered.length} kayıt listeleniyor</p>
+            </div>
+            <button
+              type="button"
+              onClick={loadTenants}
+              disabled={loading}
+              className="p-2.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 transition shadow-sm"
+              title="Listeyi yenile"
+            >
+              <RefreshCw className={`w-4 h-4 text-slate-500 ${loading ? 'animate-spin' : ''}`} />
+            </button>
           </div>
 
-          <div className="bg-white rounded-2xl shadow-sm border border-slate-100 overflow-hidden">
-            <div className="px-6 py-4 border-b border-slate-100 flex flex-wrap gap-3 items-center">
-              <div className="relative flex-1 min-w-48">
-                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+          <div className="admin-card">
+            <div className="admin-toolbar">
+              <div className="relative flex-1 min-w-[12rem]">
+                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
                 <input
                   type="text"
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
                   placeholder="Restoran adı, e-posta veya telefon..."
-                  className="w-full pl-9 pr-4 py-2.5 rounded-xl border border-slate-200 focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none text-sm"
+                  className="admin-input"
                 />
               </div>
               <select
                 value={filterStatus}
                 onChange={(e) => setFilterStatus(e.target.value)}
-                className="px-3 py-2.5 rounded-xl border border-slate-200 focus:ring-2 focus:ring-orange-400 outline-none text-sm"
+                className="admin-select"
               >
                 <option value="all">Tüm Durumlar</option>
                 {STATUSES.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
@@ -1764,41 +2177,34 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
               <select
                 value={filterPlan}
                 onChange={(e) => setFilterPlan(e.target.value)}
-                className="px-3 py-2.5 rounded-xl border border-slate-200 focus:ring-2 focus:ring-orange-400 outline-none text-sm"
+                className="admin-select"
               >
                 <option value="all">Tüm Planlar</option>
                 {PLANS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
               </select>
-              <button
-                onClick={loadTenants}
-                disabled={loading}
-                className="p-2.5 rounded-xl border border-slate-200 hover:bg-slate-50 transition"
-              >
-                <RefreshCw className={`w-4 h-4 text-slate-500 ${loading ? 'animate-spin' : ''}`} />
-              </button>
-              <span className="text-sm text-slate-400 font-medium">{filtered.length} sonuç</span>
+              <span className="text-sm text-slate-500 font-medium tabular-nums">{filtered.length} sonuç</span>
             </div>
 
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
+            <div className="admin-table-wrap">
+              <table className="admin-table">
                 <thead>
-                  <tr className="bg-slate-50 border-b border-slate-100">
-                    <th className="text-left px-6 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide cursor-pointer hover:text-slate-600" onClick={() => toggleSort('name')}>
+                  <tr>
+                    <th className="cursor-pointer hover:text-slate-600" onClick={() => toggleSort('name')}>
                       <span className="flex items-center gap-1">Restoran <SortIcon field="name" /></span>
                     </th>
-                    <th className="text-left px-4 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Plan</th>
-                    <th className="text-left px-4 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Durum</th>
-                    <th className="text-left px-4 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide cursor-pointer hover:text-slate-600" onClick={() => toggleSort('subscription_expires_at')}>
+                    <th>Plan</th>
+                    <th>Durum</th>
+                    <th className="cursor-pointer hover:text-slate-600" onClick={() => toggleSort('subscription_expires_at')}>
                       <span className="flex items-center gap-1">Bitiş <SortIcon field="subscription_expires_at" /></span>
                     </th>
-                    <th className="text-left px-4 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Kullanıcı / Şube</th>
-                    <th className="text-left px-4 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide cursor-pointer hover:text-slate-600" onClick={() => toggleSort('created_at')}>
+                    <th>Kullanıcı / Canlılık</th>
+                    <th className="cursor-pointer hover:text-slate-600" onClick={() => toggleSort('created_at')}>
                       <span className="flex items-center gap-1">Kayıt <SortIcon field="created_at" /></span>
                     </th>
-                    <th className="text-right px-6 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Detay</th>
+                    <th className="text-right">Detay</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-50">
+                <tbody>
                   {loading && (
                     <tr>
                       <td colSpan={7} className="text-center py-16 text-slate-400">
@@ -1827,9 +2233,9 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
                         className={`hover:bg-slate-50/80 transition cursor-pointer ${isSuspended ? 'bg-red-50/30' : isExpiringSoon ? 'bg-amber-50/30' : ''}`}
                         onClick={() => setDetailTenant(tenant)}
                       >
-                        <td className="px-6 py-4">
+                        <td>
                           <div className="flex items-center gap-3">
-                            <div className={`w-9 h-9 rounded-xl flex items-center justify-center text-xs font-black shrink-0 ${
+                            <div className={`admin-tenant-avatar ${
                               isSuspended ? 'bg-red-100 text-red-700' :
                               tenant.subscription_status === 'active' ? 'bg-emerald-100 text-emerald-700' :
                               'bg-slate-100 text-slate-600'
@@ -1847,9 +2253,9 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
                             </div>
                           </div>
                         </td>
-                        <td className="px-4 py-4"><PlanBadge plan={tenant.subscription_plan} /></td>
-                        <td className="px-4 py-4"><StatusBadge status={tenant.subscription_status} /></td>
-                        <td className="px-4 py-4">
+                        <td><PlanBadge plan={tenant.subscription_plan} /></td>
+                        <td><StatusBadge status={tenant.subscription_status} /></td>
+                        <td>
                           {tenant.subscription_expires_at ? (
                             <div className={`text-xs font-semibold flex items-center gap-1 ${isExpiringSoon ? 'text-red-600' : 'text-slate-600'}`}>
                               <Calendar className="w-3 h-3" />
@@ -1860,7 +2266,7 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
                             <span className="text-slate-300 text-xs">—</span>
                           )}
                         </td>
-                        <td className="px-4 py-4">
+                        <td>
                           <div className="flex items-center gap-3 text-xs">
                             <span className="flex items-center gap-1 text-slate-600">
                               <Users className="w-3.5 h-3.5 text-slate-400" /> {tenant._profileCount}
@@ -1868,17 +2274,15 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
                             <span className="flex items-center gap-1 text-slate-600">
                               <Building2 className="w-3.5 h-3.5 text-slate-400" /> {tenant._branchCount}
                             </span>
-                            <span className="flex items-center gap-1 text-emerald-600 font-semibold">
-                              <span className="w-2 h-2 rounded-full bg-emerald-500" /> {(onlineByTenant[tenant.id] || []).length} online
-                            </span>
+                            <OnlinePresenceBadge count={(onlineByTenant[tenant.id] || []).length} />
                           </div>
                         </td>
-                        <td className="px-4 py-4">
-                          <span className="text-xs text-slate-400">
+                        <td>
+                          <span className="text-xs text-slate-500 tabular-nums">
                             {new Date(tenant.created_at).toLocaleDateString('tr-TR')}
                           </span>
                         </td>
-                        <td className="px-6 py-4">
+                        <td>
                           <div className="flex items-center justify-end">
                             <ChevronRight className="w-4 h-4 text-slate-400" />
                           </div>
@@ -1905,6 +2309,8 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
           planUpdating={planUpdating}
           onStatusChange={handleStatusChange}
           statusChanging={statusChanging}
+          onWipeLocal={handleWipeLocal}
+          wipeSending={wipeSending}
         />
       )}
 
@@ -1927,6 +2333,10 @@ export function AdminPanel({ onExit }: AdminPanelProps) {
           deleting={deleteLoading}
         />
       )}
+
+      <footer className="admin-footer">
+        ŞefPOS Lisans Merkezi · Yalnızca yetkili kurucu erişimi
+      </footer>
     </div>
   );
 }
@@ -1940,6 +2350,8 @@ interface ResellerRow {
   status: string;
   commission_rate: number;
   notes: string;
+  city?: string;
+  province_slug?: string;
   created_at: string;
 }
 
@@ -1961,9 +2373,9 @@ function ResellersPanel() {
   const [loading, setLoading] = useState(true);
   const [tab, setTab] = useState<'resellers' | 'applications'>('resellers');
   const [showAddForm, setShowAddForm] = useState(false);
-  const [newReseller, setNewReseller] = useState({ email: '', company_name: '', contact_name: '', phone: '', commission_rate: '0', notes: '' });
+  const [newReseller, setNewReseller] = useState({ email: '', company_name: '', contact_name: '', phone: '', commission_rate: '0', notes: '', province_slug: '' });
   const [editResellerId, setEditResellerId] = useState<string | null>(null);
-  const [editReseller, setEditReseller] = useState({ email: '', company_name: '', contact_name: '', phone: '', commission_rate: '0', notes: '' });
+  const [editReseller, setEditReseller] = useState({ email: '', company_name: '', contact_name: '', phone: '', commission_rate: '0', notes: '', province_slug: '' });
   const [deletingResellerId, setDeletingResellerId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -1983,6 +2395,7 @@ function ResellersPanel() {
   const handleAddReseller = async () => {
     if (!newReseller.email || !newReseller.company_name) return;
     setSaving(true);
+    const slug = resolveProvinceSlug(newReseller.province_slug) || '';
     await supabase.from('resellers').insert({
       email: newReseller.email,
       company_name: newReseller.company_name,
@@ -1990,11 +2403,13 @@ function ResellersPanel() {
       phone: newReseller.phone,
       commission_rate: parseFloat(newReseller.commission_rate) || 0,
       notes: newReseller.notes,
+      city: provinceDisplayName(slug),
+      province_slug: slug,
       status: 'active',
     });
     setSaving(false);
     setShowAddForm(false);
-    setNewReseller({ email: '', company_name: '', contact_name: '', phone: '', commission_rate: '0', notes: '' });
+    setNewReseller({ email: '', company_name: '', contact_name: '', phone: '', commission_rate: '0', notes: '', province_slug: '' });
     load();
   };
 
@@ -2012,6 +2427,7 @@ function ResellersPanel() {
       phone: r.phone || '',
       commission_rate: String(r.commission_rate ?? 0),
       notes: r.notes || '',
+      province_slug: r.province_slug || resolveProvinceSlug(r.city) || '',
     });
   };
 
@@ -2019,6 +2435,7 @@ function ResellersPanel() {
     if (!editResellerId || !editReseller.company_name.trim() || !editReseller.email.trim()) return;
     setSaving(true);
     try {
+      const slug = resolveProvinceSlug(editReseller.province_slug) || '';
       const { error } = await supabase
         .from('resellers')
         .update({
@@ -2028,6 +2445,8 @@ function ResellersPanel() {
           phone: editReseller.phone.trim(),
           commission_rate: parseFloat(editReseller.commission_rate) || 0,
           notes: editReseller.notes.trim(),
+          city: provinceDisplayName(slug),
+          province_slug: slug,
         })
         .eq('id', editResellerId);
       if (error) throw error;
@@ -2058,11 +2477,14 @@ function ResellersPanel() {
   };
 
   const handleApproveApplication = async (app: ApplicationRow) => {
+    const slug = resolveProvinceSlug(app.city) || '';
     await supabase.from('resellers').insert({
       email: app.email,
       company_name: app.company_name,
       contact_name: app.contact_name,
       phone: app.phone,
+      city: provinceDisplayName(slug) || app.city,
+      province_slug: slug,
       status: 'active',
     });
     await supabase.from('reseller_applications').update({ status: 'approved' }).eq('id', app.id);
@@ -2087,13 +2509,18 @@ function ResellersPanel() {
   };
 
   return (
-    <div className="max-w-7xl mx-auto px-6 py-8">
-      <div className="flex items-center justify-between mb-6">
+    <div className="admin-main">
+      <div className="admin-page-head">
         <div>
-          <h2 className="text-xl font-black text-slate-800 flex items-center gap-2"><Handshake className="w-5 h-5 text-amber-500" />Bayi Yönetimi</h2>
-          <p className="text-slate-400 text-sm">{resellers.length} bayi · {applications.filter(a => a.status === 'pending').length} bekleyen başvuru</p>
+          <h2 className="admin-page-title">
+            <Handshake className="w-5 h-5 text-orange-500" />
+            Bayi Yönetimi
+          </h2>
+          <p className="admin-page-sub">
+            {resellers.length} bayi · {applications.filter(a => a.status === 'pending').length} bekleyen başvuru
+          </p>
         </div>
-        <button onClick={() => setShowAddForm(true)} className="flex items-center gap-2 bg-amber-600 hover:bg-amber-500 text-white px-4 py-2.5 rounded-xl text-sm font-bold transition-colors">
+        <button type="button" onClick={() => setShowAddForm(true)} className="admin-btn-primary">
           <Plus className="w-4 h-4" /> Bayi Ekle
         </button>
       </div>
@@ -2118,6 +2545,19 @@ function ResellersPanel() {
                   className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-amber-400" />
               </div>
             ))}
+            <div className="col-span-2">
+              <label className="block text-xs font-medium text-slate-500 mb-1">İl (haritada)</label>
+              <select
+                value={newReseller.province_slug}
+                onChange={e => setNewReseller({ ...newReseller, province_slug: e.target.value })}
+                className="w-full border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-amber-400 bg-white"
+              >
+                <option value="">İl seçin</option>
+                {TURKEY_PROVINCES.map(p => (
+                  <option key={p.s} value={p.s}>{p.n}</option>
+                ))}
+              </select>
+            </div>
           </div>
           <div className="flex gap-3 mt-4">
             <button onClick={() => setShowAddForm(false)} className="px-4 py-2 text-slate-500 hover:text-slate-700 text-sm transition-colors">İptal</button>
@@ -2144,19 +2584,19 @@ function ResellersPanel() {
       {loading ? (
         <div className="bg-white rounded-2xl p-16 text-center border border-slate-100"><RefreshCw className="w-8 h-8 animate-spin text-amber-400 mx-auto" /></div>
       ) : tab === 'resellers' ? (
-        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden">
-          <table className="w-full text-sm">
+        <div className="admin-card admin-table-wrap">
+          <table className="admin-table">
             <thead>
-              <tr className="bg-slate-50 border-b border-slate-100">
-                <th className="text-left px-6 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Firma</th>
-                <th className="text-left px-4 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">İletişim</th>
-                <th className="text-left px-4 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Durum</th>
-                <th className="text-left px-4 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Komisyon</th>
-                <th className="text-left px-4 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Kayıt</th>
-                <th className="text-right px-6 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">İşlem</th>
+              <tr>
+                <th>Firma</th>
+                <th>İletişim</th>
+                <th>Durum</th>
+                <th>Komisyon</th>
+                <th>Kayıt</th>
+                <th className="text-right">İşlem</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-50">
+            <tbody>
               {resellers.length === 0 && (
                 <tr><td colSpan={6} className="text-center py-12 text-slate-400">Henüz bayi yok</td></tr>
               )}
@@ -2184,6 +2624,9 @@ function ResellersPanel() {
                       <>
                         <div className="font-semibold text-slate-800">{r.company_name}</div>
                         <div className="text-xs text-slate-400">{r.email}</div>
+                        <div className="text-xs text-orange-600 mt-0.5">
+                          {provinceDisplayName(r.province_slug) || r.city || '—'}
+                        </div>
                       </>
                     )}
                   </td>
@@ -2204,6 +2647,16 @@ function ResellersPanel() {
                           className="w-full border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs focus:outline-none focus:border-amber-400"
                           placeholder="Telefon"
                         />
+                        <select
+                          value={editReseller.province_slug}
+                          onChange={e => setEditReseller(prev => ({ ...prev, province_slug: e.target.value }))}
+                          className="w-full border border-slate-200 rounded-lg px-2.5 py-1.5 text-xs bg-white focus:outline-none focus:border-amber-400"
+                        >
+                          <option value="">İl</option>
+                          {TURKEY_PROVINCES.map(p => (
+                            <option key={p.s} value={p.s}>{p.n}</option>
+                          ))}
+                        </select>
                       </div>
                     ) : (
                       <>{r.contact_name || '-'}<br /><span className="text-xs text-slate-400">{r.phone}</span></>
@@ -2346,6 +2799,143 @@ interface LicenseRow {
   created_at: string;
 }
 
+function UpdatePolicyPanel() {
+  const { user } = useAuth();
+  const [policy, setPolicy] = useState<PlatformReleasePolicy>({
+    min_required_version: '1.0.202',
+    force_update: false,
+    message: '',
+  });
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [feedback, setFeedback] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchPlatformReleasePolicy().then((p) => {
+      if (!cancelled) {
+        setPolicy(p);
+        setLoading(false);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const save = async (next?: Partial<PlatformReleasePolicy>) => {
+    const merged = { ...policy, ...next };
+    setSaving(true);
+    setFeedback('');
+    const { error } = await savePlatformReleasePolicy(
+      {
+        min_required_version: merged.min_required_version,
+        force_update: merged.force_update,
+        message: merged.message,
+      },
+      user?.id,
+    );
+    setSaving(false);
+    if (error) {
+      setFeedback(`Kaydedilemedi: ${error}`);
+      return;
+    }
+    setPolicy(merged);
+    setFeedback('Politika kaydedildi. Açık kasalar birkaç dakika içinde zorunlu güncellemeyi görür.');
+  };
+
+  if (loading) return null;
+
+  return (
+    <div className="admin-main pb-0">
+      <div className="admin-card p-5 mb-4 border border-orange-200/60">
+        <div className="flex flex-wrap items-start justify-between gap-3 mb-4">
+          <div>
+            <h3 className="text-base font-black text-slate-800 flex items-center gap-2">
+              <Download className="w-5 h-5 text-orange-500" />
+              Masaüstü zorunlu güncelleme
+            </h3>
+            <p className="text-xs text-slate-500 mt-1 max-w-xl">
+              Kurulu ŞefPOS EXE sürümü belirtilen minimumun altındaysa ve zorunlu işaretliyse kasa güncellemeden
+              çalışmaz. Önce GitHub Release’te ilgili sürümün yayında olduğundan emin olun.
+            </p>
+          </div>
+          <button
+            type="button"
+            disabled={saving}
+            onClick={() =>
+              void save({
+                min_required_version: '1.0.202',
+                force_update: true,
+                message:
+                  'Güvenlik ve performans güncellemesi zorunludur. Lütfen güncellemeyi tamamlayın; işlem birkaç dakika sürer.',
+              })
+            }
+            className="px-4 py-2 rounded-xl text-sm font-bold bg-gradient-to-r from-orange-500 to-red-500 text-white shadow disabled:opacity-50"
+          >
+            1.0.202 zorunlu yap
+          </button>
+        </div>
+        <div className="grid md:grid-cols-3 gap-4">
+          <div>
+            <label className="block text-xs font-bold text-slate-500 uppercase mb-1.5">
+              Minimum sürüm
+            </label>
+            <input
+              value={policy.min_required_version}
+              onChange={(e) => setPolicy((p) => ({ ...p, min_required_version: e.target.value }))}
+              placeholder="1.0.202"
+              className="w-full px-3 py-2.5 rounded-xl border border-slate-200 text-sm font-mono"
+            />
+          </div>
+          <div className="flex items-end">
+            <label className="flex items-center gap-2 cursor-pointer text-sm font-semibold text-slate-700">
+              <input
+                type="checkbox"
+                checked={policy.force_update}
+                onChange={(e) => setPolicy((p) => ({ ...p, force_update: e.target.checked }))}
+                className="w-4 h-4 rounded border-slate-300 text-orange-600"
+              />
+              Zorunlu güncelleme aktif
+            </label>
+          </div>
+          <div className="flex items-end">
+            <button
+              type="button"
+              disabled={saving}
+              onClick={() => void save()}
+              className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-900 text-white text-sm font-bold disabled:opacity-50"
+            >
+              {saving ? 'Kaydediliyor…' : 'Politikayı kaydet'}
+            </button>
+          </div>
+        </div>
+        <div className="mt-4">
+          <label className="block text-xs font-bold text-slate-500 uppercase mb-1.5">
+            Kasada gösterilecek mesaj
+          </label>
+          <textarea
+            value={policy.message}
+            onChange={(e) => setPolicy((p) => ({ ...p, message: e.target.value }))}
+            rows={2}
+            placeholder="Güncelleme zorunludur…"
+            className="w-full px-3 py-2.5 rounded-xl border border-slate-200 text-sm resize-none"
+          />
+        </div>
+        {feedback && (
+          <p
+            className={`mt-3 text-sm font-semibold px-3 py-2 rounded-lg ${
+              feedback.startsWith('Kaydedilemedi') ? 'bg-red-50 text-red-700' : 'bg-emerald-50 text-emerald-800'
+            }`}
+          >
+            {feedback}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function LicensesPanel({ tenants }: { tenants: TenantRow[] }) {
   const [licenses, setLicenses] = useState<LicenseRow[]>([]);
   const [resellers, setResellers] = useState<ResellerRow[]>([]);
@@ -2432,13 +3022,18 @@ function LicensesPanel({ tenants }: { tenants: TenantRow[] }) {
   };
 
   return (
-    <div className="max-w-7xl mx-auto px-6 py-8">
-      <div className="flex items-center justify-between mb-6">
+    <div className="admin-main">
+      <div className="admin-page-head">
         <div>
-          <h2 className="text-xl font-black text-slate-800 flex items-center gap-2"><CreditCard className="w-5 h-5 text-blue-500" />Lisans Yönetimi</h2>
-          <p className="text-slate-400 text-sm">{licenses.filter(l => l.status === 'active').length} aktif · {licenses.length} toplam</p>
+          <h2 className="admin-page-title">
+            <Key className="w-5 h-5 text-orange-500" />
+            Lisans Yönetimi
+          </h2>
+          <p className="admin-page-sub">
+            {licenses.filter(l => l.status === 'active').length} aktif · {licenses.length} toplam
+          </p>
         </div>
-        <button onClick={() => setShowAddForm(true)} className="flex items-center gap-2 bg-blue-600 hover:bg-blue-500 text-white px-4 py-2.5 rounded-xl text-sm font-bold transition-colors">
+        <button type="button" onClick={() => setShowAddForm(true)} className="admin-btn-primary">
           <Plus className="w-4 h-4" /> Lisans Ekle
         </button>
       </div>
@@ -2511,20 +3106,20 @@ function LicensesPanel({ tenants }: { tenants: TenantRow[] }) {
       {loading ? (
         <div className="bg-white rounded-2xl p-16 text-center border border-slate-100"><RefreshCw className="w-8 h-8 animate-spin text-blue-400 mx-auto" /></div>
       ) : (
-        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden">
-          <table className="w-full text-sm">
+        <div className="admin-card admin-table-wrap">
+          <table className="admin-table">
             <thead>
-              <tr className="bg-slate-50 border-b border-slate-100">
-                <th className="text-left px-6 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Lisans Anahtarı</th>
-                <th className="text-left px-4 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Restoran</th>
-                <th className="text-left px-4 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Bayi</th>
-                <th className="text-left px-4 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Plan</th>
-                <th className="text-left px-4 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Durum</th>
-                <th className="text-left px-4 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">Bitiş</th>
-                <th className="text-right px-6 py-3 text-xs font-bold text-slate-400 uppercase tracking-wide">İşlem</th>
+              <tr>
+                <th>Lisans Anahtarı</th>
+                <th>Restoran</th>
+                <th>Bayi</th>
+                <th>Plan</th>
+                <th>Durum</th>
+                <th>Bitiş</th>
+                <th className="text-right">İşlem</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-50">
+            <tbody>
               {licenses.length === 0 && (
                 <tr><td colSpan={7} className="text-center py-12 text-slate-400">Henüz lisans yok</td></tr>
               )}

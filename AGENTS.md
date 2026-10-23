@@ -7,8 +7,8 @@ This file is the permanent project memory for this repository.
 - **Ürün / ekran adı (Türkçe):** ŞefPOS — kullanıcı arayüzü, yazılım adı ve pazarlama metinlerinde bu isim kullanılır; kaybolmaması için tüm oturumlarda bu kimlik geçerlidir.
 - **Teknik / repo adı:** `SEFPOS` (büyük harf, kısaltma). Paket klasörü tarihsel olarak `shefpos` olabilir; yeni kodda mümkünse `SEFPOS` / `sefpos` ile tutarlı kal.
 - Primary workspace path: `C:\sefpos`
-- Primary Supabase URL: `https://xdfnozfuuzctubijbnds.supabase.co`
-- Primary Supabase project ref: `xdfnozfuuzctubijbnds`
+- **Üretim backend (zorunlu):** VDS — `https://sefpos.com.tr` + SQL Server `sefpos45` + `/vds-api`. Cloudflare www ve Electron cloud da `VITE_VDS_API_BASE=https://sefpos.com.tr` ile buraya bağlanır.
+- **Supabase (eski / soğuk yedek):** `https://xdfnozfuuzctubijbnds.supabase.co` (ref `xdfnozfuuzctubijbnds`). Yeni işlemler VDS’e yazılır; Supabase silinmeden önce VDS sayımları doğrulanmalı. Agent production işleri VDS’e yapar; yalnızca açıkça istenirse Supabase’e dokunulur.
 
 ## Non-Negotiable Rules
 

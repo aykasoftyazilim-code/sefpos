@@ -1,18 +1,34 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, type ReactNode } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
 import {
   Printer, Plus, Trash2, Save, RefreshCw, CheckCircle, XCircle,
-  ToggleLeft, ToggleRight, Settings2, AlertCircle, X, ChevronDown, Wifi, WifiOff
+  ToggleLeft, ToggleRight, Settings2, AlertCircle, X, ChevronDown, Wifi, WifiOff,
+  ArrowLeft, ChefHat, Receipt, ShoppingBag, LayoutGrid, Link2, Globe,
 } from 'lucide-react';
 import {
   PrinterDevice, PrinterConfig, PrintSettings, PrintStyleSettings, PrintAgentStatus,
   loadPrintSettings, savePrintSettings, getAvailablePrinters,
-  isElectron, checkPrintAgent, checkPrintAgentDetailed, buildKitchenHtml, buildReceiptHtml, printHtml,
+  isElectron, checkPrintAgent, checkPrintAgentDetailed, printHtml,
   getKitchenRoutePrinters, resolveCategoryPrinter, assignCategoryToKitchenPrinter,
   PRINT_SETTINGS_CONTEXT_EVENT,
-  PRINT_SETTINGS_REMOTE_UPDATED_EVENT
+  PRINT_SETTINGS_REMOTE_UPDATED_EVENT,
 } from '../lib/printService';
+import { ReceiptThermalPreview } from './print/ReceiptThermalPreview';
+import { ReceiptHubCard } from './print/ReceiptHubCard';
+import { ReceiptEdgeAlignPanel } from './print/ReceiptEdgeAlignPanel';
+import { ReceiptLiveStylePanel, type ReceiptEditorKind } from './print/ReceiptLiveStylePanel';
+import { previewAdisyonHtml, previewKitchenHtml, previewPaketHtml } from './print/receiptPreviewUtils';
+
+type PrinterSettingsView =
+  | 'hub'
+  | 'kitchen'
+  | 'adisyon'
+  | 'paket'
+  | 'genel'
+  | 'online'
+  | 'yazicilar'
+  | 'kategori';
 
 interface Category {
   id: string;
@@ -29,6 +45,7 @@ const PRINTER_TYPES = [
 
 export function PrinterSettings() {
   const { tenant, activeBranch } = useAuth();
+  const [view, setView] = useState<PrinterSettingsView>('hub');
   const [settings, setSettings] = useState<PrintSettings>(loadPrintSettings());
   const [availablePrinters, setAvailablePrinters] = useState<PrinterDevice[]>([]);
   const [loadingPrinters, setLoadingPrinters] = useState(false);
@@ -181,43 +198,73 @@ export function PrinterSettings() {
     });
   };
 
-  const handleTestPrint = async (printerName: string, type: string) => {
-    setTestResult('Gönderiliyor...');
-    let html = '';
-    if (type === 'receipt') {
-      html = buildReceiptHtml({
-        restaurantName: settings.restaurantName || 'ŞefPOS',
-        restaurantPhone: settings.restaurantPhone,
-        restaurantAddress: settings.restaurantAddress,
-        tableLabel: 'Masa 1',
-        orderNumber: 'TEST-001',
-        items: [
-          { productName: 'Test Ürün 1', quantity: 2, unitPrice: 25, totalAmount: 50 },
-          { productName: 'Test Ürün 2', quantity: 1, unitPrice: 15, totalAmount: 15, notes: 'Az baharatlı' },
-        ],
-        subtotal: 65,
-        taxAmount: 0,
-        discountAmount: 0,
-        total: 65,
-        footer: settings.receiptFooter,
-        printStyle: settings.printStyle,
-      });
-    } else {
-      html = buildKitchenHtml({
-        restaurantName: settings.restaurantName || 'ŞefPOS',
-        tableLabel: 'Masa 1',
-        orderNumber: 'TEST-001',
-        items: [
-          { productName: 'Test Ürün 1', quantity: 2 },
-          { productName: 'Test Ürün 2', quantity: 1, notes: 'Az baharatlı' },
-        ],
-        printStyle: settings.printStyle,
-      });
+  const resolveDefaultPrinter = (kind: 'kitchen' | 'receipt' | 'takeaway'): string => {
+    if (kind === 'receipt') return settings.defaultReceiptPrinter || '';
+    if (kind === 'takeaway') {
+      const typed = settings.printers.find((p) => p.enabled && p.type === 'takeaway');
+      return typed?.printerName || settings.defaultTakeawayPrinter || settings.defaultReceiptPrinter || '';
     }
+    const typed = settings.printers.find((p) => p.enabled && (p.type === 'kitchen' || p.type === 'bar'));
+    return typed?.printerName || settings.defaultKitchenPrinter || settings.defaultOnlinePlatformPrinter || '';
+  };
 
-    const result = await printHtml(html, printerName);
-    setTestResult(result.success ? 'Test fişi gönderildi!' : `Hata: ${result.error}`);
+  const previewHtmlForKind = (kind: 'kitchen' | 'receipt' | 'takeaway') => {
+    if (kind === 'receipt') return previewAdisyonHtml(settings);
+    if (kind === 'takeaway') return previewPaketHtml(settings);
+    return previewKitchenHtml(settings);
+  };
+
+  const handleTestPrint = async (printerName: string, type: string) => {
+    const kind =
+      type === 'receipt' ? 'receipt' : type === 'takeaway' ? 'takeaway' : 'kitchen';
+    await runPreviewTestPrint(kind, printerName);
+  };
+
+  const runPreviewTestPrint = async (
+    kind: 'kitchen' | 'receipt' | 'takeaway',
+    printerName?: string,
+  ) => {
+    setTestResult('Gönderiliyor...');
+    const html = previewHtmlForKind(kind);
+    const target = printerName || resolveDefaultPrinter(kind);
+    const result = await printHtml(html, target);
+    setTestResult(
+      result.success
+        ? 'Test fişi gönderildi!'
+        : `Hata: ${result.error || 'Yazıcı seçilmedi'}`,
+    );
     setTimeout(() => setTestResult(''), 4000);
+  };
+
+  const hubNavBtn = (
+    id: PrinterSettingsView,
+    label: string,
+    icon: ReactNode,
+    desc: string,
+  ) => (
+    <button
+      key={id}
+      type="button"
+      onClick={() => setView(id)}
+      className="flex items-start gap-3 p-3 rounded-xl border border-slate-200 bg-white hover:border-orange-300 hover:bg-orange-50/40 text-left transition"
+    >
+      <span className="mt-0.5 text-orange-600">{icon}</span>
+      <span>
+        <span className="block text-sm font-bold text-slate-800">{label}</span>
+        <span className="block text-[11px] text-slate-500 mt-0.5">{desc}</span>
+      </span>
+    </button>
+  );
+
+  const viewTitle: Record<PrinterSettingsView, string> = {
+    hub: 'Fiş & Yazıcı',
+    kitchen: 'Mutfak fişi',
+    adisyon: 'Adisyon fişi',
+    paket: 'Paket / kurye fişi',
+    genel: 'Restoran bilgileri',
+    online: 'Online platform fişi',
+    yazicilar: 'Yazıcı listesi',
+    kategori: 'Kategori → yazıcı',
   };
 
   const typeInfo = (type: string) => PRINTER_TYPES.find(t => t.value === type) || PRINTER_TYPES[3];
@@ -227,11 +274,20 @@ export function PrinterSettings() {
       <div className="bg-gradient-to-r from-orange-500 to-red-600 rounded-xl p-4 md:p-6 text-white">
         <div className="flex items-center gap-3 mb-2">
           <Printer className="w-6 h-6" />
-          <h3 className="text-lg md:text-2xl font-bold">Yazıcı Ayarları</h3>
+          <h3 className="text-lg md:text-2xl font-bold">{viewTitle[view]}</h3>
         </div>
         <p className="text-orange-50 text-sm">
-          Mutfak fişleri yalnızca <strong className="text-white">Mutfak / Bar / Özel</strong> tipindeki yazıcılara gider; ürün veya kategori seçiminize göre yönlendirilir.
-          <strong className="text-white"> Adisyon</strong> ise aşağıda seçtiğiniz yazıcıdan çıkar (paket fişi ayrı).
+          {view === 'hub' ? (
+            <>
+              Mutfak, adisyon ve paket fişlerini <strong className="text-white">önizleyip</strong> kartlara tıklayarak düzenleyin.
+              Yazıcı listesi ve kategori eşlemesi de bu menüdedir.
+            </>
+          ) : (
+            <>
+              Mutfak fişleri <strong className="text-white">Mutfak / Bar / Özel</strong> yazıcılara gider.
+              <strong className="text-white"> Adisyon</strong> ve <strong className="text-white">paket</strong> fişi ayrı yazıcılardan çıkar.
+            </>
+          )}
         </p>
         <p className="text-orange-50/90 text-xs mt-3 border-t border-white/20 pt-3">
           Bu ekrandaki yazıcı eşlemeleri, fiş metinleri ve otomatik yazdırma seçenekleri hesabınızdaki{' '}
@@ -272,7 +328,17 @@ export function PrinterSettings() {
                   </div>
                 </div>
               ) : agentStatus === 'not_running' ? (
-                <p className="text-sm text-amber-700 mt-1">Web üzerinden yazdırabilmek için bu bilgisayarda ŞefPOS masaüstü uygulamasının açık olması gerekir. Uygulama açıkken bağlantı otomatik kurulur (port 7878).</p>
+                <div className="text-sm text-amber-700 mt-1 space-y-1.5">
+                  <p>
+                    <strong className="text-amber-900">Getir / Yemeksepeti / Trendyol</strong> gibi online sipariş fişleri bu
+                    bilgisayarda <strong className="text-amber-900">tarayıcı yazdırma penceresi</strong> ile çıkabilir (Electron
+                    kurmadan, Getir paneli gibi). Masa ve mutfak fişleri kasadaki ŞefPOS veya Print Agent üzerinden basılır.
+                  </p>
+                  <p className="text-xs text-amber-600">
+                    Uzaktan (telefon) sipariş alıyorsanız ve fiş başka kasada basılacaksa bu PC’de ŞefPOS masaüstü veya{' '}
+                    <code className="bg-amber-200 px-1 rounded">npm run print-agent</code> açık olmalıdır.
+                  </p>
+                </div>
               ) : (
                 <p className="text-sm text-amber-700 mt-1">Bağlantı kurulamadı. {agentDetail && <span className="font-mono text-xs">({agentDetail})</span>}</p>
               )}
@@ -307,9 +373,281 @@ export function PrinterSettings() {
         </div>
       )}
 
+      {view !== 'hub' && (
+        <button
+          type="button"
+          onClick={() => setView('hub')}
+          className="flex items-center gap-2 text-sm font-semibold text-orange-700 hover:text-orange-900"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          Fiş & yazıcı menüsüne dön
+        </button>
+      )}
+
+      {view === 'hub' && (
+        <>
+          <p className="text-sm text-slate-600 -mt-1 mb-1">
+            Bir fiş türüne tıklayın — büyük önizleme ve canlı ayarlar açılır. Aşağıdaki küçük önizlemeler kaydırılabilir.
+          </p>
+
+          <div className="grid grid-cols-1 xl:grid-cols-3 gap-5 2xl:gap-6 items-stretch">
+            <ReceiptHubCard
+              title="Mutfak fişi"
+              subtitle="Sipariş gönderince mutfağa"
+              icon={<ChefHat className="w-5 h-5 text-white" />}
+              accent="orange"
+              html={previewKitchenHtml(settings)}
+              onClick={() => setView('kitchen')}
+            />
+            <ReceiptHubCard
+              title="Adisyon fişi"
+              subtitle="Ödeme ve müşteri fişi"
+              icon={<Receipt className="w-5 h-5 text-white" />}
+              accent="emerald"
+              html={previewAdisyonHtml(settings)}
+              onClick={() => setView('adisyon')}
+            />
+            <ReceiptHubCard
+              title="Paket / kurye fişi"
+              subtitle="Paket servis ve teslimat"
+              icon={<ShoppingBag className="w-5 h-5 text-white" />}
+              accent="amber"
+              html={previewPaketHtml(settings)}
+              onClick={() => setView('paket')}
+            />
+          </div>
+
+          <div className="lg:hidden rounded-xl bg-slate-50 border border-dashed border-slate-300 px-4 py-3 text-center text-xs text-slate-600">
+            İpucu: Daha rahat ayar için bir fiş kartına dokunun — tam ekran önizleme ve kaydırıcılar açılır.
+          </div>
+
+          <details className="rounded-xl border border-slate-200 bg-white overflow-hidden">
+            <summary className="cursor-pointer px-4 py-3 text-sm font-bold text-slate-700 hover:bg-slate-50">
+              Tüm fişler için kenar hizalama (yatay kayma)
+            </summary>
+            <div className="px-4 pb-4 border-t border-slate-100">
+              <ReceiptEdgeAlignPanel
+                settings={settings}
+                patchPrintStyle={patchPrintStyle}
+                accent="orange"
+                embedded
+              />
+            </div>
+          </details>
+
+          <div className="bg-white rounded-xl border border-slate-200 p-4 md:p-5 shadow-sm">
+            <h4 className="text-sm font-bold text-slate-800 mb-3 flex items-center gap-2">
+              <LayoutGrid className="w-4 h-4 text-slate-500" />
+              Diğer ayarlar
+            </h4>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2">
+              {hubNavBtn('yazicilar', 'Yazıcı listesi', <Printer className="w-4 h-4" />, 'Ekle, tür seç, test yazdır')}
+              {hubNavBtn('kategori', 'Kategori eşleme', <Link2 className="w-4 h-4" />, 'Hangi ürün hangi mutfağa')}
+              {hubNavBtn('genel', 'Restoran bilgileri', <Settings2 className="w-4 h-4" />, 'Başlık, adres, alt yazı')}
+              {hubNavBtn('online', 'Online sipariş fişi', <Globe className="w-4 h-4" />, 'Getir / YS / Trendyol')}
+            </div>
+          </div>
+        </>
+      )}
+
+      {(view === 'kitchen' || view === 'adisyon' || view === 'paket') && (() => {
+        const editorKind = view as ReceiptEditorKind;
+        const previewHtml =
+          view === 'kitchen'
+            ? previewKitchenHtml(settings)
+            : view === 'adisyon'
+              ? previewAdisyonHtml(settings)
+              : previewPaketHtml(settings);
+        const offsetMm =
+          view === 'paket' ? settings.printStyle.paperOffsetMm - 1 : settings.printStyle.paperOffsetMm;
+        const borderCls =
+          view === 'adisyon'
+            ? 'border-emerald-200'
+            : view === 'paket'
+              ? 'border-amber-200'
+              : 'border-orange-200';
+
+        return (
+          <div className="space-y-4">
+            <ReceiptEdgeAlignPanel
+              settings={settings}
+              patchPrintStyle={patchPrintStyle}
+              accent={view === 'adisyon' ? 'emerald' : view === 'paket' ? 'amber' : 'orange'}
+              paketExtraMm={view === 'paket' ? -1 : 0}
+            />
+
+            <div className="grid grid-cols-1 2xl:grid-cols-12 gap-5">
+              <div className="2xl:col-span-8 space-y-4">
+                <ReceiptThermalPreview size="editor" offsetMm={offsetMm} html={previewHtml} />
+
+                <ReceiptLiveStylePanel
+                  kind={editorKind}
+                  settings={settings}
+                  patchPrintStyle={patchPrintStyle}
+                  onRestaurantPatch={(p) => setSettings((prev) => ({ ...prev, ...p }))}
+                />
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    void runPreviewTestPrint(
+                      view === 'adisyon' ? 'receipt' : view === 'paket' ? 'takeaway' : 'kitchen',
+                    )
+                  }
+                  className="w-full py-3.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white text-base font-bold transition shadow-lg"
+                >
+                  Yazıcıya test gönder
+                </button>
+              </div>
+
+              <div className={`2xl:col-span-4 space-y-4 bg-white rounded-xl border-2 ${borderCls} p-4 md:p-5 shadow-sm`}>
+                <h4 className="font-bold text-slate-800 border-b border-slate-100 pb-2">Yazıcı ve otomasyon</h4>
+
+                {view === 'kitchen' && (
+                  <>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={settings.printStyle.showKitchenOrderNumber}
+                        onChange={(e) => patchPrintStyle({ showKitchenOrderNumber: e.target.checked })}
+                        className="rounded border-slate-300"
+                      />
+                      <span className="text-sm text-slate-700">Sipariş numarası göster</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={settings.printStyle.kitchenFooterExtra}
+                      onChange={(e) => patchPrintStyle({ kitchenFooterExtra: e.target.value })}
+                      placeholder="Mutfak ek alt satır"
+                      className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm"
+                    />
+                    <div>
+                      <label className="block text-xs font-bold text-slate-600 mb-1">Varsayılan mutfak yazıcısı</label>
+                      <select
+                        value={settings.defaultKitchenPrinter}
+                        onChange={(e) => setSettings((p) => ({ ...p, defaultKitchenPrinter: e.target.value }))}
+                        className="w-full px-3 py-2.5 rounded-lg border border-slate-200 text-sm"
+                      >
+                        <option value="">Seçilmedi</option>
+                        {availablePrinters.map((p) => (
+                          <option key={`k2-${p.name}`} value={p.name}>{p.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex items-center justify-between bg-slate-50 rounded-xl p-3 border border-slate-100">
+                      <div>
+                        <p className="font-semibold text-slate-800 text-sm">Otomatik mutfak fişi</p>
+                        <p className="text-xs text-slate-500">Sipariş gönderilince</p>
+                      </div>
+                      <button type="button" onClick={() => setSettings((p) => ({ ...p, autoPrintKitchen: !p.autoPrintKitchen }))}>
+                        {settings.autoPrintKitchen ? (
+                          <ToggleRight className="w-10 h-10 text-orange-500" />
+                        ) : (
+                          <ToggleLeft className="w-10 h-10 text-slate-300" />
+                        )}
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setView('kategori')}
+                      className="text-sm font-semibold text-orange-700 hover:underline w-full text-left"
+                    >
+                      Kategori → yazıcı eşlemesi →
+                    </button>
+                  </>
+                )}
+
+                {view === 'adisyon' && (
+                  <>
+                    <input
+                      type="text"
+                      value={settings.printStyle.receiptFooterExtra}
+                      onChange={(e) => patchPrintStyle({ receiptFooterExtra: e.target.value })}
+                      placeholder="Teşekkür üstü ek satır"
+                      className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm"
+                    />
+                    <div>
+                      <label className="block text-xs font-bold text-slate-600 mb-1">Adisyon yazıcısı</label>
+                      <select
+                        value={settings.defaultReceiptPrinter}
+                        onChange={(e) => setSettings((p) => ({ ...p, defaultReceiptPrinter: e.target.value }))}
+                        className="w-full px-3 py-2.5 rounded-lg border border-slate-200 text-sm"
+                      >
+                        <option value="">Seçilmedi</option>
+                        {availablePrinters.map((p) => (
+                          <option key={`r2-${p.name}`} value={p.name}>{p.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex items-center justify-between bg-slate-50 rounded-xl p-3 border border-slate-100">
+                      <div>
+                        <p className="font-semibold text-slate-800 text-sm">Otomatik müşteri fişi</p>
+                        <p className="text-xs text-slate-500">Ödeme alınınca</p>
+                      </div>
+                      <button type="button" onClick={() => setSettings((p) => ({ ...p, autoPrintReceipt: !p.autoPrintReceipt }))}>
+                        {settings.autoPrintReceipt ? (
+                          <ToggleRight className="w-10 h-10 text-orange-500" />
+                        ) : (
+                          <ToggleLeft className="w-10 h-10 text-slate-300" />
+                        )}
+                      </button>
+                    </div>
+                    <div className="flex items-center justify-between bg-amber-50 rounded-xl p-3 border border-amber-200">
+                      <div className="pr-2">
+                        <p className="font-semibold text-amber-900 text-sm">Ödemede adisyon açık</p>
+                        <p className="text-xs text-amber-800/80">Varsayılan toggle</p>
+                      </div>
+                      <button type="button" onClick={() => setSettings((p) => ({ ...p, receiptPrintDefaultOn: !p.receiptPrintDefaultOn }))}>
+                        {settings.receiptPrintDefaultOn ? (
+                          <ToggleRight className="w-10 h-10 text-amber-500" />
+                        ) : (
+                          <ToggleLeft className="w-10 h-10 text-slate-300" />
+                        )}
+                      </button>
+                    </div>
+                  </>
+                )}
+
+                {view === 'paket' && (
+                  <>
+                    <div>
+                      <label className="block text-xs font-bold text-slate-600 mb-1">Paket / kurye yazıcısı</label>
+                      <select
+                        value={settings.defaultTakeawayPrinter || ''}
+                        onChange={(e) => setSettings((p) => ({ ...p, defaultTakeawayPrinter: e.target.value }))}
+                        className="w-full px-3 py-2.5 rounded-lg border border-slate-200 text-sm"
+                      >
+                        <option value="">Önce Paket tipi, sonra adisyon</option>
+                        {availablePrinters.map((p) => (
+                          <option key={`t2-${p.name}`} value={p.name}>{p.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="flex items-center justify-between bg-slate-50 rounded-xl p-3 border border-slate-100">
+                      <div>
+                        <p className="font-semibold text-slate-800 text-sm">Otomatik paket fişi</p>
+                        <p className="text-xs text-slate-500">Paket siparişinde</p>
+                      </div>
+                      <button type="button" onClick={() => setSettings((p) => ({ ...p, autoPrintTakeaway: !p.autoPrintTakeaway }))}>
+                        {settings.autoPrintTakeaway !== false ? (
+                          <ToggleRight className="w-10 h-10 text-orange-500" />
+                        ) : (
+                          <ToggleLeft className="w-10 h-10 text-slate-300" />
+                        )}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {view === 'genel' && (
       <div className="bg-white rounded-xl border border-slate-200 p-4 md:p-6 space-y-4">
         <h4 className="font-bold text-slate-800 text-base border-b border-slate-100 pb-3 flex items-center gap-2">
-          <Settings2 className="w-4 h-4 text-orange-500" /> Genel Yazdırma Ayarları
+          <Settings2 className="w-4 h-4 text-orange-500" /> Restoran bilgileri (tüm fişler)
         </h4>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -355,242 +693,71 @@ export function PrinterSettings() {
             placeholder="Teşekkür ederiz, iyi günler!"
           />
         </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div>
-            <label className="block text-xs font-bold text-slate-600 mb-1.5 uppercase tracking-wide">Adisyon / müşteri fişi yazıcısı</label>
-            <p className="text-[11px] text-slate-500 mb-1.5">Ödeme sonrası otomatik fiş, Hızlı Satış ve &quot;Adisyon Yazdır&quot; yalnızca bu yazıcıdan çıkar.</p>
-            <select
-              value={settings.defaultReceiptPrinter}
-              onChange={e => setSettings(p => ({ ...p, defaultReceiptPrinter: e.target.value }))}
-              className="w-full px-3 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none text-sm"
-            >
-              <option value="">Seçilmedi</option>
-              {availablePrinters.map(p => (
-                <option key={p.name} value={p.name}>{p.name}{p.isDefault ? ' (Windows varsayılan)' : ''}</option>
-              ))}
-              {availablePrinters.length === 0 && settings.defaultReceiptPrinter && (
-                <option value={settings.defaultReceiptPrinter}>{settings.defaultReceiptPrinter}</option>
-              )}
-            </select>
-          </div>
-          <div>
-            <label className="block text-xs font-bold text-slate-600 mb-1.5 uppercase tracking-wide">Varsayılan mutfak yazıcısı</label>
-            <p className="text-[11px] text-slate-500 mb-1.5">Ürün/kategori eşleşmezse mutfak fişi buraya gider. Adisyon yazıcısına düşmez.</p>
-            <select
-              value={settings.defaultKitchenPrinter}
-              onChange={e => setSettings(p => ({ ...p, defaultKitchenPrinter: e.target.value }))}
-              className="w-full px-3 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none text-sm"
-            >
-              <option value="">Seçilmedi (mutfak yazıcısı ve kategori şart)</option>
-              {availablePrinters.map(p => (
-                <option key={`k-${p.name}`} value={p.name}>{p.name}{p.isDefault ? ' (Windows varsayılan)' : ''}</option>
-              ))}
-              {availablePrinters.length === 0 && settings.defaultKitchenPrinter && (
-                <option value={settings.defaultKitchenPrinter}>{settings.defaultKitchenPrinter}</option>
-              )}
-            </select>
-          </div>
-          <div>
-            <label className="block text-xs font-bold text-slate-600 mb-1.5 uppercase tracking-wide">Paket / kurye fişi yazıcısı</label>
-            <p className="text-[11px] text-slate-500 mb-1.5">Aşağıda &quot;Paket/Kurye&quot; tipi yazıcı yoksa bu kullanılır; o da yoksa adisyon yazıcısı.</p>
-            <select
-              value={settings.defaultTakeawayPrinter || ''}
-              onChange={e => setSettings(p => ({ ...p, defaultTakeawayPrinter: e.target.value }))}
-              className="w-full px-3 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none text-sm"
-            >
-              <option value="">Seçilmedi (önce Paket tipi satır, sonra adisyon)</option>
-              {availablePrinters.map(p => (
-                <option key={`t-${p.name}`} value={p.name}>{p.name}{p.isDefault ? ' (Windows varsayılan)' : ''}</option>
-              ))}
-              {availablePrinters.length === 0 && settings.defaultTakeawayPrinter && (
-                <option value={settings.defaultTakeawayPrinter}>{settings.defaultTakeawayPrinter}</option>
-              )}
-            </select>
-          </div>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          <div className="flex items-center justify-between bg-slate-50 rounded-xl p-3 border border-slate-100">
-            <div>
-              <p className="font-semibold text-slate-800 text-sm">Otomatik Mutfak Fişi</p>
-              <p className="text-xs text-slate-500">Sipariş eklendikçe mutfağa yaz</p>
-            </div>
-            <button onClick={() => setSettings(p => ({ ...p, autoPrintKitchen: !p.autoPrintKitchen }))}>
-              {settings.autoPrintKitchen
-                ? <ToggleRight className="w-10 h-10 text-orange-500" />
-                : <ToggleLeft className="w-10 h-10 text-slate-300" />
-              }
-            </button>
-          </div>
-          <div className="flex items-center justify-between bg-slate-50 rounded-xl p-3 border border-slate-100">
-            <div>
-              <p className="font-semibold text-slate-800 text-sm">Otomatik Müşteri Fişi</p>
-              <p className="text-xs text-slate-500">Ödeme alındığında otomatik yaz</p>
-            </div>
-            <button onClick={() => setSettings(p => ({ ...p, autoPrintReceipt: !p.autoPrintReceipt }))}>
-              {settings.autoPrintReceipt
-                ? <ToggleRight className="w-10 h-10 text-orange-500" />
-                : <ToggleLeft className="w-10 h-10 text-slate-300" />
-              }
-            </button>
-          </div>
-          <div className="flex items-center justify-between bg-slate-50 rounded-xl p-3 border border-slate-100">
-            <div>
-              <p className="font-semibold text-slate-800 text-sm">Otomatik Paket Fişi</p>
-              <p className="text-xs text-slate-500">Paket/kurye siparişinde yaz</p>
-            </div>
-            <button onClick={() => setSettings(p => ({ ...p, autoPrintTakeaway: !p.autoPrintTakeaway }))}>
-              {settings.autoPrintTakeaway !== false
-                ? <ToggleRight className="w-10 h-10 text-orange-500" />
-                : <ToggleLeft className="w-10 h-10 text-slate-300" />
-              }
-            </button>
-          </div>
-          <div className="flex items-center justify-between bg-amber-50 rounded-xl p-3 border border-amber-200 md:col-span-3">
-            <div className="pr-3">
-              <p className="font-semibold text-amber-900 text-sm">Ödeme ekranında "Adisyon Yazdır" varsayılan açık</p>
-              <p className="text-xs text-amber-800/80">
-                Açıkken: kasa/garson her ödemede otomatik adisyon basar (kapatabilir).
-                Kapalıyken (önerilen): kullanıcı isterse ödeme alma ekranında butonla açar.
-              </p>
-            </div>
-            <button onClick={() => setSettings(p => ({ ...p, receiptPrintDefaultOn: !p.receiptPrintDefaultOn }))}>
-              {settings.receiptPrintDefaultOn
-                ? <ToggleRight className="w-10 h-10 text-amber-500" />
-                : <ToggleLeft className="w-10 h-10 text-slate-300" />
-              }
-            </button>
-          </div>
-        </div>
       </div>
+      )}
 
+      {view === 'online' && (
       <div className="bg-white rounded-xl border border-slate-200 p-4 md:p-6 space-y-4">
         <h4 className="font-bold text-slate-800 text-base border-b border-slate-100 pb-3 flex items-center gap-2">
-          <Settings2 className="w-4 h-4 text-indigo-500" /> Fiş görünümü (font & ek metin)
+          <Globe className="w-4 h-4 text-orange-500" /> Online platform fişi
         </h4>
-        <p className="text-xs text-slate-500">80 mm termal çıktı; mutfak ve adisyon için punto ve ek satırlar.</p>
-
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-          {([
-            ['kitchenTitlePx', 'Mutfak başlık (px)'],
-            ['kitchenBodyPx', 'Mutfak gövde (px)'],
-            ['kitchenItemPx', 'Mutfak ürün satırı (px)'],
-            ['receiptTitlePx', 'Adisyon başlık (px)'],
-          ] as const).map(([key, label]) => (
-            <div key={key}>
-              <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">{label}</label>
-              <input
-                type="number"
-                min={8}
-                max={28}
-                value={settings.printStyle[key]}
-                onChange={(e) => patchPrintStyle({ [key]: Math.min(28, Math.max(8, Number(e.target.value) || 12)) } as Partial<PrintStyleSettings>)}
-                className="w-full px-2 py-2 rounded-lg border border-slate-200 text-sm"
-              />
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="rounded-xl border-2 border-orange-200 bg-orange-50/40 p-4 space-y-3 md:col-span-2">
+            <div>
+              <label className="block text-xs font-bold text-slate-700 mb-1 uppercase tracking-wide">
+                Online sipariş fişi (Getir / Yemeksepeti / Trendyol)
+              </label>
+              <p className="text-[11px] text-slate-600">
+                Tüm online sipariş onay fişleri bu yazıcıdan çıkar. Boş bırakırsanız varsayılan mutfak yazıcısı kullanılır.
+              </p>
             </div>
-          ))}
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          <div>
-            <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Adisyon gövde (px)</label>
-            <input
-              type="number"
-              min={8}
-              max={22}
-              value={settings.printStyle.receiptBodyPx}
-              onChange={(e) => patchPrintStyle({ receiptBodyPx: Math.min(22, Math.max(8, Number(e.target.value) || 12)) })}
-              className="w-full px-2 py-2 rounded-lg border border-slate-200 text-sm"
-            />
-          </div>
-          <div>
-            <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">Yatay kayma (mm)</label>
-            <div className="flex items-stretch gap-1">
+            <label className="flex items-center gap-2 mb-2 cursor-pointer select-none">
               <input
-                type="number"
-                min={-15}
-                max={15}
-                step={0.5}
-                value={settings.printStyle.paperOffsetMm}
-                onChange={(e) => patchPrintStyle({ paperOffsetMm: Math.min(15, Math.max(-15, Number(e.target.value) || 0)) })}
-                className="flex-1 px-2 py-2 rounded-lg border border-slate-200 text-sm"
+                type="checkbox"
+                checked={settings.autoApproveOnlineOrders === true}
+                onChange={(e) =>
+                  setSettings((p) => ({ ...p, autoApproveOnlineOrders: e.target.checked }))
+                }
+                className="w-4 h-4 rounded border-orange-300 text-orange-600 focus:ring-orange-400"
               />
-              <button
-                type="button"
-                onClick={() => patchPrintStyle({ paperOffsetMm: 0 })}
-                className="px-2 py-2 rounded-lg border border-slate-200 text-xs font-semibold text-slate-500 hover:bg-slate-50"
-                title="Sıfırla"
-              >
-                0
-              </button>
-            </div>
-            <p className="text-[10px] text-slate-400 mt-1">Negatif: sola kaydır · Pozitif: sağa kaydır</p>
-          </div>
-          <label className="flex items-center gap-2 mt-6 md:mt-8 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={settings.printStyle.showKitchenOrderNumber}
-              onChange={(e) => patchPrintStyle({ showKitchenOrderNumber: e.target.checked })}
-              className="rounded border-slate-300"
-            />
-            <span className="text-sm text-slate-700">Mutfak fişinde sipariş numarası göster</span>
-          </label>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <div>
-            <label className="block text-xs font-bold text-slate-600 mb-1">Mutfak alt başlık (logo altı, tek satır)</label>
-            <input
-              type="text"
-              value={settings.printStyle.kitchenSubtitle}
-              onChange={(e) => patchPrintStyle({ kitchenSubtitle: e.target.value })}
-              className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm"
-              placeholder="Örn: Sipariş hazırlanıyor"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-bold text-slate-600 mb-1">Adisyon alt başlık</label>
-            <input
-              type="text"
-              value={settings.printStyle.receiptSubtitle}
-              onChange={(e) => patchPrintStyle({ receiptSubtitle: e.target.value })}
-              className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm"
-              placeholder="Örn: Afiyet olsun"
-            />
-          </div>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <div>
-            <label className="block text-xs font-bold text-slate-600 mb-1">Mutfak ek satır (alt, küçük puntolu)</label>
-            <input
-              type="text"
-              value={settings.printStyle.kitchenFooterExtra}
-              onChange={(e) => patchPrintStyle({ kitchenFooterExtra: e.target.value })}
-              className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm"
-              placeholder="Örn: İyi çalışmalar"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-bold text-slate-600 mb-1">Adisyon ek satır (teşekkür üstü)</label>
-            <input
-              type="text"
-              value={settings.printStyle.receiptFooterExtra}
-              onChange={(e) => patchPrintStyle({ receiptFooterExtra: e.target.value })}
-              className="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm"
-              placeholder="Örn: Bizi tercih ettiğiniz için teşekkürler"
-            />
+              <span className="text-sm font-semibold text-slate-700">
+                Otomatik onay + fiş (sipariş gelince kasada onayla ve yazdır)
+              </span>
+            </label>
+            <select
+              value={settings.defaultOnlinePlatformPrinter || ''}
+              onChange={(e) => setSettings((p) => ({ ...p, defaultOnlinePlatformPrinter: e.target.value }))}
+              className="w-full px-3 py-2.5 rounded-lg border border-orange-200 bg-orange-50/50 focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none text-sm"
+            >
+              <option value="">Varsayılan mutfak yazıcısını kullan</option>
+              {availablePrinters.map((p) => (
+                <option key={`on2-${p.name}`} value={p.name}>
+                  {p.name}
+                  {p.isDefault ? ' (Windows varsayılan)' : ''}
+                </option>
+              ))}
+            </select>
           </div>
         </div>
       </div>
+      )}
 
-      {categories.length > 0 && (settings.printers.some((p) => p.enabled && (p.type === 'kitchen' || p.type === 'bar' || p.type === 'custom')) || settings.defaultKitchenPrinter) && (
+      {view === 'kategori' && categories.length > 0 && (settings.printers.some((p) => p.enabled && (p.type === 'kitchen' || p.type === 'bar' || p.type === 'custom')) || settings.defaultKitchenPrinter) && (
         <div className="bg-white rounded-xl border border-slate-200 p-4 md:p-6 space-y-4">
           <div className="border-b border-slate-100 pb-3">
             <h4 className="font-bold text-slate-800 text-base flex items-center gap-2">
               <Settings2 className="w-4 h-4 text-emerald-500" /> Kategori → Yazıcı Eşleme
             </h4>
             <p className="text-xs text-slate-500 mt-1">
-              Her ürün grubu için tek tıkla yazıcı seçin. Seçim <strong>otomatik kaydedilir</strong> ve bir sonraki sipariş gönderiminden itibaren geçerli olur. <strong>Ürün kartında özel yazıcı yazılıysa</strong> o öncelikli; eşleme yoksa <strong>varsayılan mutfak yazıcısı</strong> devreye girer. Bir kategori aynı anda yalnızca bir mutfak yazıcısına gider (deterministik).
+              {activeBranch?.name ? (
+                <>
+                  <strong>{activeBranch.name}</strong> şubesi için ayrı kayıt — başka şubeyle karışmaz.
+                  {' '}
+                </>
+              ) : null}
+              Her ürün grubunu bir mutfak/bar yazıcısına bağlayın; seçim <strong>otomatik kaydedilir</strong>.
+              Eşleme yapılmayan kategorilerin ürünleri <strong>mutfak fişine gitmez</strong>.
+              Ürün kartında özel yazıcı varsa o önceliklidir.
             </p>
           </div>
 
@@ -659,7 +826,7 @@ export function PrinterSettings() {
                     }}
                     className="w-full px-3 py-2 rounded-lg border border-slate-200 focus:ring-2 focus:ring-orange-400 focus:border-transparent outline-none text-sm bg-white"
                   >
-                    <option value="">— Otomatik (catch-all / varsayılan) —</option>
+                    <option value="">— Yazıcı yok (bu grup basılmaz) —</option>
                     {settings.printers.map((p, idx) => {
                       if (!p.enabled) return null;
                       const isKitchen =
@@ -673,9 +840,11 @@ export function PrinterSettings() {
                     })}
                   </select>
                   <p className="text-[11px] text-slate-500 truncate">
-                    {effective
+                    {effective?.source === 'category'
                       ? `→ ${effective.printerName}`
-                      : '⚠ Atanmadı — yukarıdan varsayılan mutfak yazıcısı seçin.'}
+                      : effective
+                        ? `→ ${effective.printerName} (${sourceLabel})`
+                        : '⚠ Bu kategori için mutfak fişi basılmaz — yazıcı seçin.'}
                   </p>
                 </div>
               );
@@ -684,7 +853,7 @@ export function PrinterSettings() {
         </div>
       )}
 
-      {categories.length > 0 && (
+      {view === 'kategori' && categories.length > 0 && (
         <div className="bg-white rounded-xl border border-slate-200 p-4 md:p-6 space-y-4">
           <div className="border-b border-slate-100 pb-3">
             <h4 className="font-bold text-slate-800 text-base flex items-center gap-2">
@@ -721,6 +890,7 @@ export function PrinterSettings() {
         </div>
       )}
 
+      {view === 'yazicilar' && (
       <div className="bg-white rounded-xl border border-slate-200 p-4 md:p-6 space-y-4">
         <div className="flex items-center justify-between border-b border-slate-100 pb-3">
           <h4 className="font-bold text-slate-800 text-base flex items-center gap-2">
@@ -947,6 +1117,7 @@ export function PrinterSettings() {
           </div>
         )}
       </div>
+      )}
 
       {testResult && (
         <div className={`rounded-xl px-4 py-3 text-sm font-medium flex items-center gap-2 ${testResult.includes('Hata') ? 'bg-red-50 border border-red-200 text-red-700' : 'bg-green-50 border border-green-200 text-green-700'}`}>
@@ -955,13 +1126,21 @@ export function PrinterSettings() {
         </div>
       )}
 
-      <button
-        onClick={handleSave}
-        className="flex items-center gap-2 bg-orange-500 hover:bg-orange-600 text-white px-6 py-2.5 rounded-xl font-semibold transition-all active:scale-95 shadow-md"
-      >
-        {saved ? <CheckCircle className="w-4 h-4" /> : <Save className="w-4 h-4" />}
-        {saved ? 'Kaydedildi!' : 'Ayarları Kaydet'}
-      </button>
+      {view !== 'hub' && (
+        <button
+          type="button"
+          onClick={handleSave}
+          className="flex items-center gap-2 bg-orange-500 hover:bg-orange-600 text-white px-6 py-2.5 rounded-xl font-semibold transition-all active:scale-95 shadow-md"
+        >
+          {saved ? <CheckCircle className="w-4 h-4" /> : <Save className="w-4 h-4" />}
+          {saved ? 'Kaydedildi!' : 'Ayarları Kaydet'}
+        </button>
+      )}
+      {view === 'hub' && (
+        <p className="text-xs text-slate-500 text-center">
+          Değişiklikler fiş kartlarında otomatik kaydedilir. Buluta senkron için bir fiş ekranından «Kaydet» kullanabilirsiniz.
+        </p>
+      )}
     </div>
   );
 }

@@ -1,10 +1,13 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { supabase } from '../lib/supabase';
-import { isSqlServerMode, isLocalMode } from '../lib/sqlDb';
+import { isHybridMode, isHybridCloudLinked, fetchHybridLinkInfo, switchElectronToCloudMode, activateElectronCloudMode } from '../lib/hybridMode';
+import { persistElectronDbMode, syncElectronDbModeFromMain } from '../lib/sqlDb';
 import { phoneToAuthEmail } from '../lib/phoneAuthEmail';
 import { resolveLoginIdentifier } from '../lib/panelUserLoginResolve';
-import { Eye, EyeOff, ChevronLeft, User, Lock, Building2, Phone, Bike, Delete, Cloud, Server, Settings, HardDrive } from 'lucide-react';
+import { Eye, EyeOff, ChevronLeft, User, Lock, Building2, Phone, Bike, Delete, Settings, Cloud } from 'lucide-react';
+import { ConnectionModeBadge } from './electron/ConnectionModeBadge';
+import { ElectronLoginUpdatePanel } from './electron/ElectronLoginUpdatePanel';
 
 const logoSrc = new URL('../../public/logo.png', import.meta.url).href;
 
@@ -66,6 +69,29 @@ interface ElectronAuthProps {
 }
 
 export function ElectronAuth({ onCourierMode, onSwitchMode, currentDbMode }: ElectronAuthProps) {
+  const storedDbMode = (() => {
+    try {
+      return localStorage.getItem('dbMode') as ElectronAuthProps['currentDbMode'];
+    } catch {
+      return null;
+    }
+  })();
+  const [liveDbMode, setLiveDbMode] = useState<ElectronAuthProps['currentDbMode']>(
+    currentDbMode ?? storedDbMode,
+  );
+
+  useEffect(() => {
+    void syncElectronDbModeFromMain().then((mode) => {
+      if (mode) setLiveDbMode(mode);
+    });
+  }, []);
+
+  const resolvedDbMode = liveDbMode ?? currentDbMode ?? storedDbMode;
+  const effectiveSqlMode =
+    resolvedDbMode === 'sqlserver' || resolvedDbMode === 'hybrid' || resolvedDbMode === 'postgres';
+  const effectiveLocalMode = resolvedDbMode === 'local';
+  const effectiveOfflineMode = effectiveSqlMode || effectiveLocalMode;
+
   const [view, setView] = useState<'login' | 'register' | 'courier'>('login');
   const [step, setStep] = useState<'phone' | 'password'>('phone');
   const [loginValue, setLoginValue] = useState('');
@@ -90,10 +116,28 @@ export function ElectronAuth({ onCourierMode, onSwitchMode, currentDbMode }: Ele
   const phoneInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    const savedLogin = localStorage.getItem(REMEMBER_KEY);
-    const savedPassword = localStorage.getItem(REMEMBER_PASSWORD_KEY);
-    if (savedLogin) { setLoginValue(savedLogin); setRemember(true); }
-    if (savedPassword) setPassword(savedPassword);
+    void (async () => {
+      const savedLogin = localStorage.getItem(REMEMBER_KEY);
+      const savedPassword = localStorage.getItem(REMEMBER_PASSWORD_KEY);
+      const hintEmail = localStorage.getItem('shefpos_hybrid_kasa_hint_email');
+      if (hintEmail) {
+        setLoginValue(hintEmail);
+        localStorage.removeItem('shefpos_hybrid_kasa_hint_email');
+        localStorage.removeItem('shefpos_hybrid_kasa_hint');
+        localStorage.removeItem(REMEMBER_KEY);
+        localStorage.removeItem(REMEMBER_PASSWORD_KEY);
+        return;
+      }
+      if (isHybridMode() && isHybridCloudLinked()) {
+        const link = await fetchHybridLinkInfo();
+        if (link?.kasaLoginEmail) {
+          setLoginValue(link.kasaLoginEmail);
+          return;
+        }
+      }
+      if (savedLogin) { setLoginValue(savedLogin); setRemember(true); }
+      if (savedPassword) setPassword(savedPassword);
+    })();
   }, []);
 
   useEffect(() => {
@@ -113,17 +157,28 @@ export function ElectronAuth({ onCourierMode, onSwitchMode, currentDbMode }: Ele
   const resolveEmail = async (val: string): Promise<string | null> => {
     const trimmed = val.trim();
 
-    if (isLocalMode()) {
+    if (effectiveLocalMode) {
       if (trimmed.includes('@')) return trimmed.toLowerCase();
       const sanitized = trimmed.toLowerCase().replace(/[^a-z0-9._-]/g, '');
       return `${sanitized}@local.shefpos`;
     }
 
-    if (isSqlServerMode()) {
+    if (effectiveSqlMode) {
       const api = (window as any).electronAPI;
+      if (isHybridMode() && isHybridCloudLinked()) {
+        if (isPhoneInput(trimmed) || (trimmed.includes('@') && !trimmed.endsWith('@shefpos.local'))) {
+          const resolved = await resolveLoginIdentifier(trimmed.includes('@') ? trimmed : loginValue);
+          if (resolved.ok && resolved.email) return resolved.email.toLowerCase();
+        }
+      }
       if (trimmed.includes('@')) return trimmed.toLowerCase();
       if (isPhoneInput(trimmed)) return phoneToAuthEmail(trimmed);
-      const sanitized = trimmed.toLowerCase().replace(/[^a-z0-9_.-]/g, '');
+      const sanitized = trimmed
+        .toLowerCase()
+        .replace(/ı/g, 'i')
+        .replace(/İ/g, 'i')
+        .replace(/[^a-z0-9_.-]/g, '');
+      if (sanitized === 'admin' || sanitized === 'adm') return 'admin@shefpos.local';
       if (api?.sqlFindProfileByUsername) {
         try {
           const result = await api.sqlFindProfileByUsername(sanitized);
@@ -151,10 +206,21 @@ export function ElectronAuth({ onCourierMode, onSwitchMode, currentDbMode }: Ele
     if (step === 'phone') { setStep('password'); return; }
     setLoading(true);
     try {
+      const synced = await syncElectronDbModeFromMain();
+      const modeNow = synced ?? resolvedDbMode;
+      const sqlNow =
+        modeNow === 'sqlserver' || modeNow === 'hybrid' || modeNow === 'postgres';
+      const localNow = modeNow === 'local';
+      const cloudModeNow = modeNow === 'cloud' || (!sqlNow && !localNow);
+
+      if (cloudModeNow) {
+        await activateElectronCloudMode();
+        setLiveDbMode('cloud');
+      }
+
       let email: string | null = null;
       const trimmed = loginValue.trim().toLowerCase();
-      const cloudMode = !isSqlServerMode() && !isLocalMode();
-      if (cloudMode) {
+      if (cloudModeNow) {
         if (trimmed === ADMIN_LOGIN_EMAIL || trimmed === ADMIN_LOGIN_EMAIL_LEGACY || trimmed === TEST_LOGIN_EMAIL) {
           email = ADMIN_LOGIN_EMAIL;
           if (trimmed === TEST_LOGIN_EMAIL) email = TEST_LOGIN_EMAIL;
@@ -181,7 +247,7 @@ export function ElectronAuth({ onCourierMode, onSwitchMode, currentDbMode }: Ele
       if (!email) { setError('Kullanıcı bulunamadı'); setLoading(false); return; }
       let result = await signIn(email, password);
       if (
-        cloudMode &&
+        cloudModeNow &&
         (trimmed === ADMIN_LOGIN_EMAIL || trimmed === ADMIN_LOGIN_EMAIL_LEGACY) &&
         result.error?.message?.includes('Invalid login credentials')
       ) {
@@ -191,9 +257,9 @@ export function ElectronAuth({ onCourierMode, onSwitchMode, currentDbMode }: Ele
       if (result.error) {
         if ((result as any).suspended) { setIsSuspended(true); setError(result.error.message); setLoading(false); return; }
         const msg = (result.error as any).message || '';
-        if (isSqlServerMode()) {
+        if (effectiveSqlMode && !cloudModeNow) {
           if (msg.includes('Kullanici bulunamadi') || msg.includes('bulunamadi')) {
-            setError('Kullanıcı bulunamadı. Lütfen önce veritabanını kurulum ekranından oluşturun.');
+            setError('Kullanıcı bulunamadı. Kurulum ekranında «Test Et + Kur ve Başla»yı tekrar çalıştırın; giriş: ADMIN / 1234');
           } else if (msg.includes('Sifre hatali')) {
             setError('Şifre hatalı');
           } else if (msg.includes('tedious') || msg.includes('SQL')) {
@@ -429,9 +495,10 @@ export function ElectronAuth({ onCourierMode, onSwitchMode, currentDbMode }: Ele
     );
   }
 
-  const sqlMode = currentDbMode === 'sqlserver' || currentDbMode === 'postgres' || isSqlServerMode();
-  const localMode = currentDbMode === 'local' || isLocalMode();
-  const offlineMode = sqlMode || localMode;
+  const sqlMode = effectiveSqlMode;
+  const localMode = effectiveLocalMode;
+  const offlineMode = effectiveOfflineMode;
+  const hybridMode = sqlMode && (currentDbMode === 'hybrid' || isHybridMode());
 
   return (
     <div className="min-h-screen flex" style={{ background: bg }}>
@@ -442,10 +509,10 @@ export function ElectronAuth({ onCourierMode, onSwitchMode, currentDbMode }: Ele
             <button
               type="button"
               onClick={onSwitchMode}
-              className="flex items-center gap-2 px-4 py-2 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 transition text-white/50 hover:text-white/80 text-xs font-medium"
+              className="flex items-center gap-2 px-4 py-2 rounded-lg border border-white/15 bg-white/10 hover:bg-white/15 transition text-white/70 hover:text-white text-xs font-semibold"
             >
               <Settings className="w-3.5 h-3.5" />
-              Bağlantı Modu
+              Bağlantı ayarı
             </button>
           </div>
         )}
@@ -454,16 +521,19 @@ export function ElectronAuth({ onCourierMode, onSwitchMode, currentDbMode }: Ele
 
         {step === 'phone' && (
           <div className="flex items-center gap-2 mb-8">
-            <div className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold border ${
-              sqlMode
-                ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                : localMode
-                  ? 'bg-amber-500/10 border-amber-500/30 text-amber-400'
-                  : 'bg-blue-500/10 border-blue-500/30 text-blue-400'
-            }`}>
-              {sqlMode ? <Server className="w-3.5 h-3.5" /> : localMode ? <HardDrive className="w-3.5 h-3.5" /> : <Cloud className="w-3.5 h-3.5" />}
-              {sqlMode ? 'PostgreSQL Modu' : localMode ? 'Yerel Mod' : 'Bulut Modu'}
-            </div>
+            <ConnectionModeBadge
+              mode={
+                sqlMode
+                  ? currentDbMode === 'hybrid' || localStorage.getItem('dbMode') === 'hybrid'
+                    ? 'hybrid'
+                    : 'sqlserver'
+                  : localMode
+                    ? 'local'
+                    : 'cloud'
+              }
+              variant="dark"
+              compact
+            />
           </div>
         )}
 
@@ -473,6 +543,31 @@ export function ElectronAuth({ onCourierMode, onSwitchMode, currentDbMode }: Ele
             <p className="text-white/50 text-lg mb-10 text-center">
               {offlineMode ? 'Kullanıcı adınızı girin' : 'Telefon numaranızı girin'}
             </p>
+
+            {hybridMode && (
+              <div className="w-full max-w-sm mb-4 rounded-xl border border-orange-400/40 bg-orange-500/10 px-4 py-3 text-sm text-orange-100">
+                <p className="font-semibold text-orange-50">Hibrit kasa girişi</p>
+                <p className="mt-1 text-orange-100/90">Bulut telefon/e-posta ve şifrenizle girin — mobil garson ile aynı hesap.</p>
+              </div>
+            )}
+
+            {sqlMode && !hybridMode && (
+              <div className="w-full max-w-sm mb-4 rounded-xl border border-blue-400/30 bg-blue-500/10 px-4 py-3 text-sm">
+                <p className="text-blue-100/90">
+                  SQL / şube modundasınız. Sadece bulut hesabınızla girecekseniz modu değiştirin.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void switchElectronToCloudMode().then(() => window.location.reload());
+                  }}
+                  className="mt-2 inline-flex items-center gap-2 text-blue-200 hover:text-white font-semibold text-xs"
+                >
+                  <Cloud className="w-3.5 h-3.5" />
+                  Bulut moduna geç
+                </button>
+              </div>
+            )}
 
             <div className="w-full max-w-sm">
               {offlineMode ? (
@@ -576,6 +671,8 @@ export function ElectronAuth({ onCourierMode, onSwitchMode, currentDbMode }: Ele
                 <Bike className="w-5 h-5" />
                 Kurye Girişi
               </button>
+
+              <ElectronLoginUpdatePanel />
             </div>
           </>
         ) : (
@@ -592,6 +689,12 @@ export function ElectronAuth({ onCourierMode, onSwitchMode, currentDbMode }: Ele
             <h1 className="text-white text-4xl font-bold mb-2 text-center">Şifre</h1>
             <p className="text-white/50 text-lg mb-3 text-center">{loginValue}</p>
             <p className="text-white/30 text-sm mb-10 text-center">Şifrenizi girin</p>
+
+            {hybridMode && (
+              <p className="text-orange-200/80 text-sm mb-6 text-center max-w-sm">
+                Bulut şifreniz (mobil garson ile aynı)
+              </p>
+            )}
 
             <div className="w-full max-w-sm">
               {offlineMode ? (

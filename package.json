@@ -1,21 +1,25 @@
 {
   "name": "shefpos",
   "private": true,
-  "version": "1.0.140",
+  "version": "1.0.297",
   "type": "module",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "build:pages": "cross-env CF_PAGES=1 VITE_PUBLIC_SUPABASE_FN_PROXY_BASE_URL=https://www.sefpos.com.tr/api NODE_OPTIONS=--max-old-space-size=6144 vite build",
+    "seo:generate": "node scripts/gen-turkey-seo.mjs",
+    "build:pages": "npm run seo:generate && cross-env CF_PAGES=1 VITE_VDS_API_BASE=https://sefpos.com.tr VITE_PUBLIC_SUPABASE_FN_PROXY_BASE_URL=https://sefpos.com.tr/vds-api NODE_OPTIONS=--max-old-space-size=6144 vite build",
+    "build:vds": "cross-env VITE_VDS_SELFHOST=true VITE_WEB_ROOT_BASE=1 NODE_OPTIONS=--max-old-space-size=6144 vite build",
     "lint": "eslint .",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
     "electron:dev": "concurrently \"vite\" \"node ./scripts/electron-dev-wait.mjs\"",
     "electron:build": "vite build && electron-builder",
     "electron:build:win": "node scripts/electron-build-win-release.mjs",
-    "android:build": "vite build && npx cap sync android",
-    "android:apk": "vite build && npx cap sync android && cd android && gradlew.bat assembleDebug",
+    "mobile:sync-version": "node scripts/sync-mobile-version.mjs",
+    "android:build": "node scripts/sync-mobile-version.mjs && vite build && npx cap sync android",
+    "android:apk": "node scripts/sync-mobile-version.mjs && vite build && npx cap sync android && cd android && gradlew.bat assembleDebug",
+    "android:bundle": "node scripts/sync-mobile-version.mjs && vite build && npx cap sync android && cd android && gradlew.bat bundleRelease",
     "android:open": "npx cap open android",
     "ios:build": "vite build && npx cap sync ios",
     "ios:open": "npx cap open ios",
@@ -27,7 +31,8 @@
     "edge:deploy:update-user": "npx supabase functions deploy update-user",
     "edge:deploy:all": "npx supabase functions deploy create-user update-user create-waiter-auth send-sms-otp verify-sms-otp send-sms-welcome send-sms-custom",
     "test:edge-sms": "node scripts/test-edge-sms-otp.mjs",
-    "cf:pages:delete-legacy-sefpos": "npx wrangler pages project delete sefpos --yes"
+    "cf:pages:delete-legacy-sefpos": "npx wrangler pages project delete sefpos --yes",
+    "print-agent": "node print-agent/index.js"
   },
   "build": {
     "appId": "com.sefpos.app",
@@ -35,6 +40,7 @@
     "directories": {
       "output": "release"
     },
+    "npmRebuild": false,
     "afterPack": "scripts/embed-icon.cjs",
     "files": [
       "dist/**/*",
@@ -55,6 +61,10 @@
       {
         "from": "shefpos_sqlserver.sql",
         "to": "shefpos_sqlserver.sql"
+      },
+      {
+        "from": "shefpos_sqlserver_patches.sql",
+        "to": "shefpos_sqlserver_patches.sql"
       }
     ],
     "win": {
@@ -143,3 +153,4 @@
     "wait-on": "^9.0.5"
   }
 }
+

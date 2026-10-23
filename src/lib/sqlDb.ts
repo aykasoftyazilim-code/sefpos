@@ -1,13 +1,113 @@
+import { isHybridMode, isHybridCloudLinked } from './hybridMode';
+
 const eApi = () => (window as any).electronAPI;
 
+export function isVdsSelfHost(): boolean {
+  return import.meta.env.VITE_VDS_SELFHOST === 'true';
+}
+
+/** Uzak VDS API kökü (Cloudflare www / Electron cloud). Boş = same-origin `/vds-api`. */
+export const DEFAULT_REMOTE_VDS_ORIGIN = 'https://sefpos.com.tr';
+
+export function getVdsApiOrigin(): string {
+  const fromEnv = String(import.meta.env.VITE_VDS_API_BASE || '')
+    .trim()
+    .replace(/\/$/, '');
+  if (fromEnv) return fromEnv;
+  if (isVdsSelfHost()) return '';
+  try {
+    // Electron "cloud" artık Supabase değil — VDS
+    if (eApi()?.isElectron && localStorage.getItem('dbMode') === 'cloud') {
+      return DEFAULT_REMOTE_VDS_ORIGIN;
+    }
+  } catch {
+    /* ignore */
+  }
+  return '';
+}
+
+/** VDS SQL API kullanılsın mı (self-host veya uzak). */
+export function isVdsBackend(): boolean {
+  if (isVdsSelfHost()) return true;
+  if (String(import.meta.env.VITE_VDS_API_BASE || '').trim()) return true;
+  try {
+    if (eApi()?.isElectron && localStorage.getItem('dbMode') === 'cloud') return true;
+  } catch {
+    /* ignore */
+  }
+  return false;
+}
+
+if (typeof window !== 'undefined' && (isVdsSelfHost() || String(import.meta.env.VITE_VDS_API_BASE || '').trim())) {
+  try {
+    localStorage.setItem('dbMode', 'sqlserver');
+  } catch {
+    /* ignore */
+  }
+}
+
+function isCloudLoginEmail(email: string): boolean {
+  const em = String(email || '').trim().toLowerCase();
+  return (
+    em.includes('@') &&
+    !em.endsWith('@shefpos.local') &&
+    !em.endsWith('@local.shefpos')
+  );
+}
+
 export function isSqlServerMode(): boolean {
+  if (isVdsBackend()) return true;
   if (!(eApi()?.isElectron)) return false;
-  const mode = localStorage.getItem('dbMode');
-  // Backward compatibility: keep existing sqlserver mode, add postgres mode.
-  return mode === 'sqlserver' || mode === 'postgres';
+  try {
+    const saved = localStorage.getItem('dbMode');
+    return saved === 'sqlserver' || saved === 'postgres' || saved === 'hybrid';
+  } catch {
+    /* ignore */
+  }
+  return false;
+}
+
+const SQL_SESSION_KEY = 'shefpos_sql_session';
+
+/** Electron ayar dosyasindan gelen modu localStorage ile hizalar (giris ekrani icin). */
+export function persistElectronDbMode(mode: string | null | undefined): void {
+  if (!mode) return;
+  const normalized = mode === 'postgres' ? 'sqlserver' : mode;
+  try {
+    localStorage.setItem('dbMode', normalized);
+  } catch {
+    /* ignore */
+  }
+}
+
+export function isElectronCloudMode(): boolean {
+  if (!(eApi()?.isElectron)) return false;
+  try {
+    return localStorage.getItem('dbMode') === 'cloud';
+  } catch {
+    return false;
+  }
+}
+
+/** Ana süreçteki dbMode ile localStorage'ı eşitle (eski hybrid kalıntısını önler). */
+export async function syncElectronDbModeFromMain(): Promise<
+  'cloud' | 'sqlserver' | 'hybrid' | 'local' | null
+> {
+  const api = eApi();
+  if (!api?.getDbMode) return null;
+  try {
+    const mode = await api.getDbMode();
+    if (!mode) return null;
+    const normalized = mode === 'postgres' ? 'sqlserver' : mode;
+    persistElectronDbMode(normalized);
+    return normalized as 'cloud' | 'sqlserver' | 'hybrid' | 'local';
+  } catch {
+    return null;
+  }
 }
 
 export function isLocalMode(): boolean {
+  if (isVdsSelfHost()) return false;
   return !!(eApi()?.isElectron) && localStorage.getItem('dbMode') === 'local';
 }
 
@@ -39,15 +139,62 @@ interface QueryState {
   limitVal?: number;
   data?: any;
   upsertOn?: string[];
+  countOnly?: boolean;
+  headOnly?: boolean;
 }
 
-async function execQuery(state: QueryState): Promise<{ data: any; error: any }> {
+function vdsAuthHeaders(): Record<string, string> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  try {
+    const raw = localStorage.getItem(SQL_SESSION_KEY);
+    const session = raw ? JSON.parse(raw) : null;
+    const token = session?.access_token;
+    if (token) headers.Authorization = `Bearer ${token}`;
+  } catch {
+    /* ignore */
+  }
+  return headers;
+}
+
+function vdsApiUrl(path: string): string {
+  const origin = getVdsApiOrigin();
+  const p = path.startsWith('/') ? path : `/${path}`;
+  return `${origin}/vds-api${p}`;
+}
+
+async function vdsPost<T = any>(path: string, body: unknown): Promise<T> {
+  const origin = getVdsApiOrigin();
+  const res = await fetch(vdsApiUrl(path), {
+    method: 'POST',
+    headers: vdsAuthHeaders(),
+    body: JSON.stringify(body),
+    credentials: origin ? 'omit' : 'same-origin',
+  });
+  const json = (await res.json().catch(() => null)) as T & { error?: string };
+  if (!res.ok) {
+    throw new Error((json as any)?.error || `VDS API ${res.status}`);
+  }
+  return json;
+}
+
+async function execQuery(
+  state: QueryState,
+): Promise<{ data: any; error: any; count?: number | null }> {
+  if (isVdsBackend()) {
+    try {
+      const result = await vdsPost<{ data: any; error?: string; count?: number | null }>('/query', state);
+      if (result.error) return { data: null, error: new Error(result.error) };
+      return { data: result.data, error: null, count: result.count ?? null };
+    } catch (err: any) {
+      return { data: null, error: err };
+    }
+  }
   const api = eApi();
   if (!api) return { data: null, error: new Error('Electron API bulunamadi') };
   try {
     const result = await api.sqlQuery(state);
     if (result.error) return { data: null, error: new Error(result.error) };
-    return { data: result.data, error: null };
+    return { data: result.data, error: null, count: result.count ?? null };
   } catch (err: any) {
     return { data: null, error: err };
   }
@@ -66,8 +213,12 @@ class SqlQueryBuilder {
     };
   }
 
-  select(cols: string) {
+  select(cols: string, opts?: { count?: string; head?: boolean }) {
     this.state.select = cols;
+    if (opts?.count === 'exact') {
+      this.state.countOnly = true;
+      this.state.headOnly = !!opts.head;
+    }
     return this;
   }
 
@@ -86,9 +237,20 @@ class SqlQueryBuilder {
   not(col: string, op: string, val: any) {
     if (op === 'is' && (val === null || val === 'null')) {
       this.state.filters.push({ col, op: 'is_not_null' });
-    } else {
-      this.state.filters.push({ col, op: 'neq', val });
+      return this;
     }
+    if (op === 'in') {
+      const vals = Array.isArray(val)
+        ? val
+        : String(val ?? '')
+            .replace(/^\(|\)$/g, '')
+            .split(',')
+            .map((x) => x.trim())
+            .filter(Boolean);
+      this.state.filters.push({ col, op: 'not_in', val: vals });
+      return this;
+    }
+    this.state.filters.push({ col, op: 'neq', val });
     return this;
   }
 
@@ -159,7 +321,10 @@ class SqlQueryBuilder {
   }
 
   then(resolve: (val: any) => any, reject?: (err: any) => any): Promise<any> {
-    return execQuery(this.state).then(resolve, reject);
+    return execQuery(this.state).then(
+      (res) => resolve({ data: res.data, error: res.error, count: res.count }),
+      reject,
+    );
   }
 
   async single(): Promise<{ data: any; error: any }> {
@@ -177,7 +342,6 @@ class SqlQueryBuilder {
 type AuthStateEvent = 'SIGNED_IN' | 'SIGNED_OUT' | 'INITIAL_SESSION';
 type AuthCallback = (event: AuthStateEvent, session: any) => void;
 
-const SQL_SESSION_KEY = 'shefpos_sql_session';
 const authCallbacks: AuthCallback[] = [];
 
 function getSqlSession() {
@@ -194,6 +358,23 @@ function setSqlSession(session: any) {
     localStorage.removeItem(SQL_SESSION_KEY);
   }
   authCallbacks.forEach(cb => cb(session ? 'SIGNED_IN' : 'SIGNED_OUT', session));
+}
+
+/** SQL bit / 0-1 / true-false tek tip boolean */
+export function sqlTruth(v: unknown): boolean {
+  return v === true || v === 1 || v === '1' || v === 'true';
+}
+
+/** VDS/SQL oturum kaydındaki alanları güncelle (onboarding vb.) */
+export function patchSqlSessionRecord(patch: Record<string, unknown>): void {
+  try {
+    const session = getSqlSession();
+    if (!session) return;
+    session._sqlRecord = { ...(session._sqlRecord || {}), ...patch };
+    localStorage.setItem(SQL_SESSION_KEY, JSON.stringify(session));
+  } catch {
+    /* ignore */
+  }
 }
 
 function buildUserFromRecord(record: any) {
@@ -414,6 +595,20 @@ export const localDb = {
     return new LocalQueryBuilder(table);
   },
 
+  async rpc(fn: string, _params?: Record<string, unknown>) {
+    if (fn === 'get_current_business_date') {
+      const d = new Date().toISOString().slice(0, 10);
+      return {
+        data: [{ business_date: d, mode: 'cutoff', cutoff_hour: 6, last_closed: null, hours_open: null }],
+        error: null,
+      };
+    }
+    if (fn === 'unlock_stale_payment_locks') {
+      return { data: null, error: null };
+    }
+    return { data: null, error: new Error(`RPC ${fn} yerel modda desteklenmiyor`) };
+  },
+
   channel(_name: string) {
     return noopChannel;
   },
@@ -489,11 +684,56 @@ export const sqlDb = {
     return new SqlQueryBuilder(table);
   },
 
+  async rpc(fn: string, params?: Record<string, unknown>) {
+    const session = getSqlSession();
+    const rec = session?._sqlRecord;
+    const merged = {
+      ...(params || {}),
+      p_tenant_id: (params as any)?.p_tenant_id ?? rec?.tenant_id,
+      p_opened_by: (params as any)?.p_opened_by ?? rec?.user_id,
+      p_closed_by: (params as any)?.p_closed_by ?? rec?.user_id,
+    };
+    if (isVdsBackend()) {
+      try {
+        const result = await vdsPost<{ data: any; error?: string }>('/rpc', { fn, params: merged });
+        if (result?.error) return { data: null, error: new Error(result.error) };
+        return { data: result.data ?? null, error: null };
+      } catch (err: any) {
+        return { data: null, error: err };
+      }
+    }
+    const api = eApi();
+    if (!api?.sqlRpc) {
+      return { data: null, error: new Error('SQL RPC desteklenmiyor') };
+    }
+    try {
+      const result = await api.sqlRpc({ fn, params: merged });
+      if (result?.error) return { data: null, error: new Error(result.error) };
+      return { data: result.data ?? null, error: null };
+    } catch (err: any) {
+      return { data: null, error: err };
+    }
+  },
+
   channel(_name: string) {
     return noopChannel;
   },
 
   removeChannel(_ch: any) {},
+
+  functions: {
+    async invoke(name: string, opts?: { body?: Record<string, unknown> }) {
+      try {
+        const result = await vdsPost<any>(`/fn/${encodeURIComponent(name)}`, opts?.body || {});
+        if (result?.error && result.success === false) {
+          return { data: result, error: new Error(String(result.error)) };
+        }
+        return { data: result, error: null };
+      } catch (err: any) {
+        return { data: null, error: err };
+      }
+    },
+  },
 
   auth: {
     async getSession() {
@@ -522,6 +762,45 @@ export const sqlDb = {
     },
 
     async signInWithPassword({ email, password }: { email: string; password: string }) {
+      if (isVdsBackend()) {
+        try {
+          const origin = getVdsApiOrigin();
+          const res = await fetch(vdsApiUrl('/login'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password }),
+            credentials: origin ? 'omit' : 'same-origin',
+          });
+          const result = await res.json().catch(() => null) as { success?: boolean; error?: string; data?: any; token?: string } | null;
+          if (res.status === 502 || res.status === 503) {
+            return {
+              data: null,
+              error: new Error(
+                'Giriş servisi şu an kapalı (VDS API). Bir dakika sonra tekrar deneyin; sorun sürerse sunucuda SefposVdsApiWatchdog görevini kontrol edin.',
+              ),
+            };
+          }
+          if (!result?.success) {
+            return { data: null, error: new Error(result?.error || 'Giriş başarısız') };
+          }
+          const session = buildSessionFromRecord(result.data);
+          if (result.token) session.access_token = result.token;
+          setSqlSession(session);
+          return { data: { session, user: session.user }, error: null };
+        } catch (err: any) {
+          const msg = String(err?.message || err || '');
+          if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+            return {
+              data: null,
+              error: new Error(
+                'Giriş servisine ulaşılamadı. https://sefpos.com.tr adresini kullanın (www SSL sorunlu olabilir) ve sayfayı yenileyip tekrar deneyin.',
+              ),
+            };
+          }
+          return { data: null, error: err };
+        }
+      }
+
       const api = eApi();
       if (!api) return { data: null, error: new Error('Electron API bulunamadi') };
 
@@ -531,6 +810,53 @@ export const sqlDb = {
         const session = buildSessionFromRecord(result.data);
         setSqlSession(session);
         return { data: { session, user: session.user }, error: null };
+      }
+
+      const em = String(email || '').trim().toLowerCase();
+      if (isHybridMode() && isHybridCloudLinked() && !em.endsWith('@shefpos.local')) {
+        let result = await api.sqlLogin({ email: em, password });
+        if (!result.success && typeof navigator !== 'undefined' && navigator.onLine) {
+          result = await api.hybridKasaLogin({ email: em, password });
+        }
+        if (!result.success) {
+          return { data: null, error: new Error(result.error || 'Giris basarisiz') };
+        }
+        const session = buildSessionFromRecord(result.data);
+        setSqlSession(session);
+        return { data: { session, user: session.user }, error: null };
+      }
+
+      /** Bulut e-posta → VDS (Supabase yok). */
+      if (isCloudLoginEmail(em)) {
+        try {
+          localStorage.setItem('dbMode', 'cloud');
+          await api.setDbMode?.('cloud');
+        } catch {
+          /* ignore */
+        }
+        try {
+          const res = await fetch(`${DEFAULT_REMOTE_VDS_ORIGIN}/vds-api/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: em, password }),
+            credentials: 'omit',
+          });
+          const result = (await res.json().catch(() => null)) as {
+            success?: boolean;
+            error?: string;
+            data?: any;
+            token?: string;
+          } | null;
+          if (!result?.success) {
+            return { data: null, error: new Error(result?.error || 'Giriş başarısız') };
+          }
+          const session = buildSessionFromRecord(result.data);
+          if (result.token) session.access_token = result.token;
+          setSqlSession(session);
+          return { data: { session, user: session.user }, error: null };
+        } catch (err: any) {
+          return { data: null, error: err };
+        }
       }
 
       const result = await api.sqlLogin({ email, password });
@@ -543,6 +869,42 @@ export const sqlDb = {
     },
 
     async signUp({ email, password, options }: { email: string; password: string; options?: any }) {
+      if (isVdsBackend()) {
+        try {
+          const fullName = options?.data?.full_name || '';
+          const tenantName = options?.data?.tenant_name || '';
+          const phone = options?.data?.phone || '';
+          const origin = getVdsApiOrigin();
+          const res = await fetch(vdsApiUrl('/register'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              email,
+              password,
+              fullName,
+              tenantName,
+              phone,
+            }),
+            credentials: origin ? 'omit' : 'same-origin',
+          });
+          const result = (await res.json().catch(() => null)) as {
+            success?: boolean;
+            error?: string;
+            data?: any;
+            token?: string;
+          } | null;
+          if (!result?.success) {
+            return { data: null, error: new Error(result?.error || 'Kayıt başarısız') };
+          }
+          const session = buildSessionFromRecord(result.data);
+          if (result.token) session.access_token = result.token;
+          setSqlSession(session);
+          return { data: { session, user: session.user }, error: null };
+        } catch (err: any) {
+          return { data: null, error: err };
+        }
+      }
+
       const api = eApi();
       if (!api) return { data: null, error: new Error('Electron API bulunamadi') };
       const fullName = options?.data?.full_name || '';
@@ -580,6 +942,11 @@ export const sqlDb = {
 
     async signOut() {
       setSqlSession(null);
+    },
+
+    async refreshSession() {
+      const session = getSqlSession();
+      return { data: { session }, error: session ? null : new Error('Oturum yok') };
     },
 
     async getUser() {

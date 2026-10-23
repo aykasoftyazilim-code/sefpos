@@ -1,21 +1,43 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { sqlDb, localDb, isSqlServerMode, isLocalMode } from './sqlDb';
+import { sqlDb, localDb, isSqlServerMode, isLocalMode, isVdsSelfHost, isVdsBackend } from './sqlDb';
+import { isHybridMode } from './hybridMode';
+import { installSupabaseDiagnostics, recordHttpRequest } from './resourceDiagnostics';
+import {
+  purgeSupabaseAuthLocalStorage,
+  sanitizeSupabaseAuthStorageOnBoot,
+} from './authSessionSnap';
 
-const isElectronRuntime = !!(window as any).electronAPI;
-const runtimeDbUrl = localStorage.getItem('shefpos_db_url');
-const runtimeDbAnonKey = localStorage.getItem('shefpos_db_anon_key');
+const isVds = isVdsSelfHost();
+const runtimeDbUrl = isVds ? null : localStorage.getItem('shefpos_db_url');
+const runtimeDbAnonKey = isVds ? null : localStorage.getItem('shefpos_db_anon_key');
 
-const portOverrideUrl =
-  typeof __SEFPOS_DEV_PORT_OVERRIDE_URL__ === 'string' ? __SEFPOS_DEV_PORT_OVERRIDE_URL__.trim() : '';
-const portOverrideAnon =
-  typeof __SEFPOS_DEV_PORT_OVERRIDE_ANON__ === 'string' ? __SEFPOS_DEV_PORT_OVERRIDE_ANON__.trim() : '';
+const portOverrideUrl = isVds
+  ? ''
+  : typeof __SEFPOS_DEV_PORT_OVERRIDE_URL__ === 'string'
+    ? __SEFPOS_DEV_PORT_OVERRIDE_URL__.trim()
+    : '';
+const portOverrideAnon = isVds
+  ? ''
+  : typeof __SEFPOS_DEV_PORT_OVERRIDE_ANON__ === 'string'
+    ? __SEFPOS_DEV_PORT_OVERRIDE_ANON__.trim()
+    : '';
 
-const envUrl = String(import.meta.env.VITE_SUPABASE_URL || '').trim();
-const envAnon = String(import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim();
-const devUrl = typeof __SEFPOS_DEV_SUPABASE_URL__ === 'string' ? __SEFPOS_DEV_SUPABASE_URL__.trim() : '';
-const devAnon = typeof __SEFPOS_DEV_SUPABASE_ANON_KEY__ === 'string' ? __SEFPOS_DEV_SUPABASE_ANON_KEY__.trim() : '';
+const envUrl = isVds ? '' : String(import.meta.env.VITE_SUPABASE_URL || '').trim();
+const envAnon = isVds ? '' : String(import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim();
+const devUrl = isVds
+  ? ''
+  : typeof __SEFPOS_DEV_SUPABASE_URL__ === 'string'
+    ? __SEFPOS_DEV_SUPABASE_URL__.trim()
+    : '';
+const devAnon = isVds
+  ? ''
+  : typeof __SEFPOS_DEV_SUPABASE_ANON_KEY__ === 'string'
+    ? __SEFPOS_DEV_SUPABASE_ANON_KEY__.trim()
+    : '';
 
-const DEFAULT_SUPABASE_URL = 'https://xdfnozfuuzctubijbnds.supabase.co';
+const DEFAULT_SUPABASE_URL = isVds
+  ? (typeof window !== 'undefined' ? window.location.origin : 'http://127.0.0.1')
+  : 'https://xdfnozfuuzctubijbnds.supabase.co';
 /**
  * Publishable anon key — RLS sayesinde "public" sayilir, herhangi bir gizlilik
  * hassasiyeti yok. Production build'de `.env` yoksa (orn. GitHub Actions
@@ -24,7 +46,7 @@ const DEFAULT_SUPABASE_URL = 'https://xdfnozfuuzctubijbnds.supabase.co';
  * ile ayni. Geliştirme/lokal build'lerde .env veya sefpos-dev-port.json
  * onceliklidir; bu sadece son fallback.
  */
-const DEFAULT_SUPABASE_ANON_KEY = 'sb_publishable_wrSHY5Kzkw-bx0XzYM5VFA_FK3BFF_x';
+const DEFAULT_SUPABASE_ANON_KEY = isVds ? 'vds-local' : 'sb_publishable_wrSHY5Kzkw-bx0XzYM5VFA_FK3BFF_x';
 
 const supabaseUrl = portOverrideUrl || envUrl || devUrl || runtimeDbUrl || DEFAULT_SUPABASE_URL;
 const supabaseAnonKey = portOverrideAnon || envAnon || devAnon || runtimeDbAnonKey || DEFAULT_SUPABASE_ANON_KEY;
@@ -53,6 +75,10 @@ const edgeFunctionsBaseUrl = `${String(supabaseUrl).replace(/\/$/, '')}/function
 
 /** Yerel `npm run dev`: tarayıcıdan doğrudan *.supabase.co → CORS / OPTIONS hatası. Vite `/__supabase-functions` proxy aynı origin. */
 function edgeFunctionInvokeUrl(functionName: string): string {
+  if (isVds) {
+    const origin = typeof window !== 'undefined' ? window.location.origin.replace(/\/$/, '') : '';
+    return `${origin}/vds-api/fn/${encodeURIComponent(functionName)}`;
+  }
   if (
     import.meta.env.DEV &&
     typeof window !== 'undefined' &&
@@ -153,7 +179,15 @@ export async function invokeEdgeFunction<T = unknown>(
     'Content-Type': 'application/json',
     apikey: supabaseAnonKey,
   };
-  if (isLegacyJwtAnonKey(supabaseAnonKey)) {
+  if (isVdsSelfHost() && typeof window !== 'undefined') {
+    try {
+      const raw = localStorage.getItem('shefpos_sql_session');
+      const tok = raw ? JSON.parse(raw)?.access_token : null;
+      if (tok) headers.Authorization = `Bearer ${tok}`;
+    } catch {
+      /* ignore */
+    }
+  } else if (isLegacyJwtAnonKey(supabaseAnonKey)) {
     headers.Authorization = `Bearer ${supabaseAnonKey}`;
   }
   const body = JSON.stringify(payload);
@@ -197,23 +231,39 @@ export async function invokeEdgeFunction<T = unknown>(
  * yeniden girişi önlemek için).
  */
 const sefposAuthClientBox: { client: SupabaseClient<Database> | null } = { client: null };
+let invalidRefreshHandled = false;
+let invalidRefreshPurgeInFlight = false;
 
-async function clearInvalidRefreshSessionIfNeeded(href: string, res: Response): Promise<void> {
-  if (!href.includes('/auth/v1/token') || res.status !== 400) return;
+/** AuthContext: gecersiz refresh sonrasi yeniden refresh denemesini atla. */
+export function consumeInvalidRefreshHandled(): boolean {
+  const v = invalidRefreshHandled;
+  invalidRefreshHandled = false;
+  return v;
+}
+
+async function clearInvalidRefreshSessionIfNeeded(href: string, res: Response): Promise<boolean> {
+  if (!href.includes('/auth/v1/token') || res.status !== 400) return false;
   let body = '';
   try {
     body = (await res.clone().text()).toLowerCase();
   } catch {
-    return;
+    return false;
   }
   const invalid =
     body.includes('invalid_refresh_token') ||
     body.includes('invalid refresh token') ||
     body.includes('refresh token not found') ||
     body.includes('refresh_token_not_found');
-  if (!invalid) return;
+  if (!invalid) return false;
+  if (invalidRefreshPurgeInFlight) return true;
+  invalidRefreshPurgeInFlight = true;
+  invalidRefreshHandled = true;
+  purgeSupabaseAuthLocalStorage();
   const client = sefposAuthClientBox.client;
-  if (!client) return;
+  if (!client) {
+    invalidRefreshPurgeInFlight = false;
+    return true;
+  }
   queueMicrotask(() => {
     void (async () => {
       try {
@@ -224,9 +274,16 @@ async function clearInvalidRefreshSessionIfNeeded(href: string, res: Response): 
         } catch {
           /* ignore */
         }
+      } finally {
+        invalidRefreshPurgeInFlight = false;
       }
     })();
   });
+  return true;
+}
+
+if (typeof window !== 'undefined') {
+  sanitizeSupabaseAuthStorageOnBoot();
 }
 
 const realSupabase = createClient(supabaseUrl, supabaseAnonKey, {
@@ -236,7 +293,8 @@ const realSupabase = createClient(supabaseUrl, supabaseAnonKey, {
   },
   global: {
     fetch: (input, init) => {
-      if (isSqlServerMode() || isLocalMode()) {
+      // SQL/yerel modda POS proxy; hibrit modda bulut auth/sync icin ag acik kalir.
+      if (isLocalMode() || (isSqlServerMode() && !isHybridMode())) {
         return Promise.resolve(new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } }));
       }
       const href = sefposRequestHref(input);
@@ -268,6 +326,7 @@ const realSupabase = createClient(supabaseUrl, supabaseAnonKey, {
       const isAuth = href.includes('/auth/v1/');
       const isAuthToken = href.includes('/auth/v1/token');
       const isRealtime = href.includes('/realtime/');
+      if (!isRealtime) recordHttpRequest(href, method);
       const fetchOptions: RequestInit = init ? { ...(init as RequestInit) } : {};
 
       // Auth: refresh_token (`/auth/v1/token`) yarım kesilirse istemci bazen oturumu
@@ -320,8 +379,8 @@ const realSupabase = createClient(supabaseUrl, supabaseAnonKey, {
           });
       }
       return nativeFetch(input as RequestInfo, init as RequestInit | undefined).then(async (res) => {
-        await clearInvalidRefreshSessionIfNeeded(href, res);
-        if (import.meta.env.DEV && href.includes('/auth/v1/') && !res.ok) {
+        const authCleared = await clearInvalidRefreshSessionIfNeeded(href, res);
+        if (import.meta.env.DEV && href.includes('/auth/v1/') && !res.ok && !authCleared) {
           try {
             const snippet = (await res.clone().text()).slice(0, 900);
             const log = res.status >= 500 ? console.error : console.warn;
@@ -345,13 +404,50 @@ const realSupabase = createClient(supabaseUrl, supabaseAnonKey, {
 
 sefposAuthClientBox.client = realSupabase;
 
+/** SQL proxy disinda gercek bulut oturumu (mod degisimi sonrasi). */
+export function getRealSupabaseClient(): SupabaseClient<Database> {
+  if (isVdsBackend()) return supabase;
+  return realSupabase;
+}
+
+/** Giriş ekranı / bulut auth — SQL proxy'den bağımsız (telefon→e-posta lookup). */
+export function getLoginLookupSupabase(): SupabaseClient<Database> {
+  if (isVdsBackend() || isSqlServerMode()) return sqlDb as unknown as SupabaseClient<Database>;
+  return realSupabase;
+}
+
+/** Hibrit kurulum / bulut baglantisi — SQL proxy fetch'inden bagimsiz, her zaman gercek ag. */
+let cloudOnlySupabase: SupabaseClient<Database> | null = null;
+export function getCloudSupabaseClient(): SupabaseClient<Database> {
+  // Üretim backend = VDS; eski Supabase istemcisi yalnızca legacy/dev için kalır
+  if (isVdsBackend()) return supabase;
+  if (!cloudOnlySupabase) {
+    cloudOnlySupabase = createClient<Database>(supabaseUrl, supabaseAnonKey, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false,
+      },
+      global: {
+        fetch: (input, init) => nativeFetch(input as RequestInfo, init as RequestInit | undefined),
+      },
+    });
+  }
+  return cloudOnlySupabase;
+}
+
+if (typeof window !== 'undefined') {
+  installSupabaseDiagnostics(realSupabase);
+}
+
 export const supabase: SupabaseClient<Database> = new Proxy({} as SupabaseClient<Database>, {
   get(_target, prop) {
+    // VDS (self-host veya uzak API): sqlDb — Supabase kullanılmaz
+    if (isVdsBackend() || isSqlServerMode()) {
+      return (sqlDb as any)[prop];
+    }
     if (isLocalMode()) {
       return (localDb as any)[prop];
-    }
-    if (isSqlServerMode()) {
-      return (sqlDb as any)[prop];
     }
     return (realSupabase as any)[prop];
   },
@@ -382,6 +478,7 @@ export type Database = {
           ip_lock_enabled: boolean | null;
           deployment_mode: string | null;
           disabled_modules: string[] | null;
+          currency_code: string;
         };
         Insert: {
           id?: string;
@@ -418,6 +515,7 @@ export type Database = {
           printer_settings?: any;
           require_cancel_reason?: boolean | null;
           lock_pin?: string | null;
+          currency_code?: string;
         };
       };
       profiles: {
@@ -518,6 +616,7 @@ export type Database = {
           name: string;
           prefix: string | null;
           color: string;
+          branch_id: string | null;
           created_at: string;
         };
         Insert: {
@@ -526,6 +625,7 @@ export type Database = {
           name: string;
           prefix?: string | null;
           color?: string;
+          branch_id?: string | null;
           created_at?: string;
         };
         Update: {
@@ -534,6 +634,7 @@ export type Database = {
           name?: string;
           prefix?: string | null;
           color?: string;
+          branch_id?: string | null;
           created_at?: string;
         };
       };

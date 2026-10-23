@@ -4,6 +4,7 @@ import { supabase, invokeEdgeFunction } from '../lib/supabase';
 import { normalizeTurkishMobileDigits, pinToAuthPassword } from '../lib/phoneAuthEmail';
 import { resolveLoginIdentifier } from '../lib/panelUserLoginResolve';
 import { isCapacitorNative } from '../lib/capacitorPlatform';
+import { isSqlServerMode } from '../lib/sqlDb';
 import { Bike, Lock, Building2, Phone, ArrowRight, Sparkles, ChefHat, User, Mail, ShieldCheck, BarChart3, Wifi, Smartphone, Printer, CreditCard } from 'lucide-react';
 import { isAykaAdminPath, AYKA_ADMIN_PATH } from '../lib/aykaRoute';
 import { WaiterLogin } from './WaiterLogin';
@@ -26,6 +27,15 @@ const TEST_LOGIN_EMAIL = 'info@sefpos.com.tr';
 const TEST_LOGIN_PHONE = '02363131818';
 const ADMIN_DEFAULT_PASSWORD = '2128948++';
 const AYKA_AUTH_KEY = 'shefpos_ayka_auth';
+
+const FEATURE_ICON_GRADIENTS = [
+  'from-orange-500 to-red-500',
+  'from-violet-500 to-fuchsia-500',
+  'from-emerald-500 to-teal-500',
+  'from-blue-500 to-indigo-500',
+  'from-amber-500 to-orange-600',
+  'from-sky-500 to-cyan-500',
+] as const;
 
 const formatPhone = (value: string) => {
   const digits = value.replace(/\D/g, '').slice(0, 11);
@@ -69,6 +79,12 @@ export function Auth({ onBackToLanding }: AuthProps = {}) {
   const [otpCode, setOtpCode] = useState('');
   const [otpPhone, setOtpPhone] = useState('');
   const [otpToken, setOtpToken] = useState('');
+  const [showForgot, setShowForgot] = useState(false);
+  const [forgotPhone, setForgotPhone] = useState('');
+  const [forgotOtp, setForgotOtp] = useState('');
+  const [forgotOtpToken, setForgotOtpToken] = useState('');
+  const [forgotStep, setForgotStep] = useState<'phone' | 'otp' | 'done'>('phone');
+  const [forgotLoading, setForgotLoading] = useState(false);
   const [registerErrors, setRegisterErrors] = useState<Partial<Record<RegisterFieldKey, string>>>({});
   /** 1 = yalnızca cep + SMS; 2 = firma, ad soyad, e-posta, şifre */
   const [registerWizardStep, setRegisterWizardStep] = useState<1 | 2>(1);
@@ -144,6 +160,77 @@ export function Auth({ onBackToLanding }: AuthProps = {}) {
       setError(err?.message || 'SMS doğrulama kodu gönderilemedi');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const resetForgotFlow = () => {
+    setShowForgot(false);
+    setForgotPhone('');
+    setForgotOtp('');
+    setForgotOtpToken('');
+    setForgotStep('phone');
+    setForgotLoading(false);
+  };
+
+  const sendForgotOtp = async () => {
+    setError('');
+    setInfo('');
+    const norm = normalizeTurkishMobileDigits(forgotPhone.replace(/\D/g, ''));
+    if (norm.length !== 10 || !norm.startsWith('5')) {
+      setError('Kayıtlı cep telefonunuzu girin (05XXXXXXXXX)');
+      return;
+    }
+    setForgotLoading(true);
+    try {
+      const data = await invokeEdgeFunction<{ success: boolean; otpToken?: string; error?: string }>('send-sms-otp', {
+        phone: norm,
+        purpose: 'reset',
+      });
+      if (!data?.success || !data?.otpToken) {
+        throw new Error(data?.error || 'SMS gönderilemedi');
+      }
+      setForgotPhone(norm);
+      setForgotOtpToken(data.otpToken);
+      setForgotStep('otp');
+      setInfo('Doğrulama kodu SMS ile gönderildi.');
+    } catch (err: any) {
+      setError(err?.message || 'SMS gönderilemedi');
+    } finally {
+      setForgotLoading(false);
+    }
+  };
+
+  const confirmForgotReset = async () => {
+    setError('');
+    setInfo('');
+    const code = forgotOtp.replace(/\D/g, '');
+    if (code.length < 4) {
+      setError('SMS kodunu girin');
+      return;
+    }
+    setForgotLoading(true);
+    try {
+      const data = await invokeEdgeFunction<{
+        success?: boolean;
+        error?: string;
+        message?: string;
+        masked_phone?: string;
+      }>('reset-password-sms', {
+        phone: forgotPhone,
+        code,
+        otpToken: forgotOtpToken,
+        purpose: 'reset',
+      });
+      if (!data?.success) {
+        throw new Error(data?.error || 'Şifre yenilenemedi');
+      }
+      setForgotStep('done');
+      setInfo(data.message || 'Yeni şifreniz SMS ile gönderildi. Giriş yapabilirsiniz.');
+      setPassword('');
+    } catch (err: any) {
+      setError(err?.message || 'Şifre yenilenemedi');
+    } finally {
+      setForgotLoading(false);
     }
   };
 
@@ -277,8 +364,16 @@ export function Auth({ onBackToLanding }: AuthProps = {}) {
           }
 
           if (trimmed === ADMIN_LOGIN_EMAIL || trimmed === ADMIN_LOGIN_EMAIL_LEGACY || trimmed === TEST_LOGIN_EMAIL) {
-            const { data: authData } = await supabase.auth.getUser();
-            const uid = authData?.user?.id;
+            // VDS/SQL modunda GoTrue kapalı olduğu için `getUser()` fetch patlatabiliyor.
+            // SQL/VDS'te bunun yerine `getSession()` üzerinden user id alınır.
+            let uid: string | null = null;
+            if (isSqlServerMode()) {
+              const { data: sessionData } = await supabase.auth.getSession();
+              uid = sessionData?.session?.user?.id ?? null;
+            } else {
+              const { data: authData } = await supabase.auth.getUser();
+              uid = authData?.user?.id ?? null;
+            }
             let promoteError: any = null;
             if (uid) {
               const res = await supabase
@@ -445,10 +540,21 @@ export function Auth({ onBackToLanding }: AuthProps = {}) {
         } catch {
           /* ignore */
         }
-        await invokeEdgeFunction('send-sms-welcome', { phone: registerNorm });
+        try {
+          await invokeEdgeFunction('send-sms-welcome', { phone: registerNorm });
+        } catch {
+          /* welcome SMS ikincil — kaydı bozma */
+        }
         if (remember) {
           localStorage.setItem(REMEMBER_KEY, loginValue);
           localStorage.setItem(REMEMBER_PASSWORD_KEY, password);
+        }
+        setInfo('Hesabınız oluşturuldu. Yönlendiriliyorsunuz…');
+        // VDS oturum localStorage'a yazıldı; sayfayı yenile ki AuthContext oturumu alsın
+        if (import.meta.env.VITE_VDS_SELFHOST === 'true') {
+          window.setTimeout(() => {
+            window.location.assign('/');
+          }, 400);
         }
       }
     } catch (err: any) {
@@ -508,7 +614,7 @@ export function Auth({ onBackToLanding }: AuthProps = {}) {
     return (
       <WaiterLogin
         onLoginSuccess={() => {
-          window.location.href = '/';
+          window.location.href = '/?waiter=1';
         }}
         onBack={() => setAuthMode('main')}
       />
@@ -601,34 +707,117 @@ export function Auth({ onBackToLanding }: AuthProps = {}) {
                   />
                 </div>
 
-                <div className="flex items-center gap-3 pt-1">
-                  <button
-                    type="button"
-                    onClick={() => setRemember((r) => !r)}
-                    className={`w-5 h-5 rounded border flex items-center justify-center transition shrink-0 ${
-                      remember ? 'border-orange-500 bg-orange-500' : 'border-slate-600 bg-slate-800'
-                    }`}
-                  >
-                    {remember && (
-                      <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 12 12">
-                        <path
-                          d="M2 6l3 3 5-5"
-                          stroke="currentColor"
-                          strokeWidth="2"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        />
-                      </svg>
-                    )}
-                  </button>
-                  <label onClick={() => setRemember((r) => !r)} className="text-sm text-slate-400 select-none cursor-pointer hover:text-slate-300 transition-colors">
-                    Beni hatırla
-                  </label>
+                <div className="flex items-center justify-between gap-3 pt-1">
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setRemember((r) => !r)}
+                      className={`w-5 h-5 rounded border flex items-center justify-center transition shrink-0 ${
+                        remember ? 'border-orange-500 bg-orange-500' : 'border-slate-600 bg-slate-800'
+                      }`}
+                    >
+                      {remember && (
+                        <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 12 12">
+                          <path
+                            d="M2 6l3 3 5-5"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                        </svg>
+                      )}
+                    </button>
+                    <label onClick={() => setRemember((r) => !r)} className="text-sm text-slate-400 select-none cursor-pointer hover:text-slate-300 transition-colors">
+                      Beni hatırla
+                    </label>
+                  </div>
+                  {!isAykaPath && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowForgot(true);
+                        setForgotStep('phone');
+                        setError('');
+                        setInfo('');
+                        const digits = loginValue.replace(/\D/g, '');
+                        if (digits.length >= 10) setForgotPhone(formatPhone(digits.slice(-11)));
+                      }}
+                      className="text-xs font-semibold text-orange-400 hover:text-orange-300 transition-colors"
+                    >
+                      Parolamı unuttum
+                    </button>
+                  )}
                 </div>
+
+                {showForgot && !isAykaPath && (
+                  <div className="rounded-xl border border-orange-500/30 bg-orange-500/5 p-3 space-y-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-sm font-semibold text-orange-200">Şifre yenile (SMS)</p>
+                      <button type="button" onClick={resetForgotFlow} className="text-xs text-slate-400 hover:text-white">
+                        Kapat
+                      </button>
+                    </div>
+                    {forgotStep === 'phone' && (
+                      <>
+                        <p className="text-[11px] text-slate-400">
+                          Kayıtlı cep telefonunuza doğrulama kodu gönderilir; yeni şifre SMS ile gelir.
+                        </p>
+                        <input
+                          type="text"
+                          value={forgotPhone}
+                          onChange={(e) => setForgotPhone(formatPhone(e.target.value))}
+                          placeholder="05XX XXX XX XX"
+                          className="w-full px-3 py-2.5 bg-slate-800/50 border border-slate-700 rounded-lg outline-none text-white text-sm focus:border-orange-500"
+                        />
+                        <button
+                          type="button"
+                          disabled={forgotLoading}
+                          onClick={() => void sendForgotOtp()}
+                          className="w-full py-2.5 rounded-lg bg-orange-600 hover:bg-orange-500 text-white text-sm font-bold disabled:opacity-50"
+                        >
+                          {forgotLoading ? 'Gönderiliyor…' : 'SMS kodu gönder'}
+                        </button>
+                      </>
+                    )}
+                    {forgotStep === 'otp' && (
+                      <>
+                        <p className="text-[11px] text-slate-400">SMS ile gelen 6 haneli kodu girin.</p>
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          value={forgotOtp}
+                          onChange={(e) => setForgotOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                          placeholder="Kod"
+                          className="w-full px-3 py-2.5 bg-slate-800/50 border border-slate-700 rounded-lg outline-none text-white text-sm tracking-widest focus:border-orange-500"
+                        />
+                        <button
+                          type="button"
+                          disabled={forgotLoading}
+                          onClick={() => void confirmForgotReset()}
+                          className="w-full py-2.5 rounded-lg bg-orange-600 hover:bg-orange-500 text-white text-sm font-bold disabled:opacity-50"
+                        >
+                          {forgotLoading ? 'Yenileniyor…' : 'Şifreyi SMS ile gönder'}
+                        </button>
+                      </>
+                    )}
+                    {forgotStep === 'done' && (
+                      <p className="text-sm text-emerald-300">
+                        Yeni şifreniz SMS ile gönderildi. Yukarıdan giriş yapabilirsiniz.
+                      </p>
+                    )}
+                  </div>
+                )}
 
                 {error && !isSuspended && (
                   <div className="bg-red-500/10 border border-red-500/30 text-red-400 px-4 py-3 rounded-lg text-sm">
                     {error}
+                  </div>
+                )}
+
+                {info && isLogin && (
+                  <div className="bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 px-4 py-3 rounded-lg text-sm">
+                    {info}
                   </div>
                 )}
 
@@ -745,7 +934,9 @@ export function Auth({ onBackToLanding }: AuthProps = {}) {
                       className="bg-slate-800/40 border border-slate-700/60 rounded-lg p-2.5 hover:bg-slate-800/60 hover:border-orange-500/40 transition-all"
                     >
                       <div className="flex items-center gap-2 mb-0.5">
-                        <div className="w-6 h-6 rounded-md bg-gradient-to-br from-orange-500 to-red-500 flex items-center justify-center shrink-0">
+                        <div
+                          className={`w-6 h-6 rounded-md bg-gradient-to-br ${FEATURE_ICON_GRADIENTS[i % FEATURE_ICON_GRADIENTS.length]} flex items-center justify-center shrink-0`}
+                        >
                           <f.icon className="w-3.5 h-3.5 text-white" />
                         </div>
                         <h4 className="text-[12px] font-semibold text-white truncate">{f.title}</h4>

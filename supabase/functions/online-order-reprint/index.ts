@@ -26,6 +26,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.57.4";
 import {
+  buildGetirReceiptInput,
   renderDHOrderReceiptHtml,
   type DHReceiptOrderInput,
 } from "../_shared/dhOrderReceipt.ts";
@@ -67,9 +68,16 @@ interface OnlineOrderRow {
   rider_pickup_time: string | null;
   dh_raw_payload: any;
   getir_verification_code: string | null;
+  getir_masked_phone: string | null;
   getir_courier_name: string | null;
   getir_courier_phone: string | null;
   getir_status_code: number | null;
+  getir_delivery_type: number | null;
+  getir_is_scheduled: boolean | null;
+  getir_scheduled_at: string | null;
+  getir_total_discount: number | null;
+  getir_supplier_support_rate: number | null;
+  getir_raw_payload: Record<string, unknown> | null;
 }
 
 interface PlatformRow {
@@ -161,50 +169,11 @@ function buildDHReceiptFromDB(
 }
 
 function buildGetirReceiptFromDB(
-  platform: PlatformRow,
+  _platform: PlatformRow,
   order: OnlineOrderRow,
   items: OrderItemRow[],
 ): DHReceiptOrderInput {
-  return {
-    platformLabel: "GETİR YEMEK",
-    orderCode: order.platform_order_number || order.platform_order_id || order.id.slice(0, 8),
-    orderToken: null,
-    createdAt: order.platform_created_at || order.created_at,
-    expeditionType: "delivery",
-    isPaid: true,
-    paymentType: order.payment_type || "Getir",
-    customer: {
-      fullName: order.customer_name || "Müşteri",
-      mobilePhone: order.customer_phone,
-    },
-    delivery: order.customer_address
-      ? {
-          address: { street: order.customer_address },
-          expectedDeliveryTime: order.estimated_delivery_time,
-          expressDelivery: false,
-          riderPickupTime: order.rider_pickup_time,
-        }
-      : null,
-    pickup: null,
-    customerComment: order.customer_notes,
-    vendorComment: order.getir_verification_code
-      ? `Doğrulama: ${order.getir_verification_code}`
-      : null,
-    products: items.map((it) => ({
-      name: it.platform_product_name || "Ürün",
-      quantity: it.quantity,
-      unitPrice: it.unit_price,
-      paidPrice: it.total_amount,
-      comment: it.notes,
-    })),
-    totals: {
-      grandTotal: Number(order.total_amount) || 0,
-      subTotal: Number(order.subtotal) || undefined,
-      vatTotal: Number(order.tax_amount) || undefined,
-      deliveryFee: Number(order.delivery_fee) || undefined,
-      discountTotal: Number(order.discount_amount) || undefined,
-    },
-  };
+  return buildGetirReceiptInput(order, items);
 }
 
 Deno.serve(async (req: Request) => {
@@ -258,8 +227,10 @@ Deno.serve(async (req: Request) => {
         expedition_type, payment_status, payment_type,
         subtotal, delivery_fee, tax_amount, discount_amount, total_amount,
         created_at, platform_created_at, estimated_delivery_time, rider_pickup_time,
-        dh_raw_payload, getir_verification_code, getir_courier_name, getir_courier_phone,
-        getir_status_code
+        dh_raw_payload, getir_verification_code, getir_masked_phone,
+        getir_courier_name, getir_courier_phone, getir_status_code,
+        getir_delivery_type, getir_is_scheduled, getir_scheduled_at, getir_total_discount, getir_supplier_support_rate,
+        getir_raw_payload
       `)
       .eq("id", onlineOrderId)
       .eq("tenant_id", profile.tenant_id)
@@ -293,6 +264,11 @@ Deno.serve(async (req: Request) => {
       : buildDHReceiptFromDB(pf as PlatformRow, order as OnlineOrderRow, itemRows);
 
     const html = renderDHOrderReceiptHtml(receiptInput);
+    const directPrint = body?.directPrint === true;
+
+    if (directPrint) {
+      return jsonResponse({ ok: true, html, platform: pf.platform_code });
+    }
 
     const { data: job, error: jobError } = await admin
       .from("print_jobs")
@@ -310,7 +286,7 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ ok: false, error: "queue failed", details: jobError.message }, 500);
     }
 
-    return jsonResponse({ ok: true, jobId: job.id, platform: pf.platform_code });
+    return jsonResponse({ ok: true, jobId: job.id, html, platform: pf.platform_code });
   } catch (err: any) {
     console.error("[online-order-reprint] error:", err);
     return jsonResponse({ ok: false, error: "internal", details: String(err?.message || err) }, 500);

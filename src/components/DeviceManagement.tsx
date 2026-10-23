@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { supabase } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
+import { revokeWaiterAuthSessions } from '../lib/waiterRevoke';
 import { getDeviceBindingCode } from '../lib/deviceBinding';
 import { Trash2, RefreshCw, ShieldAlert, Smartphone, MapPin, Clock, ToggleRight, ToggleLeft, Plus, Key } from 'lucide-react';
 
@@ -460,6 +461,16 @@ export function DeviceManagement() {
 
           if (!activeForWaiter || activeForWaiter.length === 0) {
             await syncLegacyWaiterStatus(binding.waiter_id, 'inactive');
+            const { data: wAuth } = await supabase
+              .from('waiters')
+              .select('auth_user_id')
+              .eq('id', binding.waiter_id)
+              .maybeSingle();
+            const authUid = (wAuth as { auth_user_id?: string } | null)?.auth_user_id;
+            if (authUid) {
+              await supabase.from('profiles').update({ is_active: false }).eq('id', authUid);
+              await revokeWaiterAuthSessions(authUid);
+            }
           }
         }
       }
@@ -480,10 +491,23 @@ export function DeviceManagement() {
   }, [tenant]);
 
   useEffect(() => {
-    if (activeTab === 'requests') {
-      const interval = setInterval(loadRequests, 3000);
-      return () => clearInterval(interval);
-    }
+    if (activeTab !== 'requests') return;
+    let stopped = false;
+    const tick = () => {
+      if (stopped || document.visibilityState !== 'visible') return;
+      void loadRequests();
+    };
+    tick();
+    const interval = setInterval(tick, 10_000);
+    const onVis = () => {
+      if (document.visibilityState === 'visible') tick();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      stopped = true;
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVis);
+    };
   }, [activeTab, tenant]);
 
   const toggleDeviceStatus = async (deviceId: string, currentStatus: boolean) => {

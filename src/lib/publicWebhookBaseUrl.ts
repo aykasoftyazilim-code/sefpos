@@ -1,36 +1,31 @@
 /**
- * Partnerlere verilen Edge (webhook) URL'lerinin tabanı.
- * Cloudflare Pages'te `functions/api/supabase-fn` proxy kullanıyorsanız build ortamında:
- *   VITE_PUBLIC_SUPABASE_FN_PROXY_BASE_URL=https://www.sefpos.com.tr/api
- * Boşsa doğrudan Supabase proje URL'si + /functions/v1 kullanılır.
+ * Partnerlere verilen webhook URL tabanı.
+ * VDS: aynı origin /vds-api/fn
  */
-const PRIMARY_SUPABASE = 'https://xdfnozfuuzctubijbnds.supabase.co';
-
-/** Kurumsal www üzerinden Edge proxy (Cloudflare Pages `functions/api/`). */
-const WWW_WEBHOOK_PROXY_BASE = 'https://www.sefpos.com.tr/api';
-
 export function getPublicEdgeFunctionsBaseUrl(): string {
+  if (import.meta.env.VITE_VDS_SELFHOST === 'true' && typeof window !== 'undefined') {
+    return `${window.location.origin.replace(/\/$/, '')}/vds-api/fn`;
+  }
   const proxy = (import.meta.env.VITE_PUBLIC_SUPABASE_FN_PROXY_BASE_URL as string | undefined)?.trim().replace(/\/$/, '');
   if (proxy) return proxy;
 
   if (typeof window !== 'undefined') {
     const host = window.location.hostname.toLowerCase();
     if (host === 'www.sefpos.com.tr' || host === 'sefpos.com.tr') {
-      return `${window.location.origin}/api`;
+      return `${window.location.origin}/vds-api/fn`;
     }
   }
 
-  const base = (import.meta.env.VITE_SUPABASE_URL || PRIMARY_SUPABASE).replace(/\/$/, '');
-  return `${base}/functions/v1`;
+  if (typeof window !== 'undefined') {
+    return `${window.location.origin.replace(/\/$/, '')}/vds-api/fn`;
+  }
+  return '/vds-api/fn';
 }
 
-/** Getir / Yemeksepeti panelinde gösterilecek kurumsal taban (build + www runtime). */
 export function getPartnerWebhookBaseUrl(): string {
-  const fromEnv = (import.meta.env.VITE_PUBLIC_SUPABASE_FN_PROXY_BASE_URL as string | undefined)?.trim().replace(/\/$/, '');
-  return fromEnv || WWW_WEBHOOK_PROXY_BASE;
+  return getPublicEdgeFunctionsBaseUrl();
 }
 
-/** Örn: `getir-webhook?type=new` veya `yemeksepeti-webhook/abc123` */
 export function publicPartnerEdgeUrl(pathAndQuery: string): string {
   const base = getPartnerWebhookBaseUrl();
   const p = pathAndQuery.startsWith('/') ? pathAndQuery.slice(1) : pathAndQuery;

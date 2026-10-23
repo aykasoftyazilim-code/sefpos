@@ -1,15 +1,18 @@
 import { useEffect, useRef, useState } from 'react';
 import { Bell, X, CheckCircle2, ChevronRight } from 'lucide-react';
 import { supabase } from '../lib/supabase';
+import { subscribeOnlineOrdersRealtime } from '../lib/onlineOrdersRealtimeHub';
 import { useAuth } from '../contexts/AuthContext';
 import {
+  isAudioUnlocked,
+  notificationSound,
   startContinuousAlert,
   stopContinuousAlert,
-  unlockAudio,
 } from '../lib/notification';
-import { isSqlServerMode } from '../lib/sqlDb';
 import { PlatformLogo } from './PlatformLogo';
 import { callGetir } from '../lib/getirApi';
+import { GETIR_ORDERS_POLLED_EVENT } from './GlobalGetirSync';
+import { wantsGlobalOnlineOrderAlerts, wantsOnlineOrderToastPoll } from '../lib/pageActivity';
 
 interface ToastOrderItem {
   name: string;
@@ -57,6 +60,7 @@ export function OnlineOrderToast({ onOpenOnlineOrders, currentPage }: Props) {
   const [toasts, setToasts] = useState<ToastOrder[]>([]);
   const [busyId, setBusyId] = useState<string | null>(null);
   const seenIds = useRef<Set<string>>(new Set());
+  const SEEN_TOAST_IDS_CAP = 500;
   const platformCache = useRef<Map<string, { code: string; name: string }>>(new Map());
 
   useEffect(() => {
@@ -67,7 +71,8 @@ export function OnlineOrderToast({ onOpenOnlineOrders, currentPage }: Props) {
 
   useEffect(() => {
     if (!tenant) return;
-    if (isSqlServerMode()) return;
+    if (currentPage === 'online-orders') return;
+    if (!wantsGlobalOnlineOrderAlerts()) return;
 
     const fetchPlatform = async (
       platformId: string | null,
@@ -117,58 +122,100 @@ export function OnlineOrderToast({ onOpenOnlineOrders, currentPage }: Props) {
       return fetchItemsOnce(orderId);
     };
 
-    const channel = supabase
-      .channel(`global-online-orders-${tenant.id}`)
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'online_orders',
-          filter: `tenant_id=eq.${tenant.id}`,
-        },
-        async (payload) => {
-          const row: any = payload.new;
-          if (!row?.id) return;
-          if (seenIds.current.has(row.id)) return;
-          seenIds.current.add(row.id);
-          if (!NEWISH_STATUSES.has(row.status)) return;
+    const pushToastFromRow = async (row: {
+      id: string;
+      customer_name?: string | null;
+      total_amount?: number | null;
+      platform_id?: string | null;
+      platform_order_id?: string | null;
+      platform_order_number?: string | null;
+      status?: string;
+      getir_is_scheduled?: boolean | null;
+      created_at?: string;
+    }) => {
+      if (!row?.id || seenIds.current.has(row.id)) return;
+      if (!NEWISH_STATUSES.has(row.status || '')) return;
+      seenIds.current.add(row.id);
+      if (seenIds.current.size > SEEN_TOAST_IDS_CAP) {
+        let drop = seenIds.current.size - SEEN_TOAST_IDS_CAP;
+        for (const id of seenIds.current) {
+          seenIds.current.delete(id);
+          if (--drop <= 0) break;
+        }
+      }
 
-          const [plat, items] = await Promise.all([
-            fetchPlatform(row.platform_id),
-            fetchItems(row.id),
-          ]);
-          unlockAudio();
-          startContinuousAlert(row.id, plat.name);
+      const [plat, items] = await Promise.all([
+        fetchPlatform(row.platform_id ?? null),
+        fetchItems(row.id),
+      ]);
+      if (isAudioUnlocked()) {
+        startContinuousAlert(row.id, plat.name);
+      } else {
+        void notificationSound.play();
+      }
 
-          setToasts((prev) => {
-            if (prev.some((t) => t.id === row.id)) return prev;
-            return [
-              ...prev,
-              {
-                id: row.id,
-                customer_name: row.customer_name || 'Müşteri',
-                total_amount: Number(row.total_amount || 0),
-                platform_id: row.platform_id || null,
-                platform_name: plat.name,
-                platform_code: plat.code,
-                platform_order_id: row.platform_order_id || null,
-                platform_order_number: row.platform_order_number || null,
-                status: row.status,
-                is_scheduled: !!row.getir_is_scheduled || row.status === 'scheduled_new',
-                items,
-                created_at: row.created_at,
-              },
-            ];
-          });
-        },
-      )
-      .subscribe();
+      setToasts((prev) => {
+        if (prev.some((t) => t.id === row.id)) return prev;
+        return [
+          ...prev,
+          {
+            id: row.id,
+            customer_name: row.customer_name || 'Müşteri',
+            total_amount: Number(row.total_amount || 0),
+            platform_id: row.platform_id || null,
+            platform_name: plat.name,
+            platform_code: plat.code,
+            platform_order_id: row.platform_order_id || null,
+            platform_order_number: row.platform_order_number || null,
+            status: row.status || 'new',
+            is_scheduled: !!row.getir_is_scheduled || row.status === 'scheduled_new',
+            items,
+            created_at: row.created_at || new Date().toISOString(),
+          },
+        ];
+      });
+    };
+
+    const unsubRealtime = subscribeOnlineOrdersRealtime(tenant.id, async (evt) => {
+      if (evt.eventType === 'INSERT') {
+        await pushToastFromRow(evt.new);
+        return;
+      }
+      const row = evt.new;
+      const old = evt.old;
+      if (!row?.id) return;
+      if (old?.status && NEWISH_STATUSES.has(String(old.status))) return;
+      await pushToastFromRow(row);
+    });
+
+    const onPolled = async () => {
+      if (!wantsOnlineOrderToastPoll()) return;
+      try {
+        const since = new Date(Date.now() - 3 * 60 * 1000).toISOString();
+        const { data: rows } = await supabase
+          .from('online_orders')
+          .select(
+            'id, customer_name, total_amount, platform_id, platform_order_id, platform_order_number, status, getir_is_scheduled, created_at',
+          )
+          .eq('tenant_id', tenant.id)
+          .in('status', ['new', 'scheduled_new'])
+          .gte('created_at', since)
+          .order('created_at', { ascending: false })
+          .limit(6);
+        for (const row of rows || []) {
+          await pushToastFromRow(row as any);
+        }
+      } catch (e) {
+        console.warn('[OnlineOrderToast] poll yedek:', e);
+      }
+    };
+    window.addEventListener(GETIR_ORDERS_POLLED_EVENT, onPolled);
 
     return () => {
-      supabase.removeChannel(channel);
+      unsubRealtime();
+      window.removeEventListener(GETIR_ORDERS_POLLED_EVENT, onPolled);
     };
-  }, [tenant]);
+  }, [tenant, currentPage]);
 
   if (currentPage === 'online-orders') return null;
   if (toasts.length === 0) return null;
@@ -222,7 +269,7 @@ export function OnlineOrderToast({ onOpenOnlineOrders, currentPage }: Props) {
   };
 
   return (
-    <div className="fixed bottom-4 right-4 z-[400] flex flex-col gap-3 pointer-events-none max-w-[92vw]">
+    <div className="fixed bottom-4 right-4 z-[500] flex flex-col gap-3 pointer-events-none max-w-[92vw]">
       {toasts.map((t) => {
         const visibleItems = t.items.slice(0, 6);
         const restCount = Math.max(0, t.items.length - visibleItems.length);

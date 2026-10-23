@@ -5,8 +5,12 @@ import {
   RefreshCw, AlertCircle, UserPlus, Check
 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
+import { createCustomerQuick, invalidateCustomersListCache } from '../lib/customersApi';
 import { useAuth } from '../contexts/AuthContext';
 import { loadPrintSettings, PRINT_SETTINGS_REMOTE_UPDATED_EVENT, PRINT_SETTINGS_CONTEXT_EVENT } from '../lib/printService';
+import { HuginPaymentGate, type HuginPaymentGateProps } from './HuginPaymentGate';
+import { LoyaltyPaymentSection, type LoyaltyPaymentSelection } from './loyalty/LoyaltyPaymentSection';
+import { useCurrency } from '../lib/currency';
 
 interface PickerCustomer {
   id: string;
@@ -29,6 +33,13 @@ interface PaymentModalProps {
   onPayment: (method: 'cash' | 'credit_card' | 'open_account', amount: number, printReceipt: boolean, customerId?: string) => Promise<void> | void;
   onClose: () => void;
   loading: boolean;
+  /** Yazarkasa beklerken modal kapanmasın */
+  disableDismiss?: boolean;
+  huginGate?: HuginPaymentGateProps | null;
+  loyaltyEnabled?: boolean;
+  loyaltyBillBase?: number;
+  loyaltyPayment?: LoyaltyPaymentSelection | null;
+  onLoyaltyChange?: (v: LoyaltyPaymentSelection | null) => void;
 }
 
 const METHOD_LABELS: Record<PaymentSplit['method'], string> = {
@@ -48,11 +59,12 @@ const METHOD_ICONS: Record<PaymentSplit['method'], React.ReactNode> = {
 interface CustomerPickerProps {
   tenantId: string;
   selected: { id: string; name: string } | null;
-  onSelect: (c: { id: string; name: string } | null) => void;
+  onSelect: (c: { id: string; name: string; phone?: string | null } | null) => void;
   amount: number;
 }
 
 function CustomerPicker({ tenantId, selected, onSelect, amount }: CustomerPickerProps) {
+  const { format: fmtMoney, formatInt: fmtInt } = useCurrency();
   const [search, setSearch] = useState('');
   const [customers, setCustomers] = useState<PickerCustomer[]>([]);
   const [loading, setLoading] = useState(false);
@@ -97,25 +109,23 @@ function CustomerPicker({ tenantId, selected, onSelect, amount }: CustomerPicker
   );
 
   const quickAdd = async () => {
-    if (!addName.trim()) return;
+    const name = addName.trim();
+    const phone = addPhone.trim();
+    if (!name && !phone) return;
     setAddSaving(true);
-    const { data } = await (supabase.from('customers' as any) as any)
-      .insert({
-        tenant_id: tenantId,
-        name: addName.trim(),
-        phone: addPhone.trim() || null,
-        is_active: true,
-        current_balance: 0,
-        credit_limit: 0,
-      })
-      .select('id, name')
-      .single();
-    if (data) {
-      try { sessionStorage.removeItem(`customers_${tenantId}`); } catch { /* ignore */ }
-      onSelect({ id: data.id, name: data.name });
-      setExpanded(false);
+    const { data, error } = await createCustomerQuick(tenantId, {
+      name: name || `Müşteri ${phone}`,
+      phone: phone || null,
+    });
+    if (error || !data) {
+      setAddSaving(false);
+      alert(error?.message || 'Cari oluşturulamadı');
+      return;
     }
     setAddSaving(false);
+    invalidateCustomersListCache(tenantId);
+    onSelect({ id: data.id, name: data.name, phone: data.phone });
+    setExpanded(false);
     setShowAdd(false);
     setAddName('');
     setAddPhone('');
@@ -129,7 +139,7 @@ function CustomerPicker({ tenantId, selected, onSelect, amount }: CustomerPicker
           <div>
             <div className="text-sm font-black text-slate-800">{selected.name}</div>
             <div className="text-xs text-orange-600">
-              Cari hesaba: {amount.toFixed(2)} ₺ borç yazılacak
+              Cari hesaba: {fmtMoney(amount)} borç yazılacak
             </div>
           </div>
         </div>
@@ -241,7 +251,7 @@ function CustomerPicker({ tenantId, selected, onSelect, amount }: CustomerPicker
               </div>
               <div className="flex items-center gap-1 ml-2">
                 {c.current_balance > 0 && (
-                  <span className="text-xs text-red-500 font-bold">{Number(c.current_balance).toFixed(0)}₺</span>
+                  <span className="text-xs text-red-500 font-bold">{fmtInt(Number(c.current_balance))}</span>
                 )}
                 <ChevronRight className="w-3.5 h-3.5 text-slate-300" />
               </div>
@@ -271,8 +281,15 @@ export function PaymentModal({
   onPayment,
   onClose,
   loading,
+  disableDismiss = false,
+  huginGate = null,
+  loyaltyEnabled = false,
+  loyaltyBillBase = 0,
+  loyaltyPayment = null,
+  onLoyaltyChange,
 }: PaymentModalProps) {
   const { tenant } = useAuth();
+  const { format: fmtMoney, formatInt: fmtInt, symbol: currencySymbol } = useCurrency();
   const [splits, setSplits] = useState<PaymentSplit[]>([
     { method: 'cash', amount: remainingAmount.toFixed(2) }
   ]);
@@ -325,6 +342,22 @@ export function PaymentModal({
     setSplits([{ method: 'cash', amount: remainingAmount.toFixed(2) }]);
   }, [remainingAmount]);
 
+  // Sadakat müşterisi ile cari (açık hesap) müşterisi aynı kart olmalı — ayrı kayıt kopukluğu önlenir.
+  useEffect(() => {
+    if (!loyaltyPayment?.customerId) return;
+    setSplits((prev) =>
+      prev.map((s) =>
+        s.method === 'open_account'
+          ? {
+              ...s,
+              customerId: loyaltyPayment.customerId,
+              customerName: loyaltyPayment.customerName,
+            }
+          : s,
+      ),
+    );
+  }, [loyaltyPayment?.customerId, loyaltyPayment?.customerName]);
+
   // Mobilde modal açıldığında bazı tarayıcılar (özellikle Android Chrome)
   // ilk input'u otomatik focus ederek sanal klavyeyi açar. autoFocus zaten
   // mobilde `false` veriyoruz ama yine de bir tick gecikmeli olarak aktif
@@ -368,10 +401,23 @@ export function PaymentModal({
     }));
   };
 
-  const updateSplitCustomer = (idx: number, customer: { id: string; name: string } | null) => {
+  const updateSplitCustomer = (idx: number, customer: { id: string; name: string; phone?: string | null } | null) => {
     setSplits(prev => prev.map((s, i) =>
       i === idx ? { ...s, customerId: customer?.id, customerName: customer?.name } : s
     ));
+    if (
+      customer &&
+      loyaltyEnabled &&
+      onLoyaltyChange &&
+      !loyaltyPayment
+    ) {
+      onLoyaltyChange({
+        customerId: customer.id,
+        customerName: customer.name,
+        redeemPoints: 0,
+        discountTl: 0,
+      });
+    }
   };
 
   const fillRemaining = (idx: number) => {
@@ -400,7 +446,6 @@ export function PaymentModal({
     const splitsSnapshot = splits.slice();
     const printOnComplete = printReceipt;
     setSubmitting(true);
-    onClose();
     void (async () => {
       try {
         for (let i = 0; i < splitsSnapshot.length; i++) {
@@ -437,26 +482,36 @@ export function PaymentModal({
           <h3 className="text-lg sm:text-xl font-bold text-white">Ödeme Al</h3>
           <button
             onClick={onClose}
+            disabled={disableDismiss}
             aria-label="Kapat"
-            className="text-white hover:bg-white/20 p-2 rounded-lg transition-all active:scale-95"
+            className="text-white hover:bg-white/20 p-2 rounded-lg transition-all active:scale-95 disabled:opacity-40 disabled:pointer-events-none"
           >
             <X className="w-5 h-5" />
           </button>
         </div>
 
         <div className="overflow-y-auto overscroll-contain flex-1 min-h-0 p-3 sm:p-4 space-y-3">
+          {loyaltyEnabled && tenant && onLoyaltyChange && (
+            <LoyaltyPaymentSection
+              tenantId={tenant.id}
+              billTotalTl={loyaltyBillBase}
+              value={loyaltyPayment}
+              onChange={onLoyaltyChange}
+            />
+          )}
+
           {/* Tutar özeti */}
           <div className="grid grid-cols-2 gap-2">
             <div className="bg-orange-50 border-2 border-orange-200 rounded-xl p-3 text-center">
               <div className="text-xs text-slate-500 font-medium mb-0.5">Kalan Tutar</div>
-              <div className="text-2xl font-black text-orange-600">{remainingAmount.toFixed(0)} ₺</div>
+              <div className="text-2xl font-black text-orange-600">{fmtInt(remainingAmount)}</div>
             </div>
             <div className={`border-2 rounded-xl p-3 text-center transition-all ${isFullPayment ? 'bg-green-50 border-green-400' : 'bg-amber-50 border-amber-300'}`}>
               <div className="text-xs text-slate-500 font-medium mb-0.5">
                 {isFullPayment ? 'Tam Ödeme' : 'Ödemeden Sonra Kalan'}
               </div>
               <div className={`text-2xl font-black ${isFullPayment ? 'text-green-600' : 'text-amber-600'}`}>
-                {isFullPayment ? '0 ₺' : `${afterPayment.toFixed(0)} ₺`}
+                {isFullPayment ? fmtInt(0) : fmtInt(afterPayment)}
               </div>
             </div>
           </div>
@@ -532,7 +587,7 @@ export function PaymentModal({
                     placeholder="0.00"
                     autoFocus={idx === 0 && !isMobile}
                   />
-                  <span className="text-slate-500 font-bold text-sm">₺</span>
+                  <span className="text-slate-500 font-bold text-sm">{currencySymbol}</span>
                   <button
                     onClick={() => fillRemaining(idx)}
                     className="px-2.5 py-2 bg-green-100 hover:bg-green-200 text-green-700 rounded-lg font-bold text-xs transition-all active:scale-95 whitespace-nowrap flex-shrink-0"
@@ -545,7 +600,13 @@ export function PaymentModal({
                 {split.method === 'open_account' && tenant && (
                   <CustomerPicker
                     tenantId={tenant.id}
-                    selected={split.customerId ? { id: split.customerId, name: split.customerName || '' } : null}
+                    selected={
+                      split.customerId
+                        ? { id: split.customerId, name: split.customerName || loyaltyPayment?.customerName || '' }
+                        : loyaltyPayment
+                          ? { id: loyaltyPayment.customerId, name: loyaltyPayment.customerName }
+                          : null
+                    }
                     onSelect={c => updateSplitCustomer(idx, c)}
                     amount={parseFloat(split.amount) || 0}
                   />
@@ -558,16 +619,21 @@ export function PaymentModal({
                 splitDiff > 0 ? 'bg-amber-50 text-amber-700 border border-amber-200' : 'bg-red-50 text-red-700 border border-red-200'
               }`}>
                 <span>{splitDiff > 0 ? 'Eksik tutar:' : 'Fazla tutar:'}</span>
-                <span>{Math.abs(splitDiff).toFixed(2)} ₺</span>
+                <span>{fmtMoney(Math.abs(splitDiff))}</span>
               </div>
             )}
           </div>
+
+          {huginGate ? (
+            <HuginPaymentGate {...huginGate} />
+          ) : null}
 
           <button
             onClick={() => {
               printReceiptManuallyToggledRef.current = true;
               setPrintReceipt(v => !v);
             }}
+            disabled={disableDismiss}
             className={`w-full flex items-center justify-between px-4 py-2.5 rounded-xl border-2 transition-all active:scale-95 ${
               printReceipt
                 ? 'border-blue-500 bg-blue-50'
@@ -592,20 +658,21 @@ export function PaymentModal({
         >
           <button
             onClick={onClose}
-            className="flex-1 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-3 rounded-xl transition-all active:scale-95"
+            disabled={disableDismiss}
+            className="flex-1 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-3 rounded-xl transition-all active:scale-95 disabled:opacity-50"
           >
             İptal
           </button>
           <button
             onClick={handleSubmit}
-            disabled={loading || submitting || !isValid}
+            disabled={loading || submitting || !isValid || disableDismiss || !!huginGate}
             className={`flex-[2] font-bold py-3 px-4 sm:px-6 rounded-xl transition-all disabled:opacity-50 shadow-lg active:scale-95 ${
               isFullPayment
                 ? 'bg-gradient-to-r from-green-600 to-green-700 hover:from-green-700 hover:to-green-800 text-white'
                 : 'bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600 text-white'
             }`}
           >
-            {(loading || submitting) ? 'İşleniyor...' : isFullPayment ? 'Ödemeyi Tamamla' : `${totalSplit.toFixed(0)}₺ Al`}
+            {(loading || submitting) ? 'İşleniyor...' : isFullPayment ? 'Ödemeyi Tamamla' : `${fmtInt(totalSplit)} Al`}
           </button>
         </div>
       </div>

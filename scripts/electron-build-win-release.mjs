@@ -24,7 +24,16 @@ if (process.platform === 'win32') {
 }
 
 const shell = process.platform === 'win32';
-const b = spawnSync('npm', ['run', 'build'], { cwd: root, stdio: 'inherit', shell });
+// Electron cloud → VDS (Supabase değil)
+const b = spawnSync('npm', ['run', 'build'], {
+  cwd: root,
+  stdio: 'inherit',
+  shell,
+  env: {
+    ...process.env,
+    VITE_VDS_API_BASE: process.env.VITE_VDS_API_BASE || 'https://sefpos.com.tr',
+  },
+});
 if (b.status !== 0) process.exit(b.status ?? 1);
 
 const e = spawnSync('npx', ['electron-builder', '--win'], { cwd: root, stdio: 'inherit', shell });

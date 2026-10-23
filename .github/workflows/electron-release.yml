@@ -51,6 +51,7 @@ jobs:
       - name: Build Electron Windows installer
         env:
           VITE_STOCK_COUNT_BATCH_RPC: "true"
+          VITE_VDS_API_BASE: "https://sefpos.com.tr"
         run: |
           npm run build
           npx electron-builder --win --publish never

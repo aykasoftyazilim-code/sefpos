@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Server, Save, Eye, EyeOff, CheckCircle, AlertCircle, ArrowLeft, RefreshCw, X, Download } from 'lucide-react';
+import { markSqlSetupComplete } from '../lib/hybridMode';
 
 export interface SqlServerConfig {
   host: string;
@@ -17,20 +18,25 @@ interface Props {
   onClose?: () => void;
   showBack?: boolean;
   inline?: boolean;
+  /** Kurulum sihirbazından önerilen sunucu (ör. .\\SQLEXPRESS) */
+  suggestedHost?: string;
 }
 
 const defaultConfig: SqlServerConfig = {
-  host: 'localhost',
-  port: '1433',
+  host: '.\\SQLEXPRESS',
+  port: '',
   database: 'sefpos45',
   username: 'sa',
-  password: '1578',
+  password: '',
   encrypt: false,
   trustServerCertificate: true,
 };
 
-function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = false }: Props) {
-  const [config, setConfig] = useState<SqlServerConfig>(defaultConfig);
+function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = false, suggestedHost }: Props) {
+  const [config, setConfig] = useState<SqlServerConfig>(() => ({
+    ...defaultConfig,
+    host: suggestedHost || defaultConfig.host,
+  }));
   const [showPassword, setShowPassword] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -41,12 +47,25 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
   const [importMessage, setImportMessage] = useState('');
   const [activeMode, setActiveMode] = useState<string | null>(null);
   const isPostgresMode = activeMode === 'postgres';
+  const [companyName, setCompanyName] = useState('');
+  const [companyAddress, setCompanyAddress] = useState('');
+  const [companyPhone, setCompanyPhone] = useState('');
+  const [companyEmail, setCompanyEmail] = useState('');
+  const [licenseExpires, setLicenseExpires] = useState(() => {
+    const d = new Date();
+    d.setFullYear(d.getFullYear() + 1);
+    return d.toISOString().slice(0, 10);
+  });
 
   useEffect(() => {
     const api = (window as any).electronAPI;
     if (api?.getSqlServerConfig) {
       api.getSqlServerConfig().then((c: SqlServerConfig | null) => {
-        if (c) setConfig({ ...defaultConfig, ...c });
+        if (c?.host) {
+          setConfig({ ...defaultConfig, ...c });
+        } else if (suggestedHost) {
+          setConfig((prev) => ({ ...prev, host: suggestedHost }));
+        }
         setLoading(false);
       });
     } else {
@@ -55,12 +74,45 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
     if (api?.getDbMode) {
       api.getDbMode().then((mode: string | null) => setActiveMode(mode));
     }
-  }, []);
+  }, [suggestedHost]);
 
   const handleChange = (field: keyof SqlServerConfig, value: string | boolean) => {
     setConfig(prev => ({ ...prev, [field]: value }));
     setSaved(false);
     setTestStatus('idle');
+  };
+
+  const saveCompanyProfile = async () => {
+    const api = (window as any).electronAPI;
+    if (!api?.sqlUpdateTenantProfile || !companyName.trim()) return;
+    let tenantId = '';
+    let branchId = '';
+    try {
+      const s = localStorage.getItem('shefpos_sql_session');
+      if (s) {
+        const rec = JSON.parse(s)?._sqlRecord;
+        tenantId = rec?.tenant_id || '';
+        branchId = rec?.branch_id || '';
+      }
+    } catch { /* ignore */ }
+    if (!tenantId && api.sqlLogin) {
+      const lr = await api.sqlLogin({ email: 'admin@shefpos.local', password: '1234' });
+      if (lr?.success && lr.data) {
+        tenantId = lr.data.tenant_id;
+        branchId = lr.data.branch_id;
+      }
+    }
+    if (!tenantId) return;
+    await api.sqlUpdateTenantProfile({
+      tenantId,
+      branchId: branchId || undefined,
+      name: companyName.trim(),
+      address: companyAddress.trim() || null,
+      phone: companyPhone.trim() || null,
+      email: companyEmail.trim() || null,
+      branchName: companyName.trim(),
+      subscription_expires_at: licenseExpires || null,
+    });
   };
 
   const handleSave = async () => {
@@ -75,9 +127,22 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
         await api.setDbMode(targetMode);
         setActiveMode(targetMode);
       }
+      if (companyName.trim()) {
+        await saveCompanyProfile();
+      }
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
       onSave?.(config);
+      const api2 = (window as any).electronAPI;
+      if (api2?.sqlHealthCheck && !isPostgresMode) {
+        const health = await api2.sqlHealthCheck(config);
+        if (health?.success && !health.ok && health.missing?.length) {
+          setImportStatus('error');
+          setImportMessage(
+            `Bağlantı kaydedildi; eksik tablolar: ${health.missing.join(', ')}. «Eksik tabloları güncelle» ile patch uygulayın.`,
+          );
+        }
+      }
     } finally {
       setSaving(false);
     }
@@ -89,9 +154,19 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
       setImportMessage('Sunucu ve kullanıcı adı zorunludur.');
       return;
     }
+    if (!(window as any).electronAPI?.importSqlServerSchema) {
+      setImportStatus('error');
+      setImportMessage('Veritabanı kurulumu yalnızca ŞefPOS masaüstü (Electron) uygulamasında çalışır. Tarayıcıdan değil, kurulu Sefpos.exe ile açın.');
+      return;
+    }
     setImportStatus('importing');
-    setImportMessage('');
+    setImportMessage('Veritabanı oluşturuluyor, bu işlem 1–3 dakika sürebilir…');
     const api = (window as any).electronAPI;
+    if (api?.setSqlServerConfig) {
+      try {
+        await api.setSqlServerConfig(config);
+      } catch { /* ignore */ }
+    }
     if (isPostgresMode) {
       if (!api?.postgresInitDatabase) {
         setImportStatus('error');
@@ -114,10 +189,24 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
       setImportMessage('Bu özellik sadece Electron uygulamasında çalışır.');
       return;
     }
-    const result = await api.importSqlServerSchema(config);
+    const result = await Promise.race([
+      api.importSqlServerSchema(config),
+      new Promise<{ success: false; error: string }>((resolve) =>
+        window.setTimeout(
+          () => resolve({ success: false, error: 'Kurulum zaman aşımı (3 dk). SQL Server yanıt vermiyor olabilir.' }),
+          180_000,
+        ),
+      ),
+    ]);
     if (result.success) {
       setImportStatus('ok');
-      setImportMessage('sefpos45 veritabanı başarıyla oluşturuldu ve şema import edildi!');
+      const hostHint = (result as { resolvedHost?: string }).resolvedHost
+        ? ` Bağlanılan: ${(result as { resolvedHost?: string }).resolvedHost}`
+        : '';
+      setImportMessage(
+        (result.output ||
+          'sefpos45 hazır. Giriş: kullanıcı adı ADMIN veya admin, şifre 1234') + hostHint,
+      );
     } else {
       setImportStatus('error');
       setImportMessage(result.error || 'Import başarısız oldu.');
@@ -125,9 +214,9 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
   };
 
   const handleTest = async () => {
-    if (!config.host || !config.database || !config.username) {
+    if (!config.host || !config.username) {
       setTestStatus('error');
-      setTestMessage('Sunucu, veritabanı ve kullanıcı adı zorunludur.');
+      setTestMessage('Sunucu ve kullanıcı adı zorunludur.');
       return;
     }
     setTestStatus('testing');
@@ -139,13 +228,148 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
       setTestMessage('Bu özellik sadece Electron uygulamasında çalışır.');
       return;
     }
-    const result = await testFn(config);
+    const timeoutMs = 18_000;
+    const result = await Promise.race([
+      testFn(config),
+      new Promise<{ success: false; error: string }>((resolve) =>
+        window.setTimeout(
+          () =>
+            resolve({
+              success: false,
+              error:
+                'Bağlantı zaman aşımı (18 sn). SQL Server 2008 için Şifrele kapalı olsun; isimli örnek için Sunucu: .\\SQLEXPRESS (Port boş). SQL Browser servisi çalışıyor mu?',
+            }),
+          timeoutMs,
+        ),
+      ),
+    ]);
     if (result.success) {
       setTestStatus('ok');
-      setTestMessage(isPostgresMode ? 'PostgreSQL bağlantısı başarılı.' : `Bağlantı başarılı! (TDS ${result.tdsVersion || 'varsayılan'})`);
+      const extra = (result as { sqlVersion?: string }).sqlVersion
+        ? ` Sürüm: ${(result as { sqlVersion?: string }).sqlVersion}`
+        : '';
+      const hostHint = (result as { resolvedHost?: string }).resolvedHost
+        ? ` Bağlanılan adres: ${(result as { resolvedHost?: string }).resolvedHost}.`
+        : '';
+      setTestMessage(
+        isPostgresMode
+          ? 'PostgreSQL bağlantısı başarılı.'
+          : `SQL Server bağlantısı başarılı.${extra}${hostHint} Sonra «sefpos45 Veritabanını Kur» ile şemayı yükleyin.`,
+      );
     } else {
       setTestStatus('error');
       setTestMessage(result.error || 'Bağlantı başarısız');
+    }
+  };
+
+  const handleApplyPatches = async () => {
+    const api = (window as any).electronAPI;
+    if (!api?.sqlApplySchemaPatches) {
+      setImportStatus('error');
+      setImportMessage('Patch yalnızca Electron Sefpos.exe içinde çalışır.');
+      return;
+    }
+    setImportStatus('importing');
+    setImportMessage('Eksik tablolar ekleniyor (waiter_calls, print_settings)…');
+    const result = await api.sqlApplySchemaPatches(config);
+    if (result.success) {
+      setImportStatus('ok');
+      setImportMessage(result.output || 'Patch tamamlandı. Uygulamayı yeniden başlatın.');
+    } else {
+      setImportStatus('error');
+      setImportMessage(result.error || 'Patch başarısız.');
+    }
+  };
+
+  const handleTestAndSetup = async () => {
+    if (isPostgresMode) {
+      await handleTest();
+      return;
+    }
+    if (!config.host || !config.username) {
+      setTestStatus('error');
+      setTestMessage('Sunucu ve kullanıcı adı zorunludur.');
+      return;
+    }
+    setTestStatus('testing');
+    setTestMessage('');
+    setImportStatus('idle');
+    const api = (window as any).electronAPI;
+    if (!api?.sqlTestConnection || !api?.importSqlServerSchema) {
+      setTestStatus('error');
+      setTestMessage('Bu özellik yalnızca Sefpos.exe içinde çalışır.');
+      return;
+    }
+    const result = await Promise.race([
+      api.sqlTestConnection(config),
+      new Promise<{ success: false; error: string }>((resolve) =>
+        window.setTimeout(
+          () => resolve({ success: false, error: 'Bağlantı zaman aşımı (18 sn).' }),
+          18_000,
+        ),
+      ),
+    ]);
+    if (!result.success) {
+      setTestStatus('error');
+      setTestMessage(result.error || 'Bağlantı başarısız');
+      return;
+    }
+    setTestStatus('ok');
+    setTestMessage('Bağlantı OK. Veritabanı kuruluyor…');
+    if (api?.setSqlServerConfig) await api.setSqlServerConfig(config);
+
+    setImportStatus('importing');
+    setImportMessage('Veritabanı oluşturuluyor, bu işlem 1–3 dakika sürebilir…');
+    const importResult = await Promise.race([
+      api.importSqlServerSchema(config),
+      new Promise<{ success: false; error: string }>((resolve) =>
+        window.setTimeout(
+          () => resolve({ success: false, error: 'Kurulum zaman aşımı (3 dk).' }),
+          180_000,
+        ),
+      ),
+    ]);
+    if (!importResult.success) {
+      setImportStatus('error');
+      setImportMessage(importResult.error || 'Kurulum başarısız.');
+      return;
+    }
+    setImportStatus('ok');
+    const hostHint = (importResult as { resolvedHost?: string }).resolvedHost
+      ? ` Bağlanılan: ${(importResult as { resolvedHost?: string }).resolvedHost}`
+      : '';
+
+    let loginHint = '';
+    if (api?.sqlLogin) {
+      const loginCheck = await api.sqlLogin({ email: 'admin@shefpos.local', password: '1234' });
+      if (!loginCheck?.success) {
+        setImportStatus('error');
+        setImportMessage(
+          `Veritabanı kuruldu ancak ADMIN girişi doğrulanamadı: ${loginCheck?.error || 'bilinmeyen hata'}. «Test Et + Kur ve Başla»yı tekrar deneyin.`,
+        );
+        return;
+      }
+      loginHint = ' Giriş doğrulandı: ADMIN / 1234';
+    }
+
+    setImportMessage(
+      (importResult.output ||
+        'sefpos45 hazır. Giriş: ADMIN / 1234') + hostHint + loginHint,
+    );
+
+    try {
+      if (api?.setDbMode) {
+        const mode = activeMode === 'hybrid' ? 'hybrid' : 'sqlserver';
+        await api.setDbMode(mode);
+        localStorage.setItem('dbMode', mode);
+        setActiveMode(mode);
+      }
+      markSqlSetupComplete();
+      if (companyName.trim()) await saveCompanyProfile();
+      setSaved(true);
+      onSave?.(config);
+    } catch {
+      /* kayıt hatası import sonrası ayrı gösterilmez */
     }
   };
 
@@ -218,6 +442,13 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
         </div>
       )}
 
+      {typeof window !== 'undefined' && !(window as any).electronAPI?.sqlTestConnection && (
+        <div className={`rounded-xl px-4 py-3 mb-4 text-sm ${inline ? 'bg-red-50 border-2 border-red-200 text-red-800' : 'bg-red-500/15 border border-red-500/40 text-red-200'}`}>
+          <strong>ŞefPOS masaüstü değil.</strong> «Veritabanı Ayarları / Online-Offline» ekranı başka programdır.
+          Kurulu <strong>Sefpos.exe</strong> ile açın; yeşil «SQL Server Ayarları» ve «Test Et» butonları görünmeli.
+        </div>
+      )}
+
       <div className={inline ? 'space-y-4' : 'bg-white/5 border border-white/10 rounded-2xl p-6 space-y-5'}>
         <div className="grid grid-cols-3 gap-4">
           <div className="col-span-2">
@@ -226,9 +457,14 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
               type="text"
               value={config.host}
               onChange={e => handleChange('host', e.target.value)}
-              placeholder="192.168.1.100 veya localhost"
+              placeholder={isPostgresMode ? 'localhost' : '.\\SQLEXPRESS veya localhost\\SQLEXPRESS'}
               className={inputCls}
             />
+            {!isPostgresMode && (
+              <p className={`text-xs mt-1 ${inline ? 'text-gray-500' : 'text-slate-500'}`}>
+                İsimli örnek: <code>.\SQLEXPRESS</code> — Port genelde boş. Özel kurulum: <code>.\INSTANCEADINIZ</code>
+              </p>
+            )}
           </div>
           <div>
             <label className={labelCls}>Port</label>
@@ -236,7 +472,7 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
               type="text"
               value={config.port}
               onChange={e => handleChange('port', e.target.value)}
-              placeholder={isPostgresMode ? '5432' : '1433'}
+              placeholder={isPostgresMode ? '5432' : 'boş (Express)'}
               className={inputCls}
             />
           </div>
@@ -248,7 +484,7 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
             type="text"
             value={config.database}
             onChange={e => handleChange('database', e.target.value)}
-            placeholder="ShefPOS"
+            placeholder="sefpos45"
             className={inputCls}
           />
         </div>
@@ -321,6 +557,50 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
         )}
       </div>
 
+      <div className={`rounded-xl p-4 space-y-3 ${inline ? 'bg-amber-50 border-2 border-amber-200' : 'bg-white/5 border border-white/10'}`}>
+        <p className={`text-xs font-bold uppercase tracking-wide ${inline ? 'text-amber-800' : 'text-amber-200'}`}>
+          İşletme ve lisans (SQL Server)
+        </p>
+        <p className={`text-xs ${inline ? 'text-slate-600' : 'text-slate-400'}`}>
+          Firma bilgileri yerel veritabanına yazılır; lisans bitiş tarihine göre sistem çalışır (internet gerekmez).
+        </p>
+        <input
+          value={companyName}
+          onChange={(e) => setCompanyName(e.target.value)}
+          placeholder="Firma / restoran adı *"
+          className="w-full rounded-lg border px-3 py-2 text-sm"
+        />
+        <input
+          value={companyAddress}
+          onChange={(e) => setCompanyAddress(e.target.value)}
+          placeholder="Adres"
+          className="w-full rounded-lg border px-3 py-2 text-sm"
+        />
+        <div className="grid grid-cols-2 gap-2">
+          <input
+            value={companyPhone}
+            onChange={(e) => setCompanyPhone(e.target.value)}
+            placeholder="Telefon"
+            className="rounded-lg border px-3 py-2 text-sm"
+          />
+          <input
+            value={companyEmail}
+            onChange={(e) => setCompanyEmail(e.target.value)}
+            placeholder="E-posta"
+            className="rounded-lg border px-3 py-2 text-sm"
+          />
+        </div>
+        <label className={`text-xs font-medium ${inline ? 'text-slate-600' : 'text-slate-300'}`}>
+          Lisans bitiş tarihi
+          <input
+            type="date"
+            value={licenseExpires}
+            onChange={(e) => setLicenseExpires(e.target.value)}
+            className="mt-1 w-full rounded-lg border px-3 py-2 text-sm block"
+          />
+        </label>
+      </div>
+
       <div className={`flex gap-3 ${inline ? 'mt-4' : 'mt-5'}`}>
         <button
           onClick={handleTest}
@@ -356,7 +636,7 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
               Otomatik Kurulum
             </p>
           <p className={`text-xs mb-3 ${inline ? 'text-slate-600' : 'text-slate-400'}`}>
-              Kaydet butonuna bastıktan sonra <strong>sefpos45</strong> veritabanını otomatik hazırlayın.
+              <strong>Kur ve Başla</strong> ile test, veritabanı, patch ve kayıt tek adımda yapılır. Giriş: <strong>ADMIN</strong> / <strong>1234</strong>
             </p>
 
             {importStatus !== 'idle' && (
@@ -374,7 +654,7 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
 
             <button
               onClick={handleImport}
-              disabled={importStatus === 'importing'}
+              disabled={importStatus === 'importing' || testStatus === 'testing'}
               className={`w-full flex items-center justify-center gap-2 rounded-xl py-2.5 text-sm font-bold transition-all disabled:opacity-50 ${
                 inline
                   ? 'bg-slate-800 hover:bg-slate-700 text-white'
@@ -382,8 +662,33 @@ function SqlServerForm({ onSave, onBack, onClose, showBack = true, inline = fals
               }`}
             >
               <Download className={`w-4 h-4 ${importStatus === 'importing' ? 'animate-bounce' : ''}`} />
-              {importStatus === 'importing' ? 'Import Ediliyor...' : 'sefpos45 Veritabanını Kur'}
+              {importStatus === 'importing' ? 'Kuruluyor...' : 'sefpos45 Veritabanını Kur'}
             </button>
+            <button
+              type="button"
+              onClick={() => void handleTestAndSetup()}
+              disabled={importStatus === 'importing' || testStatus === 'testing'}
+              className={`w-full mt-2 flex items-center justify-center gap-2 rounded-xl py-2.5 text-sm font-semibold transition-all disabled:opacity-50 ${
+                inline
+                  ? 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                  : 'bg-emerald-600/90 hover:bg-emerald-500 text-white'
+              }`}
+            >
+              Test Et + Kur ve Başla
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleApplyPatches()}
+              disabled={importStatus === 'importing'}
+              className={`w-full mt-2 flex items-center justify-center gap-2 rounded-xl py-2 text-sm font-medium transition-all disabled:opacity-50 ${
+                inline ? 'bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-300' : 'bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 border border-amber-500/40'
+              }`}
+            >
+              Eksik tabloları güncelle (garson çağrı / yazıcı ayarı)
+            </button>
+            <p className={`text-xs mt-2 ${inline ? 'text-slate-600' : 'text-slate-400'}`}>
+              Varsayılan kasa girişi: <strong>ADMIN</strong> / <strong>1234</strong> (kurulumdan sonra)
+            </p>
           </div>
         </div>
       )}

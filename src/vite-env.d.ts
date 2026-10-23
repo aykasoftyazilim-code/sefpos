@@ -7,6 +7,10 @@ interface ImportMetaEnv {
   readonly VITE_PHONE_AUTH_EMAIL_DOMAIN?: string;
   /** `true` iken sayım belgesi RPC (SAYIM-00001); yoksa SYM- (POST/404 yok). */
   readonly VITE_STOCK_COUNT_BATCH_RPC?: string;
+  /** `true` iken tarayıcı POS yalnızca VDS SQL API kullanır (supabase.co yok). */
+  readonly VITE_VDS_SELFHOST?: string;
+  /** Uzak VDS kökü (örn. https://sefpos.com.tr). Cloudflare www / Electron cloud. */
+  readonly VITE_VDS_API_BASE?: string;
 }
 
 interface ImportMeta {

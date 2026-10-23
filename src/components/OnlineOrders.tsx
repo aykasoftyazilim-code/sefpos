@@ -1,20 +1,44 @@
 import { useState, useEffect, useRef, useCallback, Fragment, useMemo } from 'react';
-import { supabase } from '../lib/supabase';
+import { subscribeOnlineOrdersRealtime } from '../lib/onlineOrdersRealtimeHub';
+import { supabase, getEdgeFunctionInvokeUrl } from '../lib/supabase';
 import { useAuth } from '../contexts/AuthContext';
-import { ShoppingBag, Clock, Phone, MapPin, Check, X, ChevronDown, ChevronUp, Bike, Package, RefreshCw, Volume2, VolumeX, AlertTriangle, Hash, Tag, BellRing, Printer } from 'lucide-react';
+import { ShoppingBag, Clock, Phone, MapPin, Check, X, ChevronDown, ChevronUp, Bike, Package, RefreshCw, Volume2, VolumeX, AlertTriangle, Hash, Tag, BellRing, Printer, Store } from 'lucide-react';
 import {
   startContinuousAlert,
   stopContinuousAlert,
   stopAllAlerts,
   getActiveAlertOrderIds,
+  isAudioUnlocked,
   unlockAudio,
   playOnlineOrderAlert,
-  getAudioState,
 } from '../lib/notification';
-import { callGetir, eligibleCancelReasons, getGetirNextStepHint, getGetirUiPhase, getirStatusLabel } from '../lib/getirApi';
+import {
+  callGetir,
+  eligibleCancelReasons,
+  getGetirNextStepHint,
+  getGetirUiPhase,
+  getirStatusLabel,
+  syncGetirRestaurantOpen,
+  syncGetirStoreStatusFromApi,
+} from '../lib/getirApi';
+import { GETIR_STORE_STATUS_EVENT, GETIR_ORDERS_POLLED_EVENT } from './GlobalGetirSync';
+import { startAdaptivePoller } from '../lib/pollSchedule';
+import {
+  readOnlineOrdersCache,
+  writeOnlineOrdersCache,
+  type OnlineOrderWarmRow,
+} from '../lib/onlineOrdersWarm';
 import { internalStatusLabelTr } from '../../supabase/functions/_shared/getirOrderStatus';
 import { PlatformLogo } from './PlatformLogo';
-import { loadPrintSettings, printOnlineOrderKitchenTicket } from '../lib/printService';
+import {
+  isElectron,
+  loadPrintSettings,
+  savePrintSettings,
+  getOnlinePlatformPrinterName,
+  printOnlineOrderKitchenTicket,
+  printOnlineOrderReceiptFromEdge,
+  PRINT_SETTINGS_REMOTE_UPDATED_EVENT,
+} from '../lib/printService';
 
 /**
  * `Database` tipinde online sipariş tabloları tanımlı olmadığı için bu ekranda yerel model.
@@ -145,9 +169,16 @@ const KITCHEN_READY_STATUSES = new Set([
 ]);
 const PENDING_APPROVAL_STATUSES = new Set(['new', 'scheduled_new']);
 
-export function OnlineOrders() {
+export function OnlineOrders({ isActive = true }: { isActive?: boolean }) {
   const { tenant, user } = useAuth();
-  const [orders, setOrders] = useState<OrderWithDetails[]>([]);
+  const isActiveRef = useRef(isActive);
+  useEffect(() => {
+    isActiveRef.current = isActive;
+  }, [isActive]);
+  const initialOnlineCached = tenant?.id ? readOnlineOrdersCache(tenant.id) : null;
+  const [orders, setOrders] = useState<OrderWithDetails[]>(
+    () => (initialOnlineCached as OrderWithDetails[] | null) ?? [],
+  );
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [expandedOrder, setExpandedOrder] = useState<string | null>(null);
@@ -164,13 +195,45 @@ export function OnlineOrders() {
     const saved = localStorage.getItem('notification_sound_enabled');
     return saved === null ? true : saved === 'true';
   });
+  const ordersRef = useRef(orders);
+  useEffect(() => {
+    ordersRef.current = orders;
+  }, [orders]);
   const previousOrderCount = useRef<number>(0);
   // Daha onceden goruldumu listesi — yeni gelenleri platforma gore uyarmak icin
   const seenOrderIds = useRef<Set<string>>(new Set());
+  const SEEN_ORDER_IDS_CAP = 800;
   const firstLoadDone = useRef<boolean>(false);
 
   const soundEnabledRef = useRef(soundEnabled);
   soundEnabledRef.current = soundEnabled;
+
+  const [autoApproveOnline, setAutoApproveOnline] = useState(
+    () => loadPrintSettings().autoApproveOnlineOrders === true,
+  );
+  const [onlinePrinterLabel, setOnlinePrinterLabel] = useState(() => {
+    const name = getOnlinePlatformPrinterName();
+    return name || '';
+  });
+  const autoApproveInFlight = useRef<Set<string>>(new Set());
+  const autoApproveOrderRef = useRef<(o: OrderWithDetails) => Promise<void>>(async () => {});
+
+  useEffect(() => {
+    const refreshFromSettings = () => {
+      setAutoApproveOnline(loadPrintSettings().autoApproveOnlineOrders === true);
+      const name = getOnlinePlatformPrinterName();
+      setOnlinePrinterLabel(name || '');
+    };
+    refreshFromSettings();
+    window.addEventListener(PRINT_SETTINGS_REMOTE_UPDATED_EVENT, refreshFromSettings);
+    return () => window.removeEventListener(PRINT_SETTINGS_REMOTE_UPDATED_EVENT, refreshFromSettings);
+  }, []);
+
+  const persistAutoApproveOnline = (enabled: boolean) => {
+    setAutoApproveOnline(enabled);
+    const s = loadPrintSettings();
+    savePrintSettings({ ...s, autoApproveOnlineOrders: enabled });
+  };
 
   const kitchenPrintInFlight = useRef<Set<string>>(new Set());
   // Her siparişin son bilinen statüsü — onaylama anında geçişi yakalamak için.
@@ -179,33 +242,54 @@ export function OnlineOrders() {
   const scheduleKitchenPrint = useCallback(
     async (o: OrderWithDetails) => {
       if (!tenant?.id) return;
-      if (kitchenPrintInFlight.current.has(o.id)) return;
       if (wasKitchenPrinted(tenant.id, o.id)) return;
+      if (kitchenPrintInFlight.current.has(o.id)) return;
       kitchenPrintInFlight.current.add(o.id);
       try {
         const settings = loadPrintSettings();
-        await printOnlineOrderKitchenTicket({
-          settings,
-          restaurantName: (settings.restaurantName || tenant?.name || 'ŞefPOS').trim(),
-          platformLabel:
-            o.online_order_platforms?.platform_name ||
-            o.online_order_platforms?.platform_code ||
-            'Online',
-          orderNumber: String(o.platform_order_number || (o.platform_order_id || '').slice(0, 12)),
-          customerName: o.customer_name || undefined,
-          customerAddress: o.customer_address || undefined,
-          verificationCode: o.getir_verification_code || null,
-          items: (o.items || []).map((it) => ({
-            platform_product_name: it.platform_product_name || '',
-            quantity: it.quantity,
-            notes: it.notes || null,
-          })),
+        const printer = getOnlinePlatformPrinterName(settings);
+        let printed = false;
+
+        const edgeResult = await printOnlineOrderReceiptFromEdge(o.id, {
+          silent: true,
+          printerName: printer,
         });
-        markKitchenPrinted(tenant.id, o.id);
+        printed = edgeResult.success;
+
+        if (!printed) {
+          console.warn('[OnlineOrders] Platform fişi (edge) yazdırılamadı, mutfak fişi deneniyor:', edgeResult.error);
+          const fallback = await printOnlineOrderKitchenTicket({
+            settings,
+            printerName: printer,
+            restaurantName: (settings.restaurantName || tenant?.name || 'ŞefPOS').trim(),
+            platformLabel:
+              o.online_order_platforms?.platform_name ||
+              o.online_order_platforms?.platform_code ||
+              'Online',
+            orderNumber: String(o.platform_order_number || (o.platform_order_id || '').slice(0, 12)),
+            customerName: o.customer_name || undefined,
+            customerAddress: o.customer_address || undefined,
+            verificationCode: o.getir_verification_code || null,
+            items: (o.items || []).map((it) => ({
+              platform_product_name: it.platform_product_name || '',
+              quantity: it.quantity,
+              notes: it.notes || null,
+            })),
+          });
+          printed = fallback.success;
+        }
+
+        if (!printed) {
+          console.warn('[OnlineOrders] Online fiş yazdırılamadı; yazıcı:', printer || '(seçilmedi)');
+        }
+        if (printed) markKitchenPrinted(tenant.id, o.id);
       } catch (e) {
         console.warn('[OnlineOrders] Mutfak fişi yazdırılamadı:', e);
       } finally {
         kitchenPrintInFlight.current.delete(o.id);
+        if (kitchenPrintInFlight.current.size > 120) {
+          kitchenPrintInFlight.current.clear();
+        }
       }
     },
     [tenant?.id, tenant?.name],
@@ -214,7 +298,7 @@ export function OnlineOrders() {
   const loadOrders = useCallback(async (showLoading = false) => {
     if (!tenant) return;
 
-    if (showLoading) setLoading(true);
+    if (showLoading && ordersRef.current.length === 0) setLoading(true);
     try {
       let query = supabase
         .from('online_orders')
@@ -229,6 +313,7 @@ export function OnlineOrders() {
       if (error) throw error;
 
       const newOrders = (data as any[]) || [];
+      writeOnlineOrdersCache(tenant.id, newOrders as OnlineOrderWarmRow[]);
 
       // ────────────────────────────────────────────────────────────────
       // ALARM + MUTFAK FİŞİ politikası
@@ -247,7 +332,16 @@ export function OnlineOrders() {
       for (const o of newOrders) {
         const prevStatus = lastStatusByOrderId.current.get(o.id);
         const isFirstSighting = !seenOrderIds.current.has(o.id);
-        if (isFirstSighting) seenOrderIds.current.add(o.id);
+        if (isFirstSighting) {
+          seenOrderIds.current.add(o.id);
+          if (seenOrderIds.current.size > SEEN_ORDER_IDS_CAP) {
+            let drop = seenOrderIds.current.size - SEEN_ORDER_IDS_CAP;
+            for (const id of seenOrderIds.current) {
+              seenOrderIds.current.delete(id);
+              if (--drop <= 0) break;
+            }
+          }
+        }
 
         // 1) Bekleyen onay → alarm. Ses açıksa sürekli, kapalıysa da DB'ye
         //    not düş (idempotent: aynı id iki kez başlatılmaz).
@@ -256,29 +350,55 @@ export function OnlineOrders() {
           startContinuousAlert(o.id, label);
         }
 
-        // 2) Onaylanmış statü → fiş. Geçiş veya ilk görüşte (eski kayıt)
-        //    olduğu farketmez; localStorage mükerrer engelliyor.
-        if (KITCHEN_READY_STATUSES.has(o.status)) {
+        if (
+          isFirstSighting &&
+          PENDING_APPROVAL_STATUSES.has(o.status) &&
+          loadPrintSettings().autoApproveOnlineOrders
+        ) {
+          void autoApproveOrderRef.current(o as OrderWithDetails);
+        }
+
+        // 2) Onaylanmış statü → fiş (canlı onay geçişi). Eski kayıtlar bootstrap catch-up ile.
+        if (KITCHEN_READY_STATUSES.has(o.status) && tenant?.id && !wasKitchenPrinted(tenant.id, o.id)) {
           const isGetir = o.online_order_platforms?.platform_code === 'getir';
           const justApproved =
             prevStatus !== undefined && PENDING_APPROVAL_STATUSES.has(prevStatus);
           const hasLocalAck = !!o.accepted_at;
-          // Getir için: kasa onayı (accepted_at) zorunlu — getir paneli auto-verify
-          // etse bile fiş YALNIZCA kullanıcı ŞefPOS’ta «Onayla» dedikten sonra basılır.
-          // Diğer platformlar (Yemeksepeti vb.) için eski davranış: durum geçişi veya
-          // ilk görüş yeterli.
-          const triggerPrint = isGetir
-            ? hasLocalAck && (justApproved || isFirstSighting)
-            : justApproved || isFirstSighting;
+          const triggerPrint = isGetir ? hasLocalAck && justApproved : justApproved;
           if (triggerPrint) {
             void scheduleKitchenPrint(o as OrderWithDetails);
           }
         }
 
         lastStatusByOrderId.current.set(o.id, o.status);
+        if (lastStatusByOrderId.current.size > SEEN_ORDER_IDS_CAP) {
+          let drop = lastStatusByOrderId.current.size - SEEN_ORDER_IDS_CAP;
+          for (const id of lastStatusByOrderId.current.keys()) {
+            lastStatusByOrderId.current.delete(id);
+            if (--drop <= 0) break;
+          }
+        }
       }
 
-      if (!firstLoadDone.current) firstLoadDone.current = true;
+      if (!firstLoadDone.current) {
+        firstLoadDone.current = true;
+        if (tenant?.id) {
+          const catchUp = newOrders.filter(
+            (o) =>
+              KITCHEN_READY_STATUSES.has(o.status) && !wasKitchenPrinted(tenant.id, o.id),
+          );
+          if (catchUp.length) {
+            const run = () => {
+              for (const o of catchUp) void scheduleKitchenPrint(o as OrderWithDetails);
+            };
+            if (typeof requestIdleCallback !== 'undefined') {
+              requestIdleCallback(run, { timeout: 5000 });
+            } else {
+              setTimeout(run, 800);
+            }
+          }
+        }
+      }
 
       // Onaylanmış / iptal edilmiş ya da artık listede olmayan siparişlerin
       // alarmlarını durdur.
@@ -303,28 +423,36 @@ export function OnlineOrders() {
   }, [tenant?.id]);
 
   useEffect(() => {
-    if (!tenant) return;
+    if (!tenant || !isActive) return;
 
-    loadOrders(true);
+    const cached = readOnlineOrdersCache(tenant.id);
+    if (cached?.length) {
+      setOrders(cached as OrderWithDetails[]);
+      void loadOrders(false);
+    } else {
+      void loadOrders(true);
+    }
 
-    const channel = supabase
-      .channel(`online-orders-${tenant.id}`)
-      .on('postgres_changes', {
-        event: 'INSERT',
-        schema: 'public',
-        table: 'online_orders',
-        filter: `tenant_id=eq.${tenant.id}`,
-      }, () => loadOrders())
-      .on('postgres_changes', {
-        event: 'UPDATE',
-        schema: 'public',
-        table: 'online_orders',
-        filter: `tenant_id=eq.${tenant.id}`,
-      }, () => loadOrders())
-      .subscribe();
+    let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleReload = () => {
+      if (!isActiveRef.current) return;
+      if (reloadTimer) clearTimeout(reloadTimer);
+      reloadTimer = setTimeout(() => {
+        reloadTimer = null;
+        if (!isActiveRef.current) return;
+        void loadOrders();
+      }, 350);
+    };
 
-    return () => { supabase.removeChannel(channel); };
-  }, [tenant, loadOrders]);
+    const unsubRealtime = subscribeOnlineOrdersRealtime(tenant.id, () => {
+      scheduleReload();
+    });
+
+    return () => {
+      if (reloadTimer) clearTimeout(reloadTimer);
+      unsubRealtime();
+    };
+  }, [tenant, isActive, loadOrders]);
 
   // Sayfa kapatildiginda / kullanici baska ekrana gectiğinde tum alarmlari durdur
   useEffect(() => {
@@ -343,32 +471,61 @@ export function OnlineOrders() {
         const { data: rows } = await supabase
           .from('online_order_platforms')
           .select(
-            'id, platform_code, is_active, getir_app_secret_key, getir_restaurant_secret_key, getir_restaurant_id, getir_pos_status, getir_environment',
+            'id, platform_code, is_active, getir_app_secret_key, getir_restaurant_secret_key, getir_restaurant_id, getir_pos_status, getir_environment, getir_restaurant_open',
           )
           .eq('tenant_id', tenant.id)
           .eq('platform_code', 'getir')
-          .eq('is_active', true);
+          .limit(1);
         if (cancelled) return;
         const platform = (rows || [])[0] as
           | {
+              id: string;
               getir_app_secret_key?: string | null;
               getir_restaurant_secret_key?: string | null;
               getir_restaurant_id?: string | null;
               getir_pos_status?: number | null;
               getir_environment?: string | null;
+              getir_restaurant_open?: boolean | null;
             }
           | undefined;
-        if (!platform) return;
+        if (!platform) {
+          setGetirPlatformMeta(null);
+          return;
+        }
+        let restaurantOpen = platform.getir_restaurant_open ?? null;
+        let posStatus = platform.getir_pos_status ?? null;
+
         const missing: string[] = [];
         if (!platform.getir_app_secret_key) missing.push('appSecretKey');
         if (!platform.getir_restaurant_secret_key) missing.push('restaurantSecretKey');
         if (!platform.getir_restaurant_id) missing.push('restaurantId');
         if (missing.length) {
+          setGetirPlatformMeta({ id: platform.id, getir_restaurant_open: restaurantOpen, getir_pos_status: posStatus });
           setGetirPollIssue(`Getir credential eksik: ${missing.join(', ')}`);
           return;
         }
-        if (platform.getir_pos_status === 200) {
-          setGetirPollIssue('Getir POS durumu PASİF (200). Polling devre dışı.');
+
+        // Sayfa yenilemede DB'de null kaldıysa Getir'den gerçek durumu çek (panelde açık görünüp uyarı çıkmasın).
+        const sync = await syncGetirStoreStatusFromApi(platform.id);
+        if (cancelled) return;
+        if (sync.ok) {
+          if (sync.posStatus != null) posStatus = sync.posStatus;
+          if (sync.restaurantOpen != null) restaurantOpen = sync.restaurantOpen;
+          else if (sync.posStatus === 100 && restaurantOpen == null) restaurantOpen = true;
+        }
+
+        setGetirPlatformMeta({
+          id: platform.id,
+          getir_restaurant_open: restaurantOpen,
+          getir_pos_status: posStatus,
+        });
+
+        if (restaurantOpen === false) {
+          setGetirPollIssue('Getir uygulamasında restoran KAPALI — müşteriler sipariş veremez.');
+        } else if (posStatus === 200) {
+          setGetirPollIssue('Getir POS pasif — «Getir Restoranı Aç» butonu POS’u da açar.');
+        } else {
+          setGetirPollIssue(null);
         }
       } catch (e) {
         console.warn('[OnlineOrders] Getir platform precheck:', e);
@@ -379,86 +536,57 @@ export function OnlineOrders() {
     };
   }, [tenant]);
 
-  // Getir API auto-poll — her tick'te HEM onay bekleyen (`poll-unapproved`) HEM
-  // aktif (`poll-active`) siparişleri çek. Webhook gecikse veya kaybolsa bile
-  // yeni siparişler 30 sn içinde mutlaka düşer. (Eski sürüm 45 sn aralıkla
-  // alternatif çağrı yapıyordu → yeni siparişler 90 sn beklerdi.)
+  // GlobalGetirSync (~20 sn) Getir panelinden kapatınca anında banner günceller.
   useEffect(() => {
-    if (!tenant) return;
-    let stopped = false;
-
-    const callOne = async (
-      platformId: string,
-      action: 'poll-unapproved' | 'poll-active' | 'poll-cancelled',
-    ): Promise<{ fetched: number; saved: number } | null> => {
-      const res = await callGetir({ platformId, action });
-      if (!res.ok) {
-        const dataObj = (res.data && typeof res.data === 'object') ? (res.data as Record<string, unknown>) : {};
-        const detail =
-          (dataObj.error as string | undefined) ||
-          (dataObj.message as string | undefined) ||
-          ((dataObj.data as any)?.message as string | undefined) ||
-          res.error ||
-          `HTTP ${res.status ?? '???'}`;
-        setGetirPollIssue(`${action}: ${detail}`);
-        setGetirPollInfo(null);
-        return null;
-      }
-      return { fetched: Number(res.fetched ?? 0), saved: Number(res.saved ?? 0) };
-    };
-
-    const tick = async () => {
-      if (stopped || document.visibilityState !== 'visible') return;
-      if (busyOrderIdRef.current) return;
-      try {
-        const { data: platforms } = await supabase
-          .from('online_order_platforms')
-          .select('id, platform_code, is_active')
-          .eq('tenant_id', tenant.id)
-          .eq('is_active', true)
-          .eq('platform_code', 'getir');
-        for (const p of (platforms || []) as OnlinePlatformListRow[]) {
-          if (stopped || busyOrderIdRef.current) break;
-          // 1) Önce onay bekleyenler: yeni sipariş geciktirilmemeli
-          const unapproved = await callOne(p.id, 'poll-unapproved');
-          if (stopped || busyOrderIdRef.current) break;
-          // 2) Sonra aktifler: onaylı/hazırlık aşamasındakileri senkronla
-          const active = await callOne(p.id, 'poll-active');
-          if (unapproved && active) {
-            setGetirPollIssue(null);
-            const ts = new Date().toLocaleTimeString('tr-TR');
-            const totalFetched = unapproved.fetched + active.fetched;
-            const totalSaved = unapproved.saved + active.saved;
-            console.info(
-              `[OnlineOrders] auto-poll ok: unapproved=${unapproved.fetched}/${unapproved.saved} active=${active.fetched}/${active.saved} (${ts})`,
-            );
-            setGetirPollInfo({ fetched: totalFetched, saved: totalSaved, ts });
-          }
-        }
-      } catch (e) {
-        console.warn('[OnlineOrders] auto-poll uyari:', e);
+    const onStoreStatus = (ev: Event) => {
+      const d = (ev as CustomEvent<{
+        platformId: string;
+        restaurantOpen: boolean | null;
+        posStatus: number | null;
+      }>).detail;
+      if (!d?.platformId) return;
+      setGetirPlatformMeta((prev) => {
+        if (!prev || prev.id !== d.platformId) return prev;
+        return {
+          ...prev,
+          getir_restaurant_open: d.restaurantOpen,
+          getir_pos_status: d.posStatus ?? prev.getir_pos_status,
+        };
+      });
+      if (d.restaurantOpen === false) {
+        setGetirPollIssue('Getir uygulamasında restoran KAPALI — müşteriler sipariş veremez.');
+      } else if (d.posStatus === 200) {
+        setGetirPollIssue('Getir POS pasif — «Getir Restoranı Aç» butonu POS’u da açar.');
+      } else if (d.restaurantOpen === true) {
+        setGetirPollIssue(null);
       }
     };
+    window.addEventListener(GETIR_STORE_STATUS_EVENT, onStoreStatus);
+    return () => window.removeEventListener(GETIR_STORE_STATUS_EVENT, onStoreStatus);
+  }, []);
 
-    const firstId = window.setTimeout(tick, 500);
-    const intervalId = window.setInterval(tick, 15_000);
-    return () => {
-      stopped = true;
-      window.clearTimeout(firstId);
-      window.clearInterval(intervalId);
-    };
-  }, [tenant]);
-
-  // Realtime fallback: 20 sn'de bir hafif bir DB poll — id+status+updated_at
-  // disinde alan cekmedigimiz icin neredeyse bedava. Realtime kacirirsa yine
-  // sipariş düşer. Yeni id veya status degisikligi tespit edilirse loadOrders.
+  // Getir API poll: yalnizca GlobalGetirSync (App kokunde) — cift poll 429 uretiyordu.
   useEffect(() => {
     if (!tenant) return;
+    const onPolled = () => {
+      if (!isActiveRef.current || busyOrderIdRef.current) return;
+      void loadOrders();
+      const ts = new Date().toLocaleTimeString('tr-TR');
+      setGetirPollInfo({ fetched: 0, saved: 0, ts });
+      setGetirPollIssue(null);
+    };
+    window.addEventListener(GETIR_ORDERS_POLLED_EVENT, onPolled);
+    return () => window.removeEventListener(GETIR_ORDERS_POLLED_EVENT, onPolled);
+  }, [tenant, loadOrders]);
+
+  // Realtime birincil; hafif DB imza poll yedek (gizli sekme: yok, boşta: seyrek).
+  useEffect(() => {
+    if (!tenant || !isActive) return;
     let stopped = false;
     let lastSignature = '';
 
     const tick = async () => {
-      if (stopped || document.visibilityState !== 'visible') return;
+      if (stopped || !isActiveRef.current || document.visibilityState !== 'visible') return;
       if (busyOrderIdRef.current) return;
       try {
         const { data } = await supabase
@@ -480,13 +608,19 @@ export function OnlineOrders() {
     };
 
     const firstId = window.setTimeout(tick, 2000);
-    const intervalId = window.setInterval(tick, 10_000);
+    const stopPoll = startAdaptivePoller({
+      baseMs: 30_000,
+      idleMs: 60_000,
+      hiddenMs: 0,
+      run: tick,
+      immediate: false,
+    });
     return () => {
       stopped = true;
       window.clearTimeout(firstId);
-      window.clearInterval(intervalId);
+      stopPoll();
     };
-  }, [tenant, loadOrders]);
+  }, [tenant, isActive, loadOrders]);
 
   // filter UI tarafında uygulanıyor; ek loadOrders gereksiz.
 
@@ -526,7 +660,6 @@ export function OnlineOrders() {
     const order = orders.find((o) => o.id === orderId);
     const prevStatus = order?.status;
 
-    const baseURL = (import.meta.env.VITE_SUPABASE_URL || 'https://xdfnozfuuzctubijbnds.supabase.co').replace(/\/$/, '');
     const now = new Date().toISOString();
     const updateData: Record<string, any> = { status };
     if (status === 'accepted') updateData.accepted_at = now;
@@ -537,19 +670,19 @@ export function OnlineOrders() {
     setOrders((prev) => prev.map((o) => (o.id === orderId ? { ...o, ...updateData } : o)));
     setBusyOrderId(orderId);
 
-    try {
+      try {
       if (dhAction) {
         const { data: { session } } = await supabase.auth.getSession();
         if (!session) throw new Error('Oturum bulunamadı, lütfen yeniden giriş yapın.');
 
-        const resp = await fetch(`${baseURL}/functions/v1/yemeksepeti-callback`, {
-          method: 'POST',
-          headers: {
+        const resp = await fetch(getEdgeFunctionInvokeUrl('yemeksepeti-callback'), {
+              method: 'POST',
+              headers: {
             Authorization: `Bearer ${session.access_token}`,
-            'Content-Type': 'application/json',
+                'Content-Type': 'application/json',
             apikey: (import.meta.env.VITE_SUPABASE_ANON_KEY as string) || '',
-          },
-          body: JSON.stringify({ orderId, action: dhAction, rejectReason }),
+              },
+              body: JSON.stringify({ orderId, action: dhAction, rejectReason }),
         });
 
         const raw = await resp.text();
@@ -690,27 +823,20 @@ export function OnlineOrders() {
   const reprintOnlineOrder = async (order: OrderWithDetails): Promise<void> => {
     setBusyOrderId(order.id);
     try {
-      const { data: sess } = await supabase.auth.getSession();
-      const token = sess?.session?.access_token;
-      if (!token) {
-        alert('Oturum bilgisi alınamadı. Yeniden giriş yapın.');
-        return;
-      }
-      const baseUrl = (import.meta.env.VITE_SUPABASE_URL || 'https://xdfnozfuuzctubijbnds.supabase.co').replace(/\/$/, '');
-      const res = await fetch(`${baseUrl}/functions/v1/online-order-reprint`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ onlineOrderId: order.id }),
+      const settings = loadPrintSettings();
+      const printer = getOnlinePlatformPrinterName(settings);
+      const result = await printOnlineOrderReceiptFromEdge(order.id, {
+        printerName: printer,
+        title: 'Fiş yazdırılıyor',
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data?.ok) {
-        alert(`Fiş tekrar basılamadı: ${data?.error || res.statusText}`);
-        return;
+      if (!result.success) {
+        const detail = result.error ? ` (${result.error})` : '';
+        alert(
+          isElectron()
+            ? `Online fiş yazdırılamadı.${detail}\n\nAyarlar → Yazıcılar → «Online platform fişi yazıcısı» bölümünden termal yazıcıyı seçin (Windows’taki adla aynı olmalı).`
+            : `Fiş açılamadı.${detail} Pop-up engelliyse tarayıcıda www.sefpos.com.tr için açılır pencereye izin verin. Termal yazıcı bu PC'deyse yazdırma penceresinden varsayılan yazıcıyı seçin.`,
+        );
       }
-      console.info(`[OnlineOrders] Fiş tekrar baskıya gönderildi: order=${order.id}, job=${data.jobId}`);
     } catch (err: any) {
       alert(`Reprint hatası: ${err?.message || err}`);
     } finally {
@@ -728,7 +854,7 @@ export function OnlineOrders() {
       });
       if (!res.ok) {
         alert(`Getir senkronizasyonu başarısız: ${(res as any)?.data?.message || res.error || 'bilinmeyen'}`);
-      } else {
+    } else {
         await loadOrders();
       }
     } catch (err: any) {
@@ -743,7 +869,9 @@ export function OnlineOrders() {
     action: 'verify' | 'verify-scheduled' | 'prepare' | 'handover' | 'deliver' | 'cancel',
     extra?: { cancelReasonId?: string; cancelNote?: string },
     retryCount: number = 0,
+    options?: { silent?: boolean },
   ): Promise<void> => {
+    const silent = options?.silent === true;
     setBusyOrderId(order.id);
     try {
       const res = await callGetir({
@@ -763,9 +891,10 @@ export function OnlineOrders() {
           lower.includes('status is invalid') || lower.includes('invalid status');
 
         if (is429) {
-          alert(
-            'Çok sık istek gönderildi (geçici limit). Bir dakika bekleyip "Siparişleri Yenile" veya aynı butona tekrar deneyin.',
-          );
+          const msg429 =
+            'Çok sık istek gönderildi (geçici limit). Bir dakika bekleyip "Siparişleri Yenile" veya aynı butona tekrar deneyin.';
+          if (silent) console.warn('[Getir] auto:', msg429);
+          else alert(msg429);
           await loadOrders();
           return;
         }
@@ -782,22 +911,38 @@ export function OnlineOrders() {
                 : action === 'deliver'
                   ? '«Teslim edildi»'
                   : `«${action}»`;
-          alert(
+          const timeMsg =
             `${actionTr} aksiyonu için Getir bir bekleme süresi uyguluyor.\n\n` +
-              `Önceki adımdan sonra ~1–2 dakika geçmeden bu aksiyon kabul edilmiyor.\n\n` +
-              `Lütfen 1–2 dakika sonra aynı butona tekrar basın.`,
-          );
+            `Önceki adımdan sonra ~1–2 dakika geçmeden bu aksiyon kabul edilmiyor.\n\n` +
+            `Lütfen 1–2 dakika sonra aynı butona tekrar basın.`;
+          if (silent) console.warn('[Getir] auto:', timeMsg);
+          else alert(timeMsg);
           await loadOrders();
           return;
         }
 
-        // "Invalid status" hatasi → Getir'in iç state'i DB ile uyumsuz.
-        // Kullanıcıya "yerel olarak kapatmak ister misiniz?" diye sor; onaylarsa
-        // siparişi delivered yap (Getir'e ek istek atılmaz, 429 baskısı yok).
+        // "Invalid status" — teslim/kurye/hazır adımlarında yerel kapatma sunma;
+        // aksi halde ŞefPOS "teslim" görünür, Getir müşteride hâlâ hazırlanıyor kalır.
         if (isInvalidStatus && retryCount === 0) {
-          console.log(`[Getir] ${action} invalid status → kullanıcıya yerel kapatma seçeneği sun`);
           const currentCode =
             typeof order.getir_status_code === 'number' ? order.getir_status_code : null;
+          const needsGetirChain =
+            (action === 'deliver' && (currentCode == null || currentCode < 800)) ||
+            (action === 'handover' && (currentCode == null || currentCode < 550)) ||
+            (action === 'prepare' && (currentCode == null || currentCode < 500));
+
+          if (needsGetirChain) {
+            const chainMsg =
+              'Getir bu adımı henüz kabul etmedi.\n\n' +
+              'Sıra: Onayla → Yemek hazır → Kurye yola çıktı → Teslim edildi.\n\n' +
+              'Eksik adımlar otomatik denenir; birkaç saniye sonra aynı butona tekrar basın veya «Siparişleri Yenile».';
+            if (silent) console.warn('[Getir] auto:', chainMsg);
+            else alert(chainMsg);
+            await loadOrders();
+            return;
+          }
+
+          console.log(`[Getir] ${action} invalid status → kullanıcıya yerel kapatma seçeneği sun`);
           const label = currentCode != null ? getirStatusLabel(currentCode) : 'bilinmiyor';
           const confirmClose = confirm(
             `Getir bu işlemi kabul etmedi (sıra dışı bir adım).\n\n` +
@@ -826,7 +971,9 @@ export function OnlineOrders() {
           return;
         }
 
-        alert(friendlyGetirError(action, raw));
+        const errMsg = friendlyGetirError(action, raw);
+        if (silent) console.warn('[Getir] auto:', errMsg);
+        else alert(errMsg);
         await loadOrders();
         return;
       }
@@ -850,10 +997,11 @@ export function OnlineOrders() {
           }
         | undefined;
       if (meta?.skippedGetirCourier) {
-        alert(
+        const courierMsg =
           'Bu sipariş Getir kuryesi tarafından taşınıyor.\n\n' +
-            'Restoran «Kurye yola çıktı» / «Teslim edildi» basmaz; Getir teslim alınca ve teslim ettiğinde durum otomatik ilerler.',
-        );
+          'Restoran «Kurye yola çıktı» / «Teslim edildi» basmaz; Getir teslim alınca ve teslim ettiğinde durum otomatik ilerler.';
+        if (!silent) alert(courierMsg);
+        else console.info('[Getir] auto:', courierMsg);
       } else if (meta?.cancelled) {
         alert(
           `Bu sipariş Getir tarafında iptal edilmiş — ŞefPOS'ta da otomatik olarak kapatıldı.`,
@@ -878,10 +1026,34 @@ export function OnlineOrders() {
         );
       }
     } catch (err: any) {
-      alert(`Getir aksiyonu sırasında hata: ${err?.message || err}`);
+      if (silent) console.warn('[Getir] auto:', err?.message || err);
+      else alert(`Getir aksiyonu sırasında hata: ${err?.message || err}`);
       await loadOrders();
     } finally {
       setBusyOrderId(null);
+    }
+  };
+
+  autoApproveOrderRef.current = async (order: OrderWithDetails) => {
+    if (!loadPrintSettings().autoApproveOnlineOrders) return;
+    if (!PENDING_APPROVAL_STATUSES.has(order.status)) return;
+    if (autoApproveInFlight.current.has(order.id)) return;
+    autoApproveInFlight.current.add(order.id);
+    try {
+      const pc = order.online_order_platforms?.platform_code;
+      if (pc === 'getir') {
+        const action =
+          order.status === 'scheduled_new' || order.getir_is_scheduled
+            ? 'verify-scheduled'
+            : 'verify';
+        await doGetirAction(order, action, undefined, 0, { silent: true });
+      } else {
+        await updateOrderStatus(order.id, 'accepted', 'accept');
+      }
+    } catch (err) {
+      console.warn('[OnlineOrders] Otomatik onay başarısız:', order.id, err);
+    } finally {
+      autoApproveInFlight.current.delete(order.id);
     }
   };
 
@@ -974,16 +1146,15 @@ export function OnlineOrders() {
         (p: OnlinePlatformListRow) => p.platform_code !== 'getir',
       );
       if (nonGetir.length > 0) {
-        const baseUrl = (import.meta.env.VITE_SUPABASE_URL || 'https://xdfnozfuuzctubijbnds.supabase.co').replace(/\/$/, '');
         const { data: { session } } = await supabase.auth.getSession();
         if (session) {
           try {
-            const response = await fetch(`${baseUrl}/functions/v1/sync-online-orders`, {
-              method: 'POST',
-              headers: {
+            const response = await fetch(getEdgeFunctionInvokeUrl('sync-online-orders'), {
+          method: 'POST',
+          headers: {
                 Authorization: `Bearer ${session.access_token}`,
-                'Content-Type': 'application/json',
-              },
+            'Content-Type': 'application/json',
+          },
             });
             const result = await response.json().catch(() => ({}));
             if (response.ok && typeof result?.newOrders === 'number') {
@@ -1074,23 +1245,78 @@ export function OnlineOrders() {
   const [getirPollIssue, setGetirPollIssue] = useState<string | null>(null);
   /** Başarılı son senkron özeti — "0 sipariş bulundu" durumunu da kullanıcıya göstermek için. */
   const [getirPollInfo, setGetirPollInfo] = useState<{ fetched: number; saved: number; ts: string } | null>(null);
-  // Sayfa acildiginda audio context'i unlock dene; engellendiyse banner goster.
+  const [getirPlatformMeta, setGetirPlatformMeta] = useState<{
+    id: string;
+    getir_restaurant_open: boolean | null;
+    getir_pos_status: number | null;
+  } | null>(null);
+  const [getirStoreBusy, setGetirStoreBusy] = useState(false);
+  // Autoplay: mount'ta AudioContext acilmaz; kullanici bir kez tiklayinca App unlock eder.
   useEffect(() => {
-    unlockAudio();
-    const check = () => {
-      const s = getAudioState();
-      setAudioBlocked(s.state === 'suspended' || (!s.unlocked && s.state !== 'running'));
-    };
+    const check = () => setAudioBlocked(!isAudioUnlocked());
     check();
-    const id = window.setInterval(check, 2000);
+    const id = window.setInterval(check, isActive ? 5000 : 15_000);
     return () => window.clearInterval(id);
-  }, []);
+  }, [isActive]);
 
   const testSound = async () => {
-    unlockAudio();
+    await unlockAudio();
     await playOnlineOrderAlert('Test', 1);
-    setAudioBlocked(false);
+    setAudioBlocked(!isAudioUnlocked());
   };
+
+  const setGetirRestaurantOpen = async (wantOpen: boolean) => {
+    if (!getirPlatformMeta) return;
+    if (!wantOpen && !confirm('Getir uygulamasında restoranı kapatmak istiyor musunuz?')) return;
+    setGetirStoreBusy(true);
+    try {
+      const res = await syncGetirRestaurantOpen(getirPlatformMeta.id, wantOpen, { openPosToo: true });
+      if (!res.ok) {
+        const dataObj =
+          res.data && typeof res.data === 'object' ? (res.data as Record<string, unknown>) : {};
+        const detail =
+          (dataObj.message as string | undefined) ||
+          (dataObj.error as string | undefined) ||
+          res.error ||
+          'Getir API hatası';
+        alert(`Getir mağaza durumu değiştirilemedi:\n\n${detail}`);
+        return;
+      }
+      if (res.error) alert(res.error);
+      if (wantOpen) {
+        const verify = await syncGetirStoreStatusFromApi(getirPlatformMeta.id);
+        const openNow = verify.restaurantOpen === true;
+        const posNow = verify.posStatus ?? (openNow ? 100 : null);
+        setGetirPlatformMeta((prev) =>
+          prev
+            ? {
+                ...prev,
+                getir_restaurant_open: openNow,
+                getir_pos_status: posNow,
+              }
+            : null,
+        );
+        if (openNow) {
+          setGetirPollIssue(null);
+        } else {
+          setGetirPollIssue(
+            'Getir API aç komutu gönderildi ama Getir hâlâ kapalı görünüyor. Ayarlar → Online Platformlar → ortam TEST/CANLI ve credential eşleşmesini kontrol edin.',
+          );
+        }
+      } else {
+        setGetirPlatformMeta((prev) =>
+          prev ? { ...prev, getir_restaurant_open: false } : null,
+        );
+        setGetirPollIssue('Getir uygulamasında restoran KAPALI.');
+      }
+    } finally {
+      setGetirStoreBusy(false);
+    }
+  };
+
+  /** Yalnızca Getir'de gerçekten KAPALI ise «Aç» göster; null/ bilinmiyor = uyarı yok. */
+  const getirNeedsOpen =
+    !!getirPlatformMeta && getirPlatformMeta.getir_restaurant_open === false;
 
   return (
     <div className="h-full flex flex-col bg-slate-50">
@@ -1104,13 +1330,38 @@ export function OnlineOrders() {
             <div className="min-w-0">
               <h1 className="text-lg md:text-xl font-black text-slate-800 truncate">
                 ONLİNE SİPARİŞLER
-              </h1>
+            </h1>
               <p className="text-xs text-slate-500 truncate">
                 {orders.length} sipariş · {activeAlertCount} yeni · Yemeksepeti, Getir, Trendyol, Migros
-              </p>
-            </div>
+            </p>
+          </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
+            {getirPlatformMeta && (
+              getirNeedsOpen ? (
+                <button
+                  type="button"
+                  onClick={() => setGetirRestaurantOpen(true)}
+                  disabled={getirStoreBusy}
+                  title="Getir Yemek uygulamasında restoranı aç (ayarlara gerek yok)"
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-xl font-black text-xs text-white bg-gradient-to-r from-purple-600 to-violet-700 shadow-md ring-2 ring-purple-300 hover:from-purple-700 hover:to-violet-800 transition active:scale-95 disabled:opacity-50 animate-pulse"
+                >
+                  <Store className="w-4 h-4 shrink-0" />
+                  <span>{getirStoreBusy ? 'Açılıyor…' : 'Getir Restoranı Aç'}</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setGetirRestaurantOpen(false)}
+                  disabled={getirStoreBusy}
+                  title="Getir Yemek uygulamasında restoranı kapat"
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-xl font-bold text-xs ring-1 transition active:scale-95 disabled:opacity-50 bg-emerald-50 text-emerald-800 ring-emerald-200 hover:bg-emerald-100"
+                >
+                  <Store className="w-4 h-4 shrink-0" />
+                  <span>{getirStoreBusy ? '…' : 'Getir: Açık'}</span>
+                </button>
+              )
+            )}
             {activeAlertCount > 0 && (
               <button
                 onClick={silenceNow}
@@ -1168,8 +1419,58 @@ export function OnlineOrders() {
               <span>{syncing ? 'Senkronize ediliyor…' : 'Siparişleri Çek'}</span>
             </button>
           </div>
+          </div>
+        </div>
+
+      <div className="bg-white border-b border-orange-100 px-4 md:px-6 py-2.5 shrink-0">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 sm:gap-4">
+          <label className="flex items-center gap-2 cursor-pointer shrink-0 select-none">
+            <input
+              type="checkbox"
+              checked={autoApproveOnline}
+              onChange={(e) => persistAutoApproveOnline(e.target.checked)}
+              className="w-4 h-4 rounded border-orange-300 text-orange-600 focus:ring-orange-400"
+            />
+            <span className="text-xs font-bold text-slate-700">Otomatik onay + fiş</span>
+          </label>
+          <p className="text-[11px] text-slate-500 sm:text-right">
+            {autoApproveOnline ? (
+              <>
+                Yeni sipariş <strong className="text-slate-700">otomatik onaylanır</strong> ve fiş basılır.
+              </>
+            ) : (
+              <>
+                Sipariş <strong className="text-slate-700">onaylandığında</strong> fiş basılır.
+              </>
+            )}{' '}
+            Fiş yazıcısı:{' '}
+            <strong className="text-slate-700">{onlinePrinterLabel || 'varsayılan mutfak'}</strong> —{' '}
+            <span className="text-orange-700 font-semibold">Ayarlar → Yazıcılar</span>
+          </p>
         </div>
       </div>
+
+      {/* ─────────── GETIR RESTORAN KAPALI — tek tık aç ─────────── */}
+      {getirNeedsOpen && (
+        <div className="bg-gradient-to-r from-purple-700 to-violet-800 border-b border-purple-900 shrink-0">
+          <div className="max-w-7xl mx-auto px-4 md:px-6 py-3 flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+            <div className="flex-1 text-white min-w-0">
+              <p className="font-black text-sm md:text-base">Getir Yemek’te restoran kapalı görünüyor</p>
+              <p className="text-xs md:text-sm text-purple-100 mt-0.5">
+                Müşteriler sipariş veremez. Ayarlara gitmeden buradan açın; POS entegrasyonu da açılır.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setGetirRestaurantOpen(true)}
+              disabled={getirStoreBusy}
+              className="shrink-0 px-5 py-3 bg-white text-purple-900 rounded-xl font-black text-sm shadow-lg hover:bg-purple-50 transition active:scale-95 disabled:opacity-60"
+            >
+              {getirStoreBusy ? 'Getir’e bağlanılıyor…' : 'Getir Restoranı Aç'}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* ─────────── AUDIO KILITLI UYARI ─────────── */}
       {audioBlocked && soundEnabled && (
@@ -1220,7 +1521,7 @@ export function OnlineOrders() {
                   : /pos|pasif|inactive/i.test(getirPollIssue)
                     ? 'Çözüm: Ayarlar → Online Sipariş Ayarları → Getir → POS durumunu AÇIK (100) yapın.'
                     : /restaurant.*clos|kapal/i.test(getirPollIssue)
-                      ? 'Çözüm: Getir paneline veya Ayarlar → Getir → "Restoran Aç" ile restoranı açın.'
+                      ? 'Çözüm: Yukarıdaki mor şeritte veya sağ üstte «Getir Restoranı Aç» butonuna basın.'
                       : 'Detaylı sebep için F12 → Console; `[getir-api]` satırına bakın.'}
               </div>
             </div>
@@ -1259,7 +1560,7 @@ export function OnlineOrders() {
               >
                 <span className="flex items-center gap-1.5">
                   <Icon className="w-3.5 h-3.5 shrink-0" />
-                  {tab.label}
+                {tab.label}
                 </span>
                 <span
                   className={`pl-5 text-[9px] font-semibold leading-tight ${
@@ -1320,8 +1621,8 @@ export function OnlineOrders() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {filteredOrders.map((order) => {
-                    const isExpanded = expandedOrder === order.id;
+            {filteredOrders.map((order) => {
+              const isExpanded = expandedOrder === order.id;
                     const platformCode = order.online_order_platforms.platform_code;
                     const platformColor = getPlatformColor(platformCode);
                     const orderDate = new Date(order.created_at);
@@ -1330,7 +1631,7 @@ export function OnlineOrders() {
                         ? getGetirUiPhase(order)
                         : null;
 
-                    return (
+              return (
                       <Fragment key={order.id}>
                         {/* ─── ANA SATIR ─── */}
                         <tr
@@ -1366,11 +1667,11 @@ export function OnlineOrders() {
                           <td className="px-3 py-2.5 whitespace-nowrap">
                             <div className="font-mono font-semibold text-slate-700 text-xs">
                               #{order.platform_order_number || order.platform_order_id.slice(0, 6)}
-                            </div>
+                      </div>
                             {platformCode === 'getir' && order.getir_verification_code && (
                               <div className="text-[10px] font-bold text-purple-700 font-mono">
                                 {order.getir_verification_code.toUpperCase()}
-                              </div>
+                    </div>
                             )}
                           </td>
 
@@ -1399,10 +1700,10 @@ export function OnlineOrders() {
                             <div>{orderDate.toLocaleDateString('tr-TR')}</div>
                             <div className="text-[10px] text-slate-400">
                               {orderDate.toLocaleTimeString('tr-TR', {
-                                hour: '2-digit',
-                                minute: '2-digit',
-                              })}
-                            </div>
+                          hour: '2-digit',
+                          minute: '2-digit',
+                        })}
+                    </div>
                           </td>
 
                           {/* DURUM */}
@@ -1457,7 +1758,7 @@ export function OnlineOrders() {
                             <span className="line-clamp-2">{order.customer_address}</span>
                           </div>
                         )}
-                      </div>
+                  </div>
 
                       {/* Sipariş notu */}
                       {order.customer_notes && (
@@ -1472,7 +1773,7 @@ export function OnlineOrders() {
                         <div className="space-y-1">
                           {order.items.map((item, idx) => (
                             <div key={idx} className="flex justify-between items-start gap-2 text-sm">
-                              <div className="flex-1 min-w-0">
+                      <div className="flex-1 min-w-0">
                                 <p className="font-bold text-slate-800">
                                   <span className="text-slate-500 mr-1">{item.quantity}x</span>
                                   {safeName(item.platform_product_name)}
@@ -1484,8 +1785,8 @@ export function OnlineOrders() {
                               <span className="font-bold text-slate-700 shrink-0">{item.total_amount.toFixed(0)} ₺</span>
                             </div>
                           ))}
-                        </div>
                       </div>
+                    </div>
 
                       {/* Getir özel rozetler */}
                       {platformCode === 'getir' && (
@@ -1535,8 +1836,8 @@ export function OnlineOrders() {
                               Ortak Kampanya
                             </span>
                           )}
-                        </div>
-                      )}
+                      </div>
+                    )}
 
                       {/* GETIR akış: iptal sadece «onay» aşamasında (verify fazı) */}
                       {order.online_order_platforms.platform_code === 'getir' &&
@@ -1570,7 +1871,7 @@ export function OnlineOrders() {
                               className="w-full border border-red-300 rounded-lg px-3 py-2 text-sm font-medium text-slate-800 bg-white focus:outline-none focus:ring-2 focus:ring-red-400"
                             />
                             <div className="flex gap-2">
-                              <button
+                    <button
                                 onClick={() => {
                                   setRejectingOrderId(null);
                                   setGetirCancelReasonId('');
@@ -1613,7 +1914,7 @@ export function OnlineOrders() {
                         >
                           <Printer className={`w-3 h-3 ${busyOrderId === order.id ? 'animate-pulse' : ''}`} />
                           Fişi Tekrar Bas
-                        </button>
+                    </button>
 
                         {order.online_order_platforms.platform_code === 'getir' &&
                           order.status !== 'delivered' &&
@@ -1629,8 +1930,8 @@ export function OnlineOrders() {
                               <RefreshCw className={`w-3 h-3 ${busyOrderId === order.id ? 'animate-spin' : ''}`} />
                               {busyOrderId === order.id ? 'Sorguluyor…' : 'Getir ile durumu eşle'}
                             </button>
-                          )}
-                      </div>
+                              )}
+                            </div>
 
                       {order.online_order_platforms.platform_code === 'getir' && getirPhase && (
                         <>
@@ -1669,7 +1970,7 @@ export function OnlineOrders() {
                           {getirPhase === 'scheduled_accepted_wait' && (
                             <div className="w-full bg-amber-100 text-amber-800 font-bold py-3 rounded-xl text-center text-sm">
                               İleri tarihli — Getir teslimat saatinden 1 saat önce hazırlanma akışını başlatacak.
-                            </div>
+                          </div>
                           )}
 
                           {getirPhase === 'prepare' && (
@@ -1720,8 +2021,8 @@ export function OnlineOrders() {
                               <div className="text-[11px] font-normal text-purple-700">
                                 Bu sipariş Getir kuryesinde — restoranın «Kurye yola çıktı» / «Teslim edildi» basmasına gerek yok. Durum Getir tarafından otomatik ilerler.
                               </div>
-                            </div>
-                          )}
+                      </div>
+                    )}
 
                           {getirPhase === 'deliver' && (
                             <button
@@ -1737,12 +2038,23 @@ export function OnlineOrders() {
                           {getirPhase === 'arrived_info' && (
                             <div className="w-full bg-teal-100 text-teal-800 font-bold py-3 rounded-xl text-center text-sm">
                               Müşteriye ulaştı (teslim onayı bekleniyor)
-                            </div>
+                      </div>
                           )}
 
                           {order.status === 'delivered' && (
-                            <div className="w-full bg-green-100 text-green-800 font-bold py-3 rounded-xl text-center text-sm">
-                              ✓ Sipariş teslim edildi
+                            <div className="w-full space-y-2">
+                              <div className="bg-green-100 text-green-800 font-bold py-3 rounded-xl text-center text-sm">
+                                ✓ ŞefPOS: teslim edildi
+                              </div>
+                              {typeof order.getir_status_code === 'number' &&
+                                order.getir_status_code < 800 &&
+                                order.getir_status_code >= 400 && (
+                                  <div className="bg-amber-50 border border-amber-200 text-amber-900 text-xs font-semibold py-2.5 px-3 rounded-xl text-center">
+                                    Getir müşteri uygulamasında henüz teslim görünmüyor (durum:{' '}
+                                    {getirStatusLabel(order.getir_status_code)}). «Yemek hazır» → «Kurye yola
+                                    çıktı» → «Teslim edildi» sırasını tamamlayın veya «Siparişleri Yenile».
+                                  </div>
+                                )}
                             </div>
                           )}
                           {order.status === 'cancelled' && (
@@ -1756,43 +2068,43 @@ export function OnlineOrders() {
                       {/* Diğer platformlar (Yemeksepeti vb.) — eski akış değişmedi */}
                       {order.online_order_platforms.platform_code !== 'getir' && order.status === 'new' &&
                         rejectingOrderId === order.id && (
-                          <div className="bg-red-50 border-2 border-red-200 rounded-xl p-3 space-y-3">
-                            <div className="flex items-center gap-2 text-red-700 font-bold text-sm">
-                              <AlertTriangle className="w-4 h-4" />
-                              Reddetme Sebebi
-                            </div>
-                            <select
-                              value={selectedRejectReason}
+                        <div className="bg-red-50 border-2 border-red-200 rounded-xl p-3 space-y-3">
+                          <div className="flex items-center gap-2 text-red-700 font-bold text-sm">
+                            <AlertTriangle className="w-4 h-4" />
+                            Reddetme Sebebi
+                          </div>
+                          <select
+                            value={selectedRejectReason}
                               onChange={(e) => setSelectedRejectReason(e.target.value)}
-                              className="w-full border border-red-300 rounded-lg px-3 py-2 text-sm font-medium text-slate-800 bg-white focus:outline-none focus:ring-2 focus:ring-red-400"
-                            >
+                            className="w-full border border-red-300 rounded-lg px-3 py-2 text-sm font-medium text-slate-800 bg-white focus:outline-none focus:ring-2 focus:ring-red-400"
+                          >
                               {REJECT_REASONS.map((r) => (
                                 <option key={r.value} value={r.value}>
                                   {r.label}
                                 </option>
-                              ))}
-                            </select>
-                            <div className="flex gap-2">
-                              <button
-                                onClick={() => setRejectingOrderId(null)}
-                                className="flex-1 border-2 border-slate-300 text-slate-700 font-bold py-2.5 rounded-xl transition-all hover:bg-slate-50 text-sm"
-                              >
-                                Vazgec
-                              </button>
-                              <button
-                                onClick={() => {
-                                  setRejectingOrderId(null);
-                                  updateOrderStatus(order.id, 'cancelled', 'reject', selectedRejectReason);
-                                }}
-                                disabled={loading}
-                                className="flex-1 bg-red-600 hover:bg-red-700 text-white font-black py-2.5 rounded-xl transition-all active:scale-95 disabled:opacity-50 text-sm flex items-center justify-center gap-1.5"
-                              >
-                                <X className="w-4 h-4" />
-                                REDDET
-                              </button>
-                            </div>
+                            ))}
+                          </select>
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => setRejectingOrderId(null)}
+                              className="flex-1 border-2 border-slate-300 text-slate-700 font-bold py-2.5 rounded-xl transition-all hover:bg-slate-50 text-sm"
+                            >
+                              Vazgec
+                            </button>
+                            <button
+                              onClick={() => {
+                                setRejectingOrderId(null);
+                                updateOrderStatus(order.id, 'cancelled', 'reject', selectedRejectReason);
+                              }}
+                              disabled={loading}
+                              className="flex-1 bg-red-600 hover:bg-red-700 text-white font-black py-2.5 rounded-xl transition-all active:scale-95 disabled:opacity-50 text-sm flex items-center justify-center gap-1.5"
+                            >
+                              <X className="w-4 h-4" />
+                              REDDET
+                            </button>
                           </div>
-                        )}
+                        </div>
+                      )}
 
                       {order.online_order_platforms.platform_code !== 'getir' && order.status === 'new' && rejectingOrderId !== order.id && (
                         <div className="flex gap-2">
@@ -1850,13 +2162,13 @@ export function OnlineOrders() {
                           {busyOrderId === order.id ? 'Platforma bildiriliyor…' : 'KURYE ALDI / TESLİM EDİLDİ'}
                         </button>
                       )}
-                              </div>
+                    </div>
                             </td>
                           </tr>
                         )}
                       </Fragment>
-                    );
-                  })}
+              );
+            })}
                 </tbody>
               </table>
             </div>
