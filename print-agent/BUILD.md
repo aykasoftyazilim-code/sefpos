@@ -1,33 +1,23 @@
-# ShefPOS Print Agent - EXE Yapma Talimatları
+# ŞefPOS Yazıcı Ajanı
 
-## Gereksinimler
-- Node.js 18+ kurulu olmalı
+Web’den (Electron olmadan) fiş basmak için. **Bir kez kurulur**; Windows her açılışta gizli çalışır.
 
-## Adımlar
+## Müşteri
 
-1. print-agent klasörüne gir:
-   ```
-   cd print-agent
-   ```
+1. Ayarlar → Fiş & Yazıcı → **ŞefPOS Yazıcı Ajanı kur (bir kez)**
+2. İnen `Sefpos-PrintAgent.exe` dosyasını çalıştırın → kurulum tamam, açılışa eklenir
+3. Aynı ekranda **Yazıcı ajanını bağla** (bir kez)
+4. Artık PC / tarayıcı yeniden açılınca ajan kendiliğinden çalışır
 
-2. pkg aracını global yükle:
-   ```
-   npm install -g pkg
-   ```
+Kaldırmak: kurulu klasördeki EXE’ye `--uninstall`  
+`%LOCALAPPDATA%\SefPOS\PrintAgent\Sefpos-PrintAgent.exe --uninstall`
 
-3. EXE oluştur:
-   ```
-   pkg index.js --target node18-win-x64 --output ShefPOS-PrintAgent.exe
-   ```
+## Geliştirici
 
-4. Oluşan `ShefPOS-PrintAgent.exe` dosyasını çalıştır.
+```bat
+cd print-agent
+npm run build
+npm run publish-public
+```
 
-## Kullanım
-- EXE çalıştırıldığında arka planda 127.0.0.1:7878 portunda dinler
-- Web tarayıcısında ShefPOS açıkken yazdırma otomatik çalışır
-- Yazıcı listesi: http://127.0.0.1:7878/printers
-- Durum: http://127.0.0.1:7878/status
-
-## Windows Başlangıcında Otomatik Çalıştırma
-EXE'yi Windows Başlangıç klasörüne koy:
-`C:\Users\KULLANICI\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup`
+`public/download/Sefpos-PrintAgent.exe` → müşteri indirmesi.

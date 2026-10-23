@@ -6,6 +6,13 @@ import {
   clearWaiterLocalSession,
 } from '../lib/waiterAccessGuard';
 import { startAdaptivePoller } from '../lib/pollSchedule';
+import {
+  loadPrintSettings,
+  printKitchenReceipts,
+  setPrintAgentTenantId,
+  setPrintAgentBranchId,
+  fetchPrintSettingsFromCloud,
+} from '../lib/printService';
 import { LogOut, Plus, Minus, Check, X, AlertCircle, ShoppingCart, RefreshCw, Search, ArrowRightLeft } from 'lucide-react';
 
 interface WaiterSession {
@@ -38,6 +45,7 @@ interface Product {
   name: string;
   price: number;
   category_id: string | null;
+  printer_name?: string | null;
 }
 
 interface CartItem {
@@ -238,7 +246,7 @@ export function WaiterApp({ onLogout }: { onLogout: () => void }) {
           .order('sort_order'),
         supabase
           .from('products')
-          .select('id, name, price, category_id')
+          .select('id, name, price, category_id, printer_name')
           .eq('tenant_id', tenantId)
           .eq('is_active', true)
           .order('name'),
@@ -253,6 +261,7 @@ export function WaiterApp({ onLogout }: { onLogout: () => void }) {
         name: p.name,
         price: Number(p.price) || 0,
         category_id: p.category_id || null,
+        printer_name: p.printer_name || null,
       }));
 
       setCategories(safeCats);
@@ -308,45 +317,125 @@ export function WaiterApp({ onLogout }: { onLogout: () => void }) {
     if (!selectedTable || !session || cart.length === 0) return;
 
     setOrderLoading(true);
+    const cartSnapshot = [...cart];
     try {
-      const { data: order, error: orderError } = await supabase
-        .from('orders')
-        .insert({
-          table_id: selectedTable.id,
-          tenant_id: session.tenant_id,
-          branch_id: selectedTable.branch_id || null,
-          status: 'open',
-          payment_status: 'unpaid',
-          total_amount: cart.reduce((sum, item) => sum + (item.product.price * item.quantity), 0),
-          order_type: 'dine_in',
-          waiter_id: session.id,
-          waiter_name: session.name,
-        })
-        .select()
-        .single();
+      setPrintAgentTenantId(session.tenant_id);
+      setPrintAgentBranchId(selectedTable.branch_id || session.branch_id || null);
+      try {
+        await fetchPrintSettingsFromCloud();
+      } catch {
+        /* yerel cache yeterli */
+      }
 
-      if (orderError) throw orderError;
+      const cartTotal = cartSnapshot.reduce(
+        (sum, item) => sum + item.product.price * item.quantity,
+        0,
+      );
 
-      const orderItems = cart.map(item => ({
-        order_id: order.id,
+      let orderId = selectedTable.current_order_id || '';
+      let orderNumber = '';
+
+      if (orderId) {
+        const { data: existing, error: exErr } = await supabase
+          .from('orders')
+          .select('id, order_number, status, payment_status, total_amount')
+          .eq('id', orderId)
+          .maybeSingle();
+        if (exErr) throw exErr;
+        const ex = existing as {
+          id?: string;
+          order_number?: string;
+          status?: string;
+          payment_status?: string;
+          total_amount?: number;
+        } | null;
+        if (
+          !ex?.id ||
+          ex.payment_status === 'paid' ||
+          ex.status === 'closed' ||
+          ex.status === 'cancelled'
+        ) {
+          orderId = '';
+        } else {
+          orderNumber = String(ex.order_number || '');
+          const prevTotal = Number(ex.total_amount) || 0;
+          const { error: upErr } = await (supabase.from('orders') as any)
+            .update({
+              total_amount: prevTotal + cartTotal,
+              subtotal: prevTotal + cartTotal,
+              waiter_id: session.id,
+              waiter_name: session.name,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('id', orderId);
+          if (upErr) throw upErr;
+        }
+      }
+
+      if (!orderId) {
+        orderNumber = `M${selectedTable.table_number}-${Date.now().toString(36).toUpperCase()}`;
+        const { data: order, error: orderError } = await (supabase.from('orders') as any)
+          .insert({
+            table_id: selectedTable.id,
+            tenant_id: session.tenant_id,
+            branch_id: selectedTable.branch_id || session.branch_id || null,
+            status: 'open',
+            payment_status: 'unpaid',
+            subtotal: cartTotal,
+            total_amount: cartTotal,
+            order_number: orderNumber,
+            order_type: 'dine_in',
+            waiter_id: session.id,
+            waiter_name: session.name,
+          })
+          .select('id, order_number')
+          .single();
+
+        if (orderError) throw orderError;
+        const created = order as { id: string; order_number?: string };
+        orderId = created.id;
+        orderNumber = String(created.order_number || orderNumber);
+      }
+
+      const orderItems = cartSnapshot.map((item) => ({
+        order_id: orderId,
         product_id: item.product.id,
         quantity: item.quantity,
         unit_price: item.product.price,
-        notes: item.notes,
+        total_amount: item.product.price * item.quantity,
+        notes: item.notes || null,
         tenant_id: session.tenant_id,
       }));
 
-      const { error: itemError } = await supabase
-        .from('order_items')
-        .insert(orderItems);
-
+      const { error: itemError } = await (supabase.from('order_items') as any).insert(orderItems);
       if (itemError) throw itemError;
 
-      // Update table status
-      await supabase
-        .from('restaurant_tables')
-        .update({ status: 'occupied', current_order_id: order.id })
+      const { error: tableErr } = await (supabase.from('restaurant_tables') as any)
+        .update({ status: 'occupied', current_order_id: orderId })
         .eq('id', selectedTable.id);
+      if (tableErr) {
+        console.warn('[WaiterApp] masa güncelleme:', tableErr.message);
+      }
+
+      // Mutfak fişi — kasa yazıcı ajanı print_jobs kuyruğundan basar
+      const printSettings = loadPrintSettings();
+      if (printSettings.autoPrintKitchen !== false) {
+        const kitchenItems = cartSnapshot.map((item) => ({
+          productName: item.product.name,
+          quantity: item.quantity,
+          notes: item.notes || null,
+          categoryId: item.product.category_id || null,
+          productPrinterName: item.product.printer_name || null,
+        }));
+        void printKitchenReceipts({
+          settings: printSettings,
+          restaurantName: printSettings.restaurantName || 'ŞefPOS',
+          tableLabel: `Masa ${selectedTable.table_number}`,
+          orderNumber: orderNumber || orderId.slice(0, 8),
+          items: kitchenItems,
+          waiterName: session.name,
+        });
+      }
 
       setCart([]);
       setShowOrderPanel(false);
@@ -381,20 +470,17 @@ export function WaiterApp({ onLogout }: { onLogout: () => void }) {
 
     try {
       const movedOrderId = selectedTable.current_order_id;
-      const { error: orderErr } = await supabase
-        .from('orders')
-        .update({ table_id: targetTable.id } as any)
+      const { error: orderErr } = await (supabase.from('orders') as any)
+        .update({ table_id: targetTable.id })
         .eq('id', movedOrderId);
       if (orderErr) throw orderErr;
 
-      const { error: destErr } = await supabase
-        .from('restaurant_tables')
+      const { error: destErr } = await (supabase.from('restaurant_tables') as any)
         .update({ current_order_id: movedOrderId, status: 'occupied' })
         .eq('id', targetTable.id);
       if (destErr) throw destErr;
 
-      const { error: srcErr } = await supabase
-        .from('restaurant_tables')
+      const { error: srcErr } = await (supabase.from('restaurant_tables') as any)
         .update({ current_order_id: null, status: 'available' })
         .eq('id', selectedTable.id);
       if (srcErr) throw srcErr;

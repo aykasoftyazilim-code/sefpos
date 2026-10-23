@@ -228,7 +228,8 @@ function printWeight(bold: boolean, extra = false): number {
 function clampOffsetMm(v: unknown): number {
   const n = typeof v === 'number' ? v : Number(v);
   if (!Number.isFinite(n)) return 0;
-  return Math.max(-15, Math.min(15, n));
+  // 80mm ruloda ±15mm kenarı keser; güvenli aralık dar.
+  return Math.max(-3, Math.min(3, n));
 }
 
 function normalizePrintSettings(raw: Partial<PrintSettings> & Record<string, unknown>): PrintSettings {
@@ -871,35 +872,49 @@ export async function checkPrintAgentDetailed(): Promise<{ connected: boolean; s
     const msg = err?.message || '';
     const isHttps = window.location.protocol === 'https:';
     if (isHttps && (msg.includes('Failed to fetch') || msg.includes('NetworkError') || err?.name === 'TypeError')) {
-      if (_currentTenantId || _currentBranchId) {
+      // HTTPS → localhost HTTP engelli; eşlenmiş ajan printer_registrations.last_seen ile görünür.
+      if (_currentTenantId) {
         try {
-          const since = new Date(Date.now() - 60000).toISOString();
-          let query = supabase
+          const since = new Date(Date.now() - 5 * 60_000).toISOString();
+          const { data: reg } = await supabase
+            .from('printer_registrations')
+            .select('printers, last_seen_at')
+            .eq('tenant_id', _currentTenantId)
+            .gte('last_seen_at', since)
+            .order('last_seen_at', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (reg && Array.isArray(reg.printers) && reg.printers.length > 0) {
+            return {
+              connected: true,
+              status: 'connected',
+              detail: `Yerel ajan eşli (${reg.printers.length} yazıcı)`,
+            };
+          }
+          const { data: jobs } = await supabase
             .from('print_jobs')
             .select('id, status, updated_at')
-            .in('status', ['done', 'processing', 'failed'])
+            .eq('tenant_id', _currentTenantId)
+            .in('status', ['done', 'processing'])
             .gte('updated_at', since)
             .limit(1);
-          if (_currentTenantId) {
-            query = query.eq('tenant_id', _currentTenantId);
-          } else if (_currentBranchId) {
-            query = query.eq('branch_id', _currentBranchId);
-          }
-          const { data: jobs } = await query;
           if (jobs && jobs.length > 0) {
-            return { connected: true, status: 'connected', detail: 'Supabase Realtime üzerinden' };
+            return { connected: true, status: 'connected', detail: 'Fiş kuyruğu üzerinden' };
           }
-          return { connected: true, status: 'connected', detail: 'Supabase Realtime hazır (henüz test edilmedi)' };
         } catch {
-          return { connected: false, status: 'blocked_mixed_content', detail: 'HTTPS sayfasından HTTP isteği engellendi' };
+          /* fall through */
         }
       }
-      return { connected: false, status: 'blocked_mixed_content', detail: 'HTTPS sayfasından HTTP isteği engellendi' };
+      return {
+        connected: false,
+        status: 'blocked_mixed_content',
+        detail: 'HTTPS: yerel ajanı «Yazıcı ajanını bağla» ile eşleyin',
+      };
     }
     if (err?.name === 'AbortError') {
       return { connected: false, status: 'not_running', detail: 'Bağlantı zaman aşımına uğradı' };
     }
-    return { connected: false, status: 'not_running', detail: 'Bağlantı reddedildi' };
+    return { connected: false, status: 'not_running', detail: 'Bağlantı reddedildi — ŞefPOS Yazıcı Ajanı açık mı?' };
   }
 
   return { connected: false, status: 'unknown_error', detail: 'Beklenmeyen yanıt' };
@@ -1290,37 +1305,57 @@ function buildBrowserThermalDocument(bodyHtml: string, title = 'ŞefPOS Fiş'): 
 <meta charset="utf-8" />
 <title>${safeTitle}</title>
 <style>
-  @page { size: 80mm auto; margin: 0; }
+  /* Electron doPrint ile aynı: 72mm içerik, margin 0 (80mm rulo yazıcı) */
+  @page { size: 72mm auto; margin: 0; }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
+  html, body {
     font-family: Arial, Helvetica, "Segoe UI", sans-serif;
     font-size: 12px;
-    width: 76mm;
-    max-width: 76mm;
-    padding: 4px;
+    width: 72mm;
+    max-width: 72mm;
+    padding: 0 1mm;
+    margin: 0;
     margin-left: ${off}mm;
     color: #000;
+    background: #fff;
     -webkit-print-color-adjust: exact;
     print-color-adjust: exact;
   }
-  .center { text-align: center; }
+  .center { text-align: center; width: 100%; display: block; }
   .bold { font-weight: bold; }
   .large { font-size: 14px; }
-  .xlarge { font-size: 16px; }
-  .line { border-top: 1px dashed #000; margin: 4px 0; }
-  .row { display: flex; justify-content: space-between; width: 100%; }
-  .name { flex: 1; overflow: hidden; }
-  .qty { width: 36px; text-align: right; }
-  .price { width: 80px; text-align: right; }
-  .note { font-size: 11px; font-style: italic; padding-left: 8px; }
-  .footer { text-align: center; font-size: 11px; margin-top: 4px; }
-  .total-row { display: flex; justify-content: space-between; font-weight: bold; font-size: 14px; }
-  @media print { body { width: 76mm; } }
+  .xlarge { font-size: 16px; font-weight: bold; }
+  .line { border-top: 1px dashed #000; margin: 3px 0; width: 100%; }
+  .row { display: table; width: 100%; table-layout: fixed; margin: 1px 0; }
+  .row span { display: table-cell; vertical-align: top; overflow: hidden; word-break: break-all; }
+  .name { width: 55%; }
+  .qty { width: 15%; text-align: center; }
+  .price { width: 30%; text-align: right; }
+  .note { font-size: 10px; padding-left: 4px; font-style: italic; }
+  .footer { text-align: center; font-size: 10px; margin-top: 6px; word-break: break-word; }
+  .total-row { display: table; width: 100%; table-layout: fixed; font-weight: bold; margin: 2px 0; font-size: 14px; }
+  .total-row span { display: table-cell; vertical-align: top; }
+  .total-row span:last-child { text-align: right; }
+  @media print { html, body { width: 72mm; } }
 </style>
 </head>
 <body>
 ${bodyHtml}
-<br><br><br>
+<script>
+(function () {
+  function lockPage() {
+    try {
+      var hPx = Math.max(document.body.scrollHeight || 0, document.documentElement.scrollHeight || 0);
+      var mm = Math.min(400, Math.max(20, Math.ceil(hPx * 0.264583) + 2));
+      var st = document.createElement('style');
+      st.textContent = '@page { size: 72mm ' + mm + 'mm !important; margin: 0 !important; }';
+      document.head.appendChild(st);
+    } catch (e) {}
+  }
+  if (document.readyState === 'complete') lockPage();
+  else window.addEventListener('load', lockPage);
+})();
+</script>
 </body>
 </html>`;
 }
@@ -1912,6 +1947,20 @@ export async function printKitchenReceipts(opts: {
     filtered,
   );
 
+  // Eşlemesi olmayan ürünler sessizce düşmesin — varsayılan / catch-all / ilk mutfak yazıcısı.
+  if (unresolved.length > 0) {
+    const fallback =
+      (settings.defaultKitchenPrinter || '').trim() ||
+      getKitchenRoutePrinters(settings)[0]?.printerName?.trim() ||
+      '';
+    const key = fallback || '__default__';
+    (logicalGroups[key] ||= []).push(...unresolved);
+    console.warn(
+      `[ŞefPOS] Mutfak fişi: ${unresolved.length} ürün eşlemesiz → "${fallback || '(ajan varsayılan)'}":`,
+      unresolved.map((u) => u.productName).join(', '),
+    );
+  }
+
   const printOneKitchenBatch = async (printerName: string, batchItems: KitchenPrintItem[]) => {
     if (batchItems.length === 0) return;
     const html = buildKitchenHtml({
@@ -1923,25 +1972,19 @@ export async function printKitchenReceipts(opts: {
       waiterName: opts.waiterName,
       printStyle: st,
     });
-    const label = printerName ? `printer="${printerName}"` : 'printer=(varsayılan)';
+    const target = printerName === '__default__' ? '' : printerName;
+    const label = target ? `printer="${target}"` : 'printer=(varsayılan)';
     posDebugLog(`[ŞefPOS] Mutfak fişi: ${batchItems.length} ürün → ${label}`);
-    await printHtml(html, printerName, {
+    await printHtml(html, target, {
       title: 'Mutfak fişi gönderildi',
       allowBrowserFallback: opts.allowWebBrowserPrint === true,
     });
   };
 
-  // Mobil / web: ayarlardaki mantıksal yazıcı adıyla **ayrı** print_jobs satırı.
-  // Eskiden tek satır + boş printer_name tüm siparişi tek yazıcıya gönderiyordu.
+  // Mobil / web: her mantıksal yazıcı için ayrı print_jobs → kasa ajanı basar (kaç yazıcı varsa).
   if (!isElectron()) {
     for (const logical of Object.keys(logicalGroups).sort()) {
       await printOneKitchenBatch(logical, logicalGroups[logical]);
-    }
-    if (unresolved.length > 0) {
-      console.warn(
-        `[ŞefPOS] Mutfak fişi: ${unresolved.length} ürün yazıcı eşlemesi yok, BASILMADI:`,
-        unresolved.map((u) => u.productName).join(', '),
-      );
     }
     return;
   }
@@ -1951,31 +1994,23 @@ export async function printKitchenReceipts(opts: {
   const devices = await getAvailablePrinters();
   const printerItemsMap: Record<string, KitchenPrintItem[]> = {};
   for (const [logical, batchItems] of Object.entries(logicalGroups)) {
-    const osName = (await resolveThermalDeviceName(logical, devices)).trim() || logical;
+    const raw = logical === '__default__' ? '' : logical;
+    const osName =
+      (await resolveThermalDeviceName(raw, devices)).trim() ||
+      pickKitchenPrinterFromDevices(devices) ||
+      raw ||
+      '__default__';
     (printerItemsMap[osName] ||= []).push(...batchItems);
   }
 
   if (Object.keys(printerItemsMap).length === 0) {
-    if (unresolved.length > 0) {
-      console.warn(
-        `[ŞefPOS] Mutfak fişi: ${unresolved.length} ürün yazıcı eşlemesi yok, BASILMADI:`,
-        unresolved.map((u) => u.productName).join(', '),
-      );
-    }
     return;
   }
 
   for (const printerName of Object.keys(printerItemsMap).sort()) {
     const printerItems = printerItemsMap[printerName];
     if (!printerItems?.length) continue;
-    await printOneKitchenBatch(printerName, printerItems);
-  }
-
-  if (unresolved.length > 0) {
-    console.warn(
-      `[ŞefPOS] Mutfak fişi: ${unresolved.length} ürün yazıcı eşlemesi yok, BASILMADI:`,
-      unresolved.map((u) => u.productName).join(', '),
-    );
+    await printOneKitchenBatch(printerName === '__default__' ? '' : printerName, printerItems);
   }
 }
 

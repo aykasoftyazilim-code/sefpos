@@ -8,7 +8,7 @@ import { X, Plus, Minus, ShoppingCart, Trash2, Search, ChevronUp, ChevronDown, A
 import { PaymentModal } from './PaymentModal';
 import { TableToPackageTransferModal } from './TableToPackageTransferModal';
 import { ScaleWeighingModal } from './ScaleWeighingModal';
-import { loadPrintSettings, printKitchenReceipts, printToAdisyonPrinter, buildReceiptHtml, printTakeawayReceipt, resolveReceiptBusinessHeader } from '../lib/printService';
+import { loadPrintSettings, printKitchenReceipts, printToAdisyonPrinter, buildReceiptHtml, printTakeawayReceipt, resolveReceiptBusinessHeader, fetchPrintSettingsFromCloud, isElectron } from '../lib/printService';
 import {
   buildHuginItemsFromOrderLines,
   cancelPcLinkDocument,
@@ -1741,62 +1741,72 @@ export function OrderPanel({ table, onClose, onAfterMergeNavigate }: OrderPanelP
     }
 
     const runPrints = (activeOrder: Order) => {
-      const printSettings = loadPrintSettings();
       const isTakeaway = table.table_number === 0;
       const tableLabel = isTakeaway ? 'Paket' : `Masa ${table.table_number}`;
       const orderNum = activeOrder.order_number;
-      const receiptHeader = resolveReceiptBusinessHeader(printSettings, tenant);
 
       queueMicrotask(() => {
-        if (printSettings.autoPrintKitchen) {
-          const kitchenItems = cartSnapshot.map((item) => ({
-            productName: item.product.name,
-            variantName: item.variant?.name || null,
-            quantity: item.quantity,
-            notes: (item as any).notes || null,
-            categoryId: item.product.category_id || null,
-            productPrinterName: (item.product as any).printer_name || null,
-          }));
-          printKitchenReceipts({
-            settings: printSettings,
-            restaurantName: receiptHeader.restaurantName,
-            tableLabel,
-            orderNumber: orderNum,
-            items: kitchenItems,
-            waiterName: profile?.full_name || profile?.email || user.email || undefined,
-          });
-        }
-
-        if (isTakeaway && (printSettings as any).autoPrintTakeaway !== false) {
-          const receiptItems = cartSnapshot.map((item) => {
-            const unitPrice = item.product.price + (item.variant?.price_modifier || 0);
-            return {
+        void (async () => {
+          // Mobil/web: kasadaki yazıcı eşlemesini buluttan al (yoksa mutfak fişi düşmez)
+          if (!isElectron()) {
+            try {
+              await fetchPrintSettingsFromCloud();
+            } catch {
+              /* yerel ayar */
+            }
+          }
+          const printSettings = loadPrintSettings();
+          const receiptHeader = resolveReceiptBusinessHeader(printSettings, tenant);
+          if (printSettings.autoPrintKitchen !== false) {
+            const kitchenItems = cartSnapshot.map((item) => ({
               productName: item.product.name,
               variantName: item.variant?.name || null,
               quantity: item.quantity,
-              unitPrice,
-              totalAmount: item.weightedPrice ?? unitPrice * item.quantity,
               notes: (item as any).notes || null,
-            };
-          });
-          const existingTotal = snapExisting.reduce((s, i) => s + Number((i as any).total_amount || 0), 0);
-          const newTotal = receiptItems.reduce((s, i) => s + i.totalAmount, 0);
-          printTakeawayReceipt({
-            settings: printSettings,
-            tenant,
-            orderType: (activeOrder as any).order_type === 'delivery' ? 'delivery' : 'takeaway',
-            orderNumber: orderNum || '',
-            customerName: (activeOrder as any).customer_name || undefined,
-            customerPhone: (activeOrder as any).customer_phone || undefined,
-            deliveryAddress: (activeOrder as any).delivery_address || undefined,
-            deliveryNote: (activeOrder as any).delivery_note || undefined,
-            courierName: (activeOrder as any).courier_name || undefined,
-            estimatedMinutes: (activeOrder as any).estimated_delivery_minutes || undefined,
-            items: receiptItems,
-            subtotal: newTotal,
-            total: existingTotal + newTotal,
-          });
-        }
+              categoryId: item.product.category_id || null,
+              productPrinterName: (item.product as any).printer_name || null,
+            }));
+            await printKitchenReceipts({
+              settings: printSettings,
+              restaurantName: receiptHeader.restaurantName,
+              tableLabel,
+              orderNumber: orderNum,
+              items: kitchenItems,
+              waiterName: profile?.full_name || profile?.email || user.email || undefined,
+            });
+          }
+
+          if (isTakeaway && (printSettings as any).autoPrintTakeaway !== false) {
+            const receiptItems = cartSnapshot.map((item) => {
+              const unitPrice = item.product.price + (item.variant?.price_modifier || 0);
+              return {
+                productName: item.product.name,
+                variantName: item.variant?.name || null,
+                quantity: item.quantity,
+                unitPrice,
+                totalAmount: item.weightedPrice ?? unitPrice * item.quantity,
+                notes: (item as any).notes || null,
+              };
+            });
+            const existingTotal = snapExisting.reduce((s, i) => s + Number((i as any).total_amount || 0), 0);
+            const newTotal = receiptItems.reduce((s, i) => s + i.totalAmount, 0);
+            await printTakeawayReceipt({
+              settings: printSettings,
+              tenant,
+              orderType: (activeOrder as any).order_type === 'delivery' ? 'delivery' : 'takeaway',
+              orderNumber: orderNum || '',
+              customerName: (activeOrder as any).customer_name || undefined,
+              customerPhone: (activeOrder as any).customer_phone || undefined,
+              deliveryAddress: (activeOrder as any).delivery_address || undefined,
+              deliveryNote: (activeOrder as any).delivery_note || undefined,
+              courierName: (activeOrder as any).courier_name || undefined,
+              estimatedMinutes: (activeOrder as any).estimated_delivery_minutes || undefined,
+              items: receiptItems,
+              subtotal: newTotal,
+              total: existingTotal + newTotal,
+            });
+          }
+        })();
       });
     };
 
