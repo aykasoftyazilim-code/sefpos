@@ -556,11 +556,15 @@ export function TableGrid({
   }, [loadAll]);
 
   useEffect(() => {
-    if (!tenant?.id || !activeBranch?.id || isLocalMode() || isSqlServerMode()) return;
+    if (!tenant?.id || !activeBranch?.id || isLocalMode()) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
     const hiddenSinceRef = { at: 0 as number };
     const lastVisRefreshRef = { at: 0 as number };
     const cacheKey = `${tenant.id}:${activeBranch.id}`;
+    // VDS'te Realtime yok — sekme geri gelince hemen yenile (Supabase'te kısa gizlenme atlanır).
+    const sqlMode = isSqlServerMode();
+    const minHiddenMs = sqlMode ? 800 : 20_000;
+    const minGapMs = sqlMode ? 2_000 : 45_000;
 
     const onVis = () => {
       if (document.visibilityState === 'hidden') {
@@ -572,19 +576,18 @@ export function TableGrid({
       const hiddenMs = hiddenSinceRef.at ? Date.now() - hiddenSinceRef.at : 0;
       hiddenSinceRef.at = 0;
 
-      // Kisa sekme degisimi (WhatsApp, baska site) — ekrani yeniden cizme; realtime zaten akar.
-      if (hiddenMs > 0 && hiddenMs < 20_000) return;
-      if (Date.now() - lastVisRefreshRef.current < 45_000) return;
+      if (hiddenMs > 0 && hiddenMs < minHiddenMs) return;
+      if (Date.now() - lastVisRefreshRef.at < minGapMs) return;
 
       if (timer) clearTimeout(timer);
       timer = setTimeout(async () => {
         timer = null;
         if (document.visibilityState !== 'visible') return;
         if (!tableGridRuntimeCache.has(cacheKey)) return;
-        lastVisRefreshRef.current = Date.now();
+        lastVisRefreshRef.at = Date.now();
         await maybeUnlockStalePaymentLocks();
         void loadAll(false, { silent: true });
-      }, 400);
+      }, 200);
     };
     document.addEventListener('visibilitychange', onVis);
     return () => {
@@ -888,10 +891,11 @@ export function TableGrid({
         if (updateTimerRef.current) clearTimeout(updateTimerRef.current);
       };
     }
+    // VDS / SQL: Realtime yok — mobil/web sipariş masaya anında yansıması için sık poll.
     if (isSqlServerMode()) {
       timer = setInterval(() => {
         if (document.visibilityState === 'visible') void loadAll(false, { silent: true });
-      }, 90_000);
+      }, 3_000);
       return () => {
         if (timer) clearInterval(timer);
         if (updateTimerRef.current) clearTimeout(updateTimerRef.current);

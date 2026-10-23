@@ -1373,7 +1373,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // olmaz. Hata olursa lokal cache aktif kalır.
   useEffect(() => {
     if (!tenant?.id) return;
-    if (isLocalMode() || isSqlServerMode()) return;
+    // Yerel-only DB'de print_settings bulutu yok; VDS/SQL dahil diğer tüm modlarda çek
+    // (mobil/web masa siparişi mutfak fişi için kategori→yazıcı eşlemesi şart).
+    if (isLocalMode()) return;
     let cancelled = false;
     void fetchPrintSettingsFromCloud()
       .then((res) => {

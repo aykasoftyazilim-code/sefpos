@@ -1,16 +1,18 @@
 {
-  "name": "shefpos-print-agent",
-  "version": "1.0.0",
-  "description": "ShefPOS Print Agent - Web tarayici icin yazici koprusu",
+  "name": "sefpos-print-agent",
+  "version": "1.2.6",
+  "description": "ŞefPOS Yazıcı Ajanı — bir kez kur, Windows açılışında otomatik (web yazıcı köprüsü)",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "build": "pkg index.js --target node18-win-x64 --output ShefPOS-PrintAgent.exe --compress GZip"
+    "start": "node index.js --run",
+    "build": "npx --yes pkg@5.8.1 . --targets node18-win-x64 --output Sefpos-PrintAgent.exe --compress GZip",
+    "publish-public": "node -e \"const fs=require('fs');const p=require('path');const src=p.join('Sefpos-PrintAgent.exe');const dest=p.join('..','public','download','Sefpos-PrintAgent.exe');fs.mkdirSync(p.dirname(dest),{recursive:true});fs.copyFileSync(src,dest);console.log('copied',dest)\""
   },
   "bin": "index.js",
   "pkg": {
+    "scripts": ["queuePoller.js", "install.js"],
     "targets": ["node18-win-x64"],
-    "outputPath": "dist",
+    "outputPath": ".",
     "compress": "GZip"
   }
 }
